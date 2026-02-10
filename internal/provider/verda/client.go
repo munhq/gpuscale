@@ -1,0 +1,339 @@
+package verda
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+)
+
+const baseURL = "https://api.verda.com/v1"
+
+// Client is an HTTP client for the Verda API with OAuth2 auth.
+type Client struct {
+	clientID     string
+	clientSecret string
+	httpClient   *http.Client
+	baseURL      string
+
+	mu          sync.Mutex
+	accessToken string
+	tokenExpiry time.Time
+}
+
+// NewClient creates a new Verda API client.
+func NewClient(clientID, clientSecret string) *Client {
+	return &Client{
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		baseURL: baseURL,
+	}
+}
+
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+// authenticate obtains or refreshes the OAuth2 access token.
+func (c *Client) authenticate(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.accessToken != "" && time.Now().Before(c.tokenExpiry) {
+		return nil
+	}
+
+	form := url.Values{}
+	form.Set("client_id", c.clientID)
+	form.Set("client_secret", c.clientSecret)
+	form.Set("grant_type", "client_credentials")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/oauth2/token", bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("creating auth request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("executing auth request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verda auth returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var token tokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+		return fmt.Errorf("decoding token: %w", err)
+	}
+
+	c.accessToken = token.AccessToken
+	// Expire 60s early to avoid edge cases
+	c.tokenExpiry = time.Now().Add(time.Duration(token.ExpiresIn-60) * time.Second)
+	return nil
+}
+
+func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, error) {
+	if err := c.authenticate(ctx); err != nil {
+		return nil, err
+	}
+
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling body: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	c.mu.Lock()
+	req.Header.Set("Authorization", "Bearer "+c.accessToken)
+	c.mu.Unlock()
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	return c.httpClient.Do(req)
+}
+
+// InstanceType represents a Verda instance type with pricing.
+type InstanceType struct {
+	ID            string  `json:"id"`
+	GPUType       string  `json:"gpu_type"`
+	GPUCount      int     `json:"gpu_count"`
+	VRAMGB        int     `json:"vram_gb"`
+	VCPU          int     `json:"vcpu"`
+	RAMGB         int     `json:"ram_gb"`
+	DiskGB        int     `json:"disk_gb"`
+	SpotPrice     float64 `json:"spot_price"`
+	OnDemandPrice float64 `json:"on_demand_price"`
+}
+
+// InstanceTypesResponse wraps the instance types API response.
+type InstanceTypesResponse struct {
+	Data []InstanceType `json:"data"`
+}
+
+// ListInstanceTypes returns available instance types.
+func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/instance-types?currency=usd", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda instance-types returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result InstanceTypesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return result.Data, nil
+}
+
+// AvailabilityResponse wraps the availability check response.
+type AvailabilityResponse struct {
+	Available bool   `json:"available"`
+	Location  string `json:"location_code"`
+}
+
+// CheckAvailability checks if an instance type is available.
+func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isSpot bool) ([]AvailabilityResponse, error) {
+	spotParam := "false"
+	if isSpot {
+		spotParam = "true"
+	}
+	path := fmt.Sprintf("/instance-availability/%s?is_spot=%s", instanceType, spotParam)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda availability returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data []AvailabilityResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return result.Data, nil
+}
+
+// CreateInstanceRequest is the body for creating a Verda instance.
+type CreateInstanceRequest struct {
+	InstanceType    string   `json:"instance_type"`
+	Image           string   `json:"image"`
+	SSHKeyIDs       []string `json:"ssh_key_ids,omitempty"`
+	Hostname        string   `json:"hostname"`
+	StartupScriptID string   `json:"startup_script_id,omitempty"`
+	LocationCode    string   `json:"location_code,omitempty"`
+	IsSpot          bool     `json:"is_spot"`
+}
+
+// InstanceResponse represents a Verda instance.
+type InstanceResponse struct {
+	ID           string  `json:"id"`
+	Status       string  `json:"status"` // "running", "starting", "stopped", etc.
+	InstanceType string  `json:"instance_type"`
+	IP           string  `json:"ip"`
+	Hostname     string  `json:"hostname"`
+	GPUType      string  `json:"gpu_type"`
+	GPUCount     int     `json:"gpu_count"`
+	PricePerHour float64 `json:"price_per_hour"`
+	CreatedAt    string  `json:"created_at"`
+	IsSpot       bool    `json:"is_spot"`
+}
+
+// CreateInstance provisions a new instance.
+func (c *Client) CreateInstance(ctx context.Context, createReq CreateInstanceRequest) (*InstanceResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost, "/instances", createReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda create returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data InstanceResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return &result.Data, nil
+}
+
+// GetInstance returns details for a specific instance.
+func (c *Client) GetInstance(ctx context.Context, instanceID string) (*InstanceResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/instances/"+instanceID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda get instance returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data InstanceResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return &result.Data, nil
+}
+
+// ListInstances returns all instances.
+func (c *Client) ListInstances(ctx context.Context) ([]InstanceResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/instances", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda list instances returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data []InstanceResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return result.Data, nil
+}
+
+// InstanceActionRequest represents an action to perform on instances.
+type InstanceActionRequest struct {
+	Action string   `json:"action"` // "boot", "start", "shutdown", "delete"
+	IDs    []string `json:"id"`
+}
+
+// DeleteInstance deletes an instance.
+func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
+	actionReq := InstanceActionRequest{
+		Action: "delete",
+		IDs:    []string{instanceID},
+	}
+	resp, err := c.doRequest(ctx, http.MethodPut, "/instances", actionReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verda delete returned %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// CreateStartupScriptRequest is the body for creating a startup script.
+type CreateStartupScriptRequest struct {
+	Name   string `json:"name"`
+	Script string `json:"script"`
+}
+
+// StartupScriptResponse represents a startup script.
+type StartupScriptResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// CreateStartupScript creates a startup script that can be referenced by instances.
+func (c *Client) CreateStartupScript(ctx context.Context, name, script string) (*StartupScriptResponse, error) {
+	req := CreateStartupScriptRequest{Name: name, Script: script}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/scripts", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda create script returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data StartupScriptResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return &result.Data, nil
+}

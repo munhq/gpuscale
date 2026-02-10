@@ -1,0 +1,124 @@
+package provider
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+var (
+	ErrNoOffersAvailable = errors.New("no offers matching requirements are available")
+	ErrInstanceNotFound  = errors.New("instance not found")
+	ErrProviderAPI       = errors.New("provider API error")
+)
+
+// GPURequirements describes what GPU resources are needed.
+type GPURequirements struct {
+	GPUCount     int      // nvidia.com/gpu limit
+	MinVRAM      int      // GB, from annotation
+	GPUTypes     []string // preferred GPU types (empty = any)
+	MaxPrice     float64  // $/hr, 0 = no limit
+	CapacityType string   // "spot" or "on-demand"
+	MinDisk      int      // GB
+	MinRAM       int      // GB
+}
+
+// Offer represents an available GPU instance from a provider.
+type Offer struct {
+	ProviderName string
+	OfferID      string  // provider-specific offer/machine ID
+	GPUType      string  // "RTX 4090", "A100 80GB", etc
+	GPUCount     int
+	VRAM         int     // per GPU, in GB
+	PricePerHour float64
+	CapacityType string // "spot" or "on-demand"
+	Region       string
+	Reliability  float64 // 0-1, provider-specific
+	DiskGB       int
+	RAMGB        int
+}
+
+// BootstrapConfig contains the configuration needed to bootstrap a node.
+type BootstrapConfig struct {
+	NodeType      string            // "k3s" or "ray-worker"
+	Image         string            // Docker image for the node
+	NetbirdKey    string            // Netbird VPN setup key (k3s only)
+	K3sURL        string            // K3s server URL (k3s only)
+	K3sToken      string            // K3s join token (k3s only)
+	RayHeadAddr   string            // Ray head address (ray-worker only, empty = run as head)
+	RayDashPort   int               // Ray dashboard port (ray-worker only, default 8265)
+	RayServePort  int               // Ray serve port (ray-worker only, default 8000)
+	ModelCacheURL string            // optional rclone URL for model cache
+	InstanceID    string            // unique ID for tracking
+	GPUType       string            // GPU type label
+	ProviderName  string            // provider name label
+	ExtraEnv      map[string]string // additional env vars
+}
+
+// Instance represents a running instance on a provider.
+type Instance struct {
+	ProviderName string
+	InstanceID   string // provider's instance ID (for destroy)
+	NodeType     string // "k3s" or "ray-worker"
+	IP           string // public or VPN IP
+	SSHPort      int
+	Endpoint     string // HTTP endpoint for ray-worker (e.g., "http://host:8000")
+	Status       string // "running", "starting", "stopped", "error"
+	GPUType      string
+	GPUCount     int
+	PricePerHour float64
+	CreatedAt    time.Time
+}
+
+// Provider is the interface that GPU cloud providers must implement.
+type Provider interface {
+	// Name returns the provider identifier (e.g., "vast.ai", "verda", "runpod").
+	Name() string
+
+	// SearchOffers returns available GPU offers matching the requirements.
+	SearchOffers(ctx context.Context, req GPURequirements) ([]Offer, error)
+
+	// CreateInstance provisions a new instance from the given offer.
+	CreateInstance(ctx context.Context, offer Offer, config BootstrapConfig) (*Instance, error)
+
+	// DestroyInstance terminates the given instance.
+	DestroyInstance(ctx context.Context, instanceID string) error
+
+	// GetInstance returns the current state of an instance.
+	GetInstance(ctx context.Context, instanceID string) (*Instance, error)
+
+	// ListInstances returns all instances managed by this provider.
+	ListInstances(ctx context.Context) ([]*Instance, error)
+}
+
+// Registry holds all configured providers.
+type Registry struct {
+	providers map[string]Provider
+}
+
+// NewRegistry creates a new provider registry.
+func NewRegistry() *Registry {
+	return &Registry{
+		providers: make(map[string]Provider),
+	}
+}
+
+// Register adds a provider to the registry.
+func (r *Registry) Register(p Provider) {
+	r.providers[p.Name()] = p
+}
+
+// Get returns a provider by name.
+func (r *Registry) Get(name string) (Provider, bool) {
+	p, ok := r.providers[name]
+	return p, ok
+}
+
+// List returns all registered providers.
+func (r *Registry) List() []Provider {
+	result := make([]Provider, 0, len(r.providers))
+	for _, p := range r.providers {
+		result = append(result, p)
+	}
+	return result
+}

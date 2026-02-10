@@ -1,0 +1,39 @@
+apiVersion: gpuscale.io/v1alpha1
+kind: GPUNodePool
+metadata:
+  name: inference-pool
+spec:
+  providers:
+    - name: vast.ai
+      apiKeySecret:
+        name: gpuscale-vast-credentials
+        namespace: gpuscale-system
+      capacityType: spot
+      maxPrice: 0.50
+
+  requirements:
+    gpuTypes: ["RTX 4090", "RTX 3090", "A100"]
+    minVRAM: 24
+    minDisk: 50
+    minRAM: 32
+
+  scaling:
+    batchWindow: "10s"
+    cooldownPeriod: "10m"
+    maxNodes: 10
+    minNodes: 0
+    interruptionPollInterval: "30s"
+
+  bootstrap:
+    image: "ghcr.io/munhq/gpuscale-node:latest"
+    vpnSetupKeySecret:
+      name: gpuscale-netbird-key
+      namespace: gpuscale-system
+    k3sTokenSecret:
+      name: gpuscale-k3s-token
+      namespace: gpuscale-system
+    k3sURL: "https://10.100.0.1:6443"
+
+  limits:
+    maxGPUs: 20
+    maxCostPerHour: 5.00

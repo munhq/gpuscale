@@ -1,0 +1,66 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/munhq/gpuscale-controller
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nodeImage:
+  repository: ghcr.io/munhq/gpuscale-node
+  tag: latest
+
+imagePullSecrets: []
+
+# Controller configuration
+controller:
+  batchWindow: "10s"
+  cooldownPeriod: "10m"
+  interruptionPollInterval: "30s"
+
+# Provider credentials (set via --set or external secrets)
+providers:
+  vastai:
+    enabled: false
+    apiKey: ""
+    # Or reference an existing secret:
+    # existingSecret: vastai-credentials
+    # existingSecretKey: api-key
+  verda:
+    enabled: false
+    clientID: ""
+    clientSecret: ""
+  runpod:
+    enabled: false
+    apiKey: ""
+
+# Bootstrap configuration
+bootstrap:
+  k3sURL: ""
+  # Secrets for bootstrap (must be created separately or set here)
+  k3sTokenSecret:
+    name: gpuscale-k3s-token
+    namespace: gpuscale-system
+  vpnSetupKeySecret:
+    name: gpuscale-netbird-key
+    namespace: gpuscale-system
+  modelCacheURL: ""
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+serviceAccount:
+  create: true
+  name: gpuscale-controller
+
+podAnnotations: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
