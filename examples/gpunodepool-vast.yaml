@@ -1,3 +1,5 @@
+# Single-provider GPUNodePool using Vast.ai spot instances.
+# Workers are standalone vLLM instances running Ray Serve.
 apiVersion: gpuscale.io/v1alpha1
 kind: GPUNodePool
 metadata:
@@ -5,8 +7,9 @@ metadata:
 spec:
   providers:
     - name: vast.ai
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-vast-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
       capacityType: spot
       maxPrice: 0.50
@@ -25,14 +28,17 @@ spec:
     interruptionPollInterval: "30s"
 
   bootstrap:
-    image: "ghcr.io/munhq/gpuscale-node:latest"
-    vpnSetupKeySecret:
-      name: gpuscale-netbird-key
-      namespace: gpuscale-system
-    k3sTokenSecret:
-      name: gpuscale-k3s-token
-      namespace: gpuscale-system
-    k3sURL: "https://10.100.0.1:6443"
+    image: "rayproject/ray-llm:2.53.0-py311-cu128"
+    rayConfig:
+      servePort: 8000
+    modelConfig:
+      modelId: "THUDM/glm-4-9b-chat"
+      modelSource: "THUDM/glm-4-9b-chat"
+      maxModelLen: 8192
+      dtype: auto
+      gpuMemoryUtilization: 0.90
+      enablePrefixCaching: true
+      maxOngoingRequests: 64
 
   limits:
     maxGPUs: 20

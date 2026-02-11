@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/munhq/gpuscale/internal/bootstrap"
 	"github.com/munhq/gpuscale/internal/provider"
 )
 
@@ -80,8 +81,14 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 }
 
 func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, config provider.BootstrapConfig) (*provider.Instance, error) {
-	// First, create a startup script with the bootstrap configuration
-	script := generateBootstrapScript(config)
+	var script string
+	if config.NodeType == "ray-worker" {
+		script = generateVLLMBootstrapScript(config)
+	} else {
+		// Full-node mode — VM joins Kubernetes cluster via VPN
+		script = bootstrap.GenerateScript(config)
+	}
+
 	scriptResp, err := p.client.CreateStartupScript(ctx, fmt.Sprintf("gpuscale-%s", config.InstanceID), script)
 	if err != nil {
 		return nil, fmt.Errorf("creating startup script: %w", err)
@@ -100,11 +107,23 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating verda instance: %w", err)
 	}
 
+	// Build endpoint for ray-worker type
+	endpoint := ""
+	if config.NodeType == "ray-worker" && resp.IP != "" {
+		servePort := config.RayServePort
+		if servePort == 0 {
+			servePort = 8000
+		}
+		endpoint = fmt.Sprintf("http://%s:%d", resp.IP, servePort)
+	}
+
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   resp.ID,
+		NodeType:     config.NodeType,
 		IP:           resp.IP,
 		SSHPort:      22,
+		Endpoint:     endpoint,
 		Status:       normalizeStatus(resp.Status),
 		GPUType:      resp.GPUType,
 		GPUCount:     resp.GPUCount,
@@ -128,11 +147,17 @@ func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provide
 
 	createdAt, _ := time.Parse(time.RFC3339, resp.CreatedAt)
 
+	// Build endpoint if the instance has an IP
+	endpoint := ""
+	if resp.IP != "" {
+		endpoint = fmt.Sprintf("http://%s:8000", resp.IP)
+	}
+
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   resp.ID,
 		IP:           resp.IP,
-		SSHPort:      22,
+		Endpoint:     endpoint,
 		Status:       normalizeStatus(resp.Status),
 		GPUType:      resp.GPUType,
 		GPUCount:     resp.GPUCount,
@@ -154,7 +179,6 @@ func (p *Provider) ListInstances(ctx context.Context) ([]*provider.Instance, err
 			ProviderName: p.Name(),
 			InstanceID:   inst.ID,
 			IP:           inst.IP,
-			SSHPort:      22,
 			Status:       normalizeStatus(inst.Status),
 			GPUType:      inst.GPUType,
 			GPUCount:     inst.GPUCount,
@@ -165,34 +189,53 @@ func (p *Provider) ListInstances(ctx context.Context) ([]*provider.Instance, err
 	return result, nil
 }
 
-func generateBootstrapScript(config provider.BootstrapConfig) string {
-	script := fmt.Sprintf(`#!/bin/bash
+func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
+	servePort := config.RayServePort
+	if servePort == 0 {
+		servePort = 8000
+	}
+	modelID := config.ModelID
+	if modelID == "" {
+		modelID = "THUDM/glm-4-9b-chat"
+	}
+	maxModelLen := config.MaxModelLen
+	if maxModelLen == 0 {
+		maxModelLen = 4096
+	}
+	dtype := config.DType
+	if dtype == "" {
+		dtype = "auto"
+	}
+	gpuMemUtil := config.GPUMemUtil
+	if gpuMemUtil <= 0 {
+		gpuMemUtil = 0.90
+	}
+
+	trustFlag := ""
+	if config.TrustRemoteCode {
+		trustFlag = " \\\n  --trust-remote-code"
+	}
+
+	return fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 
-# Install Netbird
-curl -fsSL https://pkgs.netbird.io/install.sh | sh
+echo '[gpuscale] Starting vLLM worker on verda'
+echo '[gpuscale] Instance: %s, GPU: %s'
+echo '[gpuscale] Model: %s'
 
-# Join VPN
-netbird up --setup-key "%s" --daemon
-sleep 5
-NETBIRD_IP=$(ip -4 addr show wt0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+# Install vLLM
+pip install vllm 2>&1 | tail -10
 
-# Install and start K3s agent
-curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="agent" sh -
-k3s agent \
-  --server "%s" \
-  --token "%s" \
-  --node-ip "$NETBIRD_IP" \
-  --flannel-iface wt0 \
-  --node-label "gpuscale.io/managed=true" \
-  --node-label "gpuscale.io/provider=verda" \
-  --node-label "gpuscale.io/gpu-type=%s" \
-  --node-label "gpuscale.io/instance-id=%s" \
-  --node-taint "nvidia.com/gpu:NoSchedule" &
-
-wait
-`, config.NetbirdKey, config.K3sURL, config.K3sToken, config.GPUType, config.InstanceID)
-	return script
+# Start vLLM OpenAI-compatible server
+exec python -m vllm.entrypoints.openai.api_server \
+  --model '%s' \
+  --host 0.0.0.0 \
+  --port %d \
+  --gpu-memory-utilization %.2f \
+  --max-model-len %d \
+  --dtype %s%s
+`, config.InstanceID, config.GPUType, modelID,
+		modelID, servePort, gpuMemUtil, maxModelLen, dtype, trustFlag)
 }
 
 func matchesGPUType(gpuType string, wanted []string) bool {

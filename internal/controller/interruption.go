@@ -110,7 +110,7 @@ func (r *InterruptionController) checkForInterruptions(ctx context.Context) {
 func (r *InterruptionController) handleInterruption(ctx context.Context, claim *v1alpha1.GPUNodeClaim) {
 	log := r.Log.WithValues("claim", claim.Name)
 
-	// 1. Cordon the node if it still exists
+	// For full-node: cordon and delete the K8s node if it still exists
 	if claim.Status.NodeName != "" {
 		var node corev1.Node
 		if err := r.Get(ctx, types.NamespacedName{Name: claim.Status.NodeName}, &node); err == nil {
@@ -123,14 +123,14 @@ func (r *InterruptionController) handleInterruption(ctx context.Context, claim *
 				}
 			}
 
-			// Delete the node object (best effort — instance may already be dead)
+			// Delete the node object
 			if err := r.Delete(ctx, &node); err != nil {
 				log.Error(err, "Failed to delete interrupted node")
 			}
 		}
 	}
 
-	// 2. Update claim status
+	// Update claim status
 	now := metav1.Now()
 	claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 	claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{

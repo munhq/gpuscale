@@ -1,77 +1,85 @@
 # GPUScale
 
-Multi-cloud GPU node autoscaler for Kubernetes. Dynamically provisions GPU instances from cheap cloud providers (Vast.ai, Verda, RunPod) and joins them to your K3s/K8s cluster.
+Multi-cloud GPU autoscaler for Kubernetes. Dynamically provisions standalone vLLM inference workers from spot GPU providers (Vast.ai, Verda, RunPod) when demand exceeds in-cluster capacity.
 
 ## Why GPUScale?
 
 - **Karpenter** only works on AWS/Azure
 - **Cluster Autoscaler** needs pre-defined node groups
-- **No open-source autoscaler** provisions GPU nodes from marketplace/spot GPU providers
+- **No open-source autoscaler** provisions GPU workers from marketplace/spot GPU providers
 
-GPUScale fills this gap: it watches for pending GPU workloads, finds the cheapest available GPU from across providers, provisions the instance, bootstraps it into your cluster via VPN, and scales down when idle.
+GPUScale fills this gap: it watches for pending GPU workloads, finds the cheapest available GPU across providers, provisions a standalone vLLM instance running Ray Serve, and destroys it when idle.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
-│  GPUScale Controller (runs in K3s)          │
+│  GPUScale Controller (runs in K8s)          │
 │                                              │
 │  Provisioning Controller                     │
 │    Watch pending GPU pods → batch →          │
-│    search offers → provision → bootstrap     │
-│                                              │
-│  Disruption Controller                       │
-│    Watch idle managed nodes → drain →        │
-│    destroy after cooldown                    │
-│                                              │
-│  Interruption Controller                     │
-│    Poll provider APIs → detect preemption →  │
-│    cleanup → let re-provision                │
+│    search offers → provision vLLM worker     │
 │                                              │
 │  Claim Reconciler                            │
 │    Manage GPUNodeClaim lifecycle:             │
 │    Pending → Provisioning → Bootstrapping    │
 │    → Ready → Draining → Terminated           │
-└─────────────────────────────────────────────┘
+│                                              │
+│  Disruption Controller                       │
+│    Watch idle workers → destroy after        │
+│    cooldown (respects minNodes)              │
+│                                              │
+│  Interruption Controller                     │
+│    Poll provider APIs → detect preemption →  │
+│    cleanup → let re-provision                │
+│                                              │
+│  Worker Metrics Collector                    │
+│    Scrape vLLM /metrics from workers →       │
+│    re-expose as gpuscale_worker_vllm_*       │
+└────────────────┬────────────────────────────┘
+                 │ provisions
+    ┌────────────┼────────────┐
+    ▼            ▼            ▼
+┌────────┐ ┌────────┐ ┌────────┐
+│Vast.ai │ │ Verda  │ │RunPod  │
+│ vLLM   │ │ vLLM   │ │ vLLM   │
+│ :8000  │ │ :8000  │ │ :8000  │
+└────────┘ └────────┘ └────────┘
+  Standalone ray-worker instances
+  (not K8s nodes — accessed via HTTP)
 ```
 
-### Bootstrap Flow
+### How It Works
 
-1. Provider provisions instance (30-60s)
-2. Bootstrap container starts — joins Netbird VPN (5-15s)
-3. K3s agent joins cluster over VPN (10-30s)
-4. NVIDIA device plugin detects GPU (10-30s)
-5. Pod schedules on new node (5-10s)
-
-**Total: ~1.5-3 minutes** with cached images.
+1. Pending GPU pod detected (e.g., KEDA demand-signal pod)
+2. Controller batches requests, finds cheapest GPU offer across providers
+3. Provider provisions instance with Ray Serve + vLLM (via `build_openai_app`)
+4. Controller polls `GET /v1/models` until worker is healthy (~1-3 min)
+5. Claim status moves to Ready with `status.endpoint` set
+6. GPU API router adds worker, starts routing inference requests
+7. When idle past cooldown → provider destroys instance
 
 ## Supported Providers
 
-| Provider | Capacity Types | Auth |
-|----------|---------------|------|
-| **Vast.ai** | Spot, On-demand | API Key |
-| **Verda** | Spot, On-demand | OAuth2 (client credentials) |
-| **RunPod** | Community, Secure | API Key |
+| Provider | Capacity Types | Auth | Instance Type |
+|----------|---------------|------|---------------|
+| **Vast.ai** | Spot, On-demand | API Key | Container |
+| **Verda** | Spot, On-demand | OAuth2 (client credentials) | VM |
+| **RunPod** | Community, Secure | API Key | Container |
 
 ## Quick Start
 
-### 1. Install CRDs and Controller
+### 1. Deploy via ArgoCD
+
+The Helm chart is at `ansible/argocd/charts/gpuscale/`. ArgoCD deploys it via ApplicationSet.
+
+### 2. Create Provider Credentials
 
 ```bash
-helm install gpuscale charts/gpuscale/ \
-  -n gpuscale-system --create-namespace \
-  --set providers.vastai.enabled=true \
-  --set providers.vastai.apiKey="your-vast-api-key"
-```
-
-### 2. Create Bootstrap Secrets
-
-```bash
-kubectl -n gpuscale-system create secret generic gpuscale-netbird-key \
-  --from-literal=setup-key="your-netbird-setup-key"
-
-kubectl -n gpuscale-system create secret generic gpuscale-k3s-token \
-  --from-literal=token="your-k3s-token"
+kubectl -n gpuscale-system create secret generic gpuscale-provider-credentials \
+  --from-literal=vastai-api-key="your-vast-api-key" \
+  --from-literal=verda-client-id="your-verda-client-id" \
+  --from-literal=verda-client-secret="your-verda-client-secret"
 ```
 
 ### 3. Create a GPUNodePool
@@ -84,8 +92,9 @@ metadata:
 spec:
   providers:
     - name: vast.ai
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-vast-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
       capacityType: spot
       maxPrice: 0.50
@@ -96,14 +105,15 @@ spec:
     maxNodes: 10
     cooldownPeriod: "10m"
   bootstrap:
-    image: "ghcr.io/munhq/gpuscale-node:latest"
-    vpnSetupKeySecret:
-      name: gpuscale-netbird-key
-      namespace: gpuscale-system
-    k3sTokenSecret:
-      name: gpuscale-k3s-token
-      namespace: gpuscale-system
-    k3sURL: "https://10.100.0.1:6443"
+    image: "rayproject/ray-llm:2.53.0-py311-cu128"
+    rayConfig:
+      servePort: 8000
+    modelConfig:
+      modelId: "THUDM/glm-4-9b-chat"
+      maxModelLen: 8192
+      dtype: auto
+      gpuMemoryUtilization: 0.90
+      enablePrefixCaching: true
   limits:
     maxGPUs: 20
     maxCostPerHour: 5.00
@@ -132,7 +142,7 @@ spec:
           nvidia.com/gpu: 1
 ```
 
-GPUScale will detect the pending pod, find the cheapest matching GPU, provision it, and join it to your cluster.
+GPUScale detects the pending pod, finds the cheapest GPU, and provisions a standalone vLLM worker.
 
 ### 5. Watch It Work
 
@@ -140,24 +150,24 @@ GPUScale will detect the pending pod, find the cheapest matching GPU, provision 
 # Watch GPUNodeClaims
 kubectl get gpunodeclaims -n gpuscale-system -w
 
-# Watch nodes joining
-kubectl get nodes -l gpuscale.io/managed=true -w
+# Check worker metrics
+curl http://gpuscale-controller:8080/metrics | grep gpuscale_worker
 ```
 
 ## CRDs
 
 ### GPUNodePool (cluster-scoped)
 
-Defines which providers to use, GPU requirements, scaling behavior, and bootstrap configuration.
+Defines which providers to use, GPU requirements, scaling behavior, model configuration, and cost limits.
 
 ### GPUNodeClaim (namespace-scoped)
 
-Auto-created by the controller. Tracks the lifecycle of a provisioned GPU node:
+Auto-created by the controller. Tracks the lifecycle of a provisioned GPU worker:
 - **Pending** — Claim created, waiting for provisioning
 - **Provisioning** — Instance being created on provider
-- **Bootstrapping** — Instance running, waiting for K3s join
-- **Ready** — Node joined and serving workloads
-- **Draining** — Node being drained before destruction
+- **Bootstrapping** — Instance running, waiting for vLLM to respond on `/v1/models`
+- **Ready** — Worker healthy and serving inference (endpoint in `status.endpoint`)
+- **Draining** — Worker being destroyed
 - **Terminated** — Instance destroyed
 
 ## Pod Annotations
@@ -170,21 +180,23 @@ Auto-created by the controller. Tracks the lifecycle of a provisioned GPU node:
 | `gpuscale.io/provider` | Preferred provider | any |
 | `gpuscale.io/priority` | `spot` or `on-demand` | `spot` |
 
+## Worker Monitoring
+
+The controller scrapes vLLM `/metrics` from each Ready worker every 60s and re-exposes them on `:8080/metrics` as `gpuscale_worker_vllm_*` with labels (endpoint, provider, instance_id, gpu_type). Prometheus picks these up for Grafana dashboards.
+
+Key metrics: `num_requests_running`, `gpu_cache_usage_perc`, `avg_generation_throughput_toks_per_s`, `e2e_request_latency_seconds`.
+
 ## Development
 
 ```bash
-# Build
-make build
-
-# Run locally (needs kubeconfig)
-make run
-
-# Build Docker images
-make docker-build
-make docker-build-node
+# Build controller
+cd gpuscale && go build -o bin/controller ./cmd/controller
 
 # Run tests
-make test
+cd gpuscale && go test ./...
+
+# Build Docker image
+docker build -f docker/controller/Dockerfile -t gpuscale-controller .
 ```
 
 ## Project Structure
@@ -192,16 +204,16 @@ make test
 ```
 gpuscale/
 ├── cmd/controller/        # Entry point
-├── api/v1alpha1/          # CRD types
+├── api/v1alpha1/          # CRD types (GPUNodePool, GPUNodeClaim)
 ├── internal/
-│   ├── controller/        # Provisioning, disruption, interruption controllers
+│   ├── controller/        # Provisioning, disruption, interruption, reconciler
 │   ├── provider/          # Provider interface + implementations
 │   │   ├── vastai/
 │   │   ├── verda/
 │   │   └── runpod/
 │   ├── scheduler/         # Pod-to-GPU matching, offer selection
-│   └── bootstrap/         # Bootstrap script generation, health checks
-├── charts/gpuscale/       # Helm chart
-├── docker/                # Dockerfiles (controller + node)
-└── examples/              # Example manifests
+│   ├── bootstrap/         # Ray Serve bootstrap script generation, health checks
+│   └── metrics/           # Worker vLLM metrics collector
+├── docker/controller/     # Controller Dockerfile
+└── examples/              # Example GPUNodePool manifests
 ```

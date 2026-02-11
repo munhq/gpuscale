@@ -1,3 +1,5 @@
+# Multi-provider GPUNodePool using Vast.ai + Verda + RunPod.
+# GPUScale selects the cheapest matching offer across all providers.
 apiVersion: gpuscale.io/v1alpha1
 kind: GPUNodePool
 metadata:
@@ -5,20 +7,23 @@ metadata:
 spec:
   providers:
     - name: vast.ai
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-vast-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
       capacityType: spot
       maxPrice: 0.50
     - name: verda
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-verda-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
       capacityType: spot
       maxPrice: 1.00
     - name: runpod
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-runpod-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
       capacityType: spot
       maxPrice: 0.80
@@ -36,14 +41,15 @@ spec:
     minNodes: 0
 
   bootstrap:
-    image: "ghcr.io/munhq/gpuscale-node:latest"
-    vpnSetupKeySecret:
-      name: gpuscale-netbird-key
-      namespace: gpuscale-system
-    k3sTokenSecret:
-      name: gpuscale-k3s-token
-      namespace: gpuscale-system
-    k3sURL: "https://10.100.0.1:6443"
+    image: "rayproject/ray-llm:2.53.0-py311-cu128"
+    rayConfig:
+      servePort: 8000
+    modelConfig:
+      modelId: "meta-llama/Llama-3.1-8B-Instruct"
+      maxModelLen: 8192
+      dtype: auto
+      gpuMemoryUtilization: 0.90
+      enablePrefixCaching: true
     modelCacheURL: "s3:my-bucket/models"
 
   limits:

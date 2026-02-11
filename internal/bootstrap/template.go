@@ -7,8 +7,8 @@ import (
 	"github.com/munhq/gpuscale/internal/provider"
 )
 
-// GenerateScript generates a bootstrap script for a provider instance.
-// This script is used as the entrypoint/onstart script for provisioned instances.
+// GenerateScript generates a bootstrap script for a full-node provider instance.
+// This script joins the node to the Kubernetes cluster via VPN.
 func GenerateScript(config provider.BootstrapConfig) string {
 	var sb strings.Builder
 
@@ -41,14 +41,15 @@ if [ -z "$NETBIRD_IP" ]; then
 fi
 echo "[gpuscale] VPN IP: $NETBIRD_IP"
 
-# 2. Start K3s agent
-echo "[gpuscale] Joining K3s cluster..."
+# 2. Start Kubernetes agent
+echo "[gpuscale] Joining Kubernetes cluster..."
 `)
 
-	// Build K3s agent command with labels
+	// Build Kubernetes agent command with labels
+	// Uses K3s agent binary — this is the actual command to join the cluster.
 	sb.WriteString(fmt.Sprintf(`k3s agent \
-  --server "%s" \
-  --token "%s" \
+  --server "$K8S_URL" \
+  --token "$K8S_TOKEN" \
   --node-ip "$NETBIRD_IP" \
   --flannel-iface wt0 \
   --node-label "gpuscale.io/managed=true" \
@@ -57,9 +58,9 @@ echo "[gpuscale] Joining K3s cluster..."
   --node-label "gpuscale.io/instance-id=%s" \
   --node-taint "nvidia.com/gpu:NoSchedule" \
   &
-`, config.K3sURL, config.K3sToken, config.ProviderName, sanitizeLabel(config.GPUType), config.InstanceID))
+`, config.ProviderName, SanitizeLabel(config.GPUType), config.InstanceID))
 
-	sb.WriteString(`K3S_PID=$!
+	sb.WriteString(`K8S_PID=$!
 
 `)
 
@@ -76,7 +77,7 @@ fi
 echo "[gpuscale] Waiting for node to be ready..."
 HOSTNAME=$(hostname)
 for i in $(seq 1 120); do
-  if k3s kubectl get node "$HOSTNAME" 2>/dev/null | grep -q " Ready"; then
+  if kubectl get node "$HOSTNAME" 2>/dev/null | grep -q " Ready"; then
     echo "[gpuscale] Node is Ready!"
     break
   fi
@@ -95,22 +96,33 @@ fi
 
 echo "[gpuscale] Bootstrap complete. Node is ready for workloads."
 
-# Keep running (K3s agent)
-wait $K3S_PID
+# Keep running (Kubernetes agent)
+wait $K8S_PID
 `)
 
 	return sb.String()
 }
 
-// GenerateEnvVars returns the environment variables map for an instance.
+// GenerateEnvVars returns the environment variables map for a node instance.
+// For full-node: includes VPN and Kubernetes join credentials.
+// For ray-worker: includes model and GPU info.
 func GenerateEnvVars(config provider.BootstrapConfig) map[string]string {
 	env := map[string]string{
-		"NETBIRD_SETUP_KEY": config.NetbirdKey,
-		"K3S_URL":           config.K3sURL,
-		"K3S_TOKEN":         config.K3sToken,
-		"GPU_TYPE":          config.GPUType,
-		"PROVIDER":          config.ProviderName,
-		"INSTANCE_ID":       config.InstanceID,
+		"GPU_TYPE":    config.GPUType,
+		"PROVIDER":    config.ProviderName,
+		"INSTANCE_ID": config.InstanceID,
+	}
+
+	// Full-node specific env vars
+	if config.NodeType == "full-node" {
+		env["NETBIRD_SETUP_KEY"] = config.NetbirdKey
+		env["K8S_URL"] = config.K8sURL
+		env["K8S_TOKEN"] = config.K8sToken
+	}
+
+	// Ray-worker specific env vars
+	if config.ModelID != "" {
+		env["MODEL_ID"] = config.ModelID
 	}
 	if config.ModelCacheURL != "" {
 		env["MODEL_CACHE_URL"] = config.ModelCacheURL
@@ -121,9 +133,9 @@ func GenerateEnvVars(config provider.BootstrapConfig) map[string]string {
 	return env
 }
 
-// sanitizeLabel sanitizes a string for use as a Kubernetes label value.
+// SanitizeLabel sanitizes a string for use as a Kubernetes label value.
 // Label values must be <= 63 chars, start/end with alphanumeric, and contain only [-_.a-zA-Z0-9].
-func sanitizeLabel(s string) string {
+func SanitizeLabel(s string) string {
 	var result strings.Builder
 	for _, c := range s {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {

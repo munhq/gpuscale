@@ -7,83 +7,77 @@ import (
 	"github.com/munhq/gpuscale/internal/provider"
 )
 
-// GenerateRayWorkerScript creates a bootstrap script for Ray Serve workers
+// GenerateRayWorkerScript creates a bootstrap script for a ray-worker that joins
+// an existing Ray cluster. The worker provides GPU capacity to the cluster, and
+// Ray Serve handles model placement and routing.
+//
+// This replaces the old standalone vLLM approach — workers no longer run their own
+// model. Instead, Ray Serve on the head node decides which models to load where.
 func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	var script strings.Builder
+
+	rayHeadAddr := config.RayHeadAddr
+	if rayHeadAddr == "" {
+		// Fallback: this shouldn't happen in production
+		rayHeadAddr = "localhost"
+	}
+
+	// Default GCS port is 6379
+	gcsPort := 6379
+
+	numGPUs := 1 // Default to 1 GPU
+	if config.ExtraEnv != nil {
+		if v, ok := config.ExtraEnv["NUM_GPUS"]; ok {
+			numGPUs = 0
+			for _, c := range v {
+				numGPUs = numGPUs*10 + int(c-'0')
+			}
+		}
+	}
 
 	script.WriteString("#!/bin/bash\n")
 	script.WriteString("set -euo pipefail\n\n")
 
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Starting Ray worker on %s'\n", config.ProviderName))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Instance ID: %s'\n", config.InstanceID))
-	script.WriteString(fmt.Sprintf("echo '[gpuscale] GPU Type: %s'\n\n", config.GPUType))
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] GPU Type: %s'\n", config.GPUType))
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Ray Head: %s:%d'\n\n", rayHeadAddr, gcsPort))
 
-	// Set defaults
-	dashPort := config.RayDashPort
-	if dashPort == 0 {
-		dashPort = 8265
-	}
-	servePort := config.RayServePort
-	if servePort == 0 {
-		servePort = 8000
-	}
-
-	// Install dependencies if not present
-	script.WriteString("# Install dependencies if needed\n")
-	script.WriteString("if ! command -v ray &> /dev/null; then\n")
-	script.WriteString("  echo '[gpuscale] Installing Ray...'\n")
-	script.WriteString("  pip install -q 'ray[serve]' 2>&1 | tail -5\n")
-	script.WriteString("fi\n\n")
-
-	// Start Ray
-	if config.RayHeadAddr == "" {
-		// Run as head node
-		script.WriteString("echo '[gpuscale] Starting Ray head node...'\n")
-		script.WriteString(fmt.Sprintf("ray start --head \\\n"))
-		script.WriteString(fmt.Sprintf("  --port=6379 \\\n"))
-		script.WriteString(fmt.Sprintf("  --dashboard-host=0.0.0.0 \\\n"))
-		script.WriteString(fmt.Sprintf("  --dashboard-port=%d \\\n", dashPort))
-		script.WriteString(fmt.Sprintf("  --num-gpus=1\n\n"))
-	} else {
-		// Connect to existing head
-		script.WriteString(fmt.Sprintf("echo '[gpuscale] Joining Ray cluster at %s...'\n", config.RayHeadAddr))
-		script.WriteString(fmt.Sprintf("ray start --address=%s --num-gpus=1\n\n", config.RayHeadAddr))
-	}
-
-	// Wait for Ray to be ready
-	script.WriteString("echo '[gpuscale] Waiting for Ray to be ready...'\n")
-	script.WriteString("for i in $(seq 1 30); do\n")
-	script.WriteString("  if ray status 2>/dev/null | grep -q 'Available resources'; then\n")
-	script.WriteString("    echo '[gpuscale] Ray is ready!'\n")
-	script.WriteString("    break\n")
-	script.WriteString("  fi\n")
-	script.WriteString("  sleep 2\n")
-	script.WriteString("done\n\n")
-
-	// Pre-cache models if configured
+	// Pre-cache models if configured (Ray Serve may need them on this worker)
 	if config.ModelCacheURL != "" {
-		script.WriteString(fmt.Sprintf("echo '[gpuscale] Pre-caching models from %s...'\n", config.ModelCacheURL))
+		script.WriteString(fmt.Sprintf("echo '[gpuscale] Pre-caching model from %s...'\n", config.ModelCacheURL))
 		script.WriteString("mkdir -p /opt/models\n")
-		script.WriteString(fmt.Sprintf("rclone sync '%s' /opt/models/ --progress &\n", config.ModelCacheURL))
-		script.WriteString("CACHE_PID=$!\n\n")
-	}
-
-	// Keep Ray running
-	script.WriteString("echo '[gpuscale] Ray worker is ready for inference'\n")
-	script.WriteString(fmt.Sprintf("echo '[gpuscale] Dashboard: http://$(hostname -I | awk '{print $1}'):%d'\n", dashPort))
-	script.WriteString(fmt.Sprintf("echo '[gpuscale] Serve endpoint: http://$(hostname -I | awk '{print $1}'):%d'\n\n", servePort))
-
-	// Wait for model cache if running
-	if config.ModelCacheURL != "" {
-		script.WriteString("if [ -n \"${CACHE_PID:-}\" ]; then\n")
-		script.WriteString("  echo '[gpuscale] Waiting for model cache...'\n")
-		script.WriteString("  wait \"$CACHE_PID\" || echo '[gpuscale] Model cache sync failed'\n")
+		script.WriteString("if command -v rclone &> /dev/null; then\n")
+		script.WriteString(fmt.Sprintf("  rclone sync '%s' /opt/models/ --progress\n", config.ModelCacheURL))
+		script.WriteString("else\n")
+		script.WriteString("  echo '[gpuscale] rclone not found, skipping pre-cache'\n")
 		script.WriteString("fi\n\n")
 	}
 
-	// Keep container running
-	script.WriteString("# Keep alive\n")
-	script.WriteString("tail -f /dev/null\n")
+	// Set HuggingFace cache directory
+	script.WriteString("export HF_HOME=/opt/models/huggingface\n")
+	script.WriteString("export TRANSFORMERS_CACHE=/opt/models/huggingface\n")
+	script.WriteString("export VLLM_WORKER_MULTIPROC_METHOD=spawn\n")
+	script.WriteString("mkdir -p /opt/models/huggingface\n\n")
+
+	// Wait for Ray head to be reachable
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Waiting for Ray head at %s:%d...'\n", rayHeadAddr, gcsPort))
+	script.WriteString(fmt.Sprintf("for i in $(seq 1 60); do\n"))
+	script.WriteString(fmt.Sprintf("  if python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('%s', %d)); s.close()\" 2>/dev/null; then\n", rayHeadAddr, gcsPort))
+	script.WriteString("    echo '[gpuscale] Ray head is reachable'\n")
+	script.WriteString("    break\n")
+	script.WriteString("  fi\n")
+	script.WriteString("  echo \"[gpuscale] Waiting for Ray head (attempt $i/60)...\"\n")
+	script.WriteString("  sleep 5\n")
+	script.WriteString("done\n\n")
+
+	// Join the Ray cluster as a worker node
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Joining Ray cluster as worker with %d GPUs...'\n", numGPUs))
+	script.WriteString(fmt.Sprintf("ray start --address='%s:%d' \\\n", rayHeadAddr, gcsPort))
+	script.WriteString(fmt.Sprintf("  --num-gpus=%d \\\n", numGPUs))
+	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"%s\"}' \\\n",
+		config.ProviderName, config.GPUType, config.InstanceID))
+	script.WriteString("  --block\n")
 
 	return script.String()
 }

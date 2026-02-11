@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/munhq/gpuscale/internal/bootstrap"
 	"github.com/munhq/gpuscale/internal/provider"
 )
 
@@ -95,17 +96,71 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 }
 
 func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, config provider.BootstrapConfig) (*provider.Instance, error) {
-	env := map[string]string{
-		"NETBIRD_SETUP_KEY": config.NetbirdKey,
-		"K3S_URL":           config.K3sURL,
-		"K3S_TOKEN":         config.K3sToken,
-		"GPU_TYPE":          config.GPUType,
-		"PROVIDER":          config.ProviderName,
-		"INSTANCE_ID":       config.InstanceID,
+	var env map[string]string
+	var image string
+	var dockerArgs string
+	var ports string
+
+	if config.NodeType == "ray-worker" {
+		// Ray worker mode — standalone vLLM in container
+		image = config.Image
+		if image == "" {
+			image = "vllm/vllm-openai:latest"
+		}
+
+		env = map[string]string{
+			"GPU_TYPE":    config.GPUType,
+			"PROVIDER":    config.ProviderName,
+			"INSTANCE_ID": config.InstanceID,
+		}
+		if config.ModelID != "" {
+			env["MODEL_ID"] = config.ModelID
+		}
+		if config.ModelCacheURL != "" {
+			env["MODEL_CACHE_URL"] = config.ModelCacheURL
+		}
+
+		// Build vLLM serve command as docker args
+		servePort := config.RayServePort
+		if servePort == 0 {
+			servePort = 8000
+		}
+		modelID := config.ModelID
+		if modelID == "" {
+			modelID = "THUDM/glm-4-9b-chat"
+		}
+		maxModelLen := config.MaxModelLen
+		if maxModelLen == 0 {
+			maxModelLen = 4096
+		}
+		dtype := config.DType
+		if dtype == "" {
+			dtype = "auto"
+		}
+		gpuMemUtil := config.GPUMemUtil
+		if gpuMemUtil <= 0 {
+			gpuMemUtil = 0.90
+		}
+
+		dockerArgs = fmt.Sprintf(
+			"--model %s --host 0.0.0.0 --port %d --gpu-memory-utilization %.2f --max-model-len %d --dtype %s",
+			modelID, servePort, gpuMemUtil, maxModelLen, dtype,
+		)
+		if config.TrustRemoteCode {
+			dockerArgs += " --trust-remote-code"
+		}
+
+		ports = fmt.Sprintf("%d/http", servePort)
+	} else {
+		// Full-node mode — VM joins Kubernetes cluster via VPN
+		image = config.Image
+		if image == "" {
+			image = "ghcr.io/munhq/gpuscale-node:latest"
+		}
+		env = bootstrap.GenerateEnvVars(config)
+		ports = "22/tcp"
 	}
-	if config.ModelCacheURL != "" {
-		env["MODEL_CACHE_URL"] = config.ModelCacheURL
-	}
+
 	for k, v := range config.ExtraEnv {
 		env[k] = v
 	}
@@ -117,13 +172,15 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 
 	createReq := CreatePodRequest{
 		Name:              fmt.Sprintf("gpuscale-%s", config.InstanceID),
-		ImageName:         config.Image,
+		ImageName:         image,
 		GPUTypeID:         offer.OfferID,
 		GPUCount:          offer.GPUCount,
 		CloudType:         cloudType,
 		VolumeInGB:        50,
 		ContainerDiskInGB: 20,
 		Env:               env,
+		DockerArgs:        dockerArgs,
+		Ports:             ports,
 		StartSSH:          true,
 	}
 
@@ -132,9 +189,21 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating runpod pod: %w", err)
 	}
 
+	// Build endpoint for ray-worker type
+	endpoint := ""
+	if config.NodeType == "ray-worker" {
+		servePort := config.RayServePort
+		if servePort == 0 {
+			servePort = 8000
+		}
+		endpoint = fmt.Sprintf("http://pending:%d", servePort) // placeholder until IP is assigned
+	}
+
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   pod.ID,
+		NodeType:     config.NodeType,
+		Endpoint:     endpoint,
 		Status:       normalizeStatus(pod.DesiredStatus),
 		GPUType:      offer.GPUType,
 		GPUCount:     offer.GPUCount,
@@ -166,13 +235,14 @@ func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provide
 	}
 
 	var ip string
-	var sshPort int
+	var endpoint string
 	if pod.Runtime != nil {
 		for _, port := range pod.Runtime.Ports {
-			if port.PrivatePort == 22 {
+			if port.PrivatePort == 22 && ip == "" {
 				ip = port.IP
-				sshPort = port.PublicPort
-				break
+			}
+			if port.PrivatePort == 8000 && port.IP != "" {
+				endpoint = fmt.Sprintf("http://%s:%d", port.IP, port.PublicPort)
 			}
 		}
 	}
@@ -181,7 +251,7 @@ func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provide
 		ProviderName: p.Name(),
 		InstanceID:   pod.ID,
 		IP:           ip,
-		SSHPort:      sshPort,
+		Endpoint:     endpoint,
 		Status:       normalizeStatus(pod.DesiredStatus),
 		GPUType:      gpuType,
 		GPUCount:     gpuCount,

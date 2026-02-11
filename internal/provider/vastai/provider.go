@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/munhq/gpuscale/internal/bootstrap"
 	"github.com/munhq/gpuscale/internal/provider"
 )
 
@@ -100,12 +101,11 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	var onstart string
 	var image string
 
-	// Configure based on node type
 	if config.NodeType == "ray-worker" {
-		// Ray worker mode - runs in container
+		// Ray worker mode — standalone vLLM in container
 		image = config.Image
 		if image == "" {
-			image = "rayproject/ray:latest-gpu"
+			image = "vllm/vllm-openai:latest"
 		}
 
 		env = map[string]string{
@@ -113,42 +113,27 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 			"PROVIDER":    config.ProviderName,
 			"INSTANCE_ID": config.InstanceID,
 		}
+		if config.ModelID != "" {
+			env["MODEL_ID"] = config.ModelID
+		}
 		if config.ModelCacheURL != "" {
 			env["MODEL_CACHE_URL"] = config.ModelCacheURL
-		}
-		if config.RayHeadAddr != "" {
-			env["RAY_HEAD_ADDR"] = config.RayHeadAddr
 		}
 		for k, v := range config.ExtraEnv {
 			env[k] = v
 		}
 
-		// Generate Ray bootstrap script
-		onstart = generateRayBootstrapScript(config)
+		onstart = generateVLLMBootstrapScript(config)
 
 	} else {
-		// K3s mode - needs VM (but we'll use container for now with warning)
+		// Full-node mode — VM joins Kubernetes cluster via VPN
 		image = config.Image
 		if image == "" {
 			image = "ghcr.io/munhq/gpuscale-node:latest"
 		}
 
-		env = map[string]string{
-			"NETBIRD_SETUP_KEY": config.NetbirdKey,
-			"K3S_URL":           config.K3sURL,
-			"K3S_TOKEN":         config.K3sToken,
-			"GPU_TYPE":          config.GPUType,
-			"PROVIDER":          config.ProviderName,
-			"INSTANCE_ID":       config.InstanceID,
-		}
-		if config.ModelCacheURL != "" {
-			env["MODEL_CACHE_URL"] = config.ModelCacheURL
-		}
-		for k, v := range config.ExtraEnv {
-			env[k] = v
-		}
-
-		onstart = "#!/bin/bash\n/bootstrap.sh"
+		env = bootstrap.GenerateEnvVars(config)
+		onstart = bootstrap.GenerateScript(config)
 	}
 
 	createReq := InstanceCreateRequest{
@@ -171,7 +156,9 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		if servePort == 0 {
 			servePort = 8000
 		}
-		endpoint = fmt.Sprintf("http://%s:%d", resp.SSHHost, servePort)
+		if resp.SSHHost != "" {
+			endpoint = fmt.Sprintf("http://%s:%d", resp.SSHHost, servePort)
+		}
 	}
 
 	return &provider.Instance{
@@ -189,56 +176,74 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	}, nil
 }
 
-// generateRayBootstrapScript creates an inline bootstrap script for Ray workers
-func generateRayBootstrapScript(config provider.BootstrapConfig) string {
-	dashPort := config.RayDashPort
-	if dashPort == 0 {
-		dashPort = 8265
-	}
+// generateVLLMBootstrapScript creates an inline bootstrap script for vLLM workers.
+func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 	servePort := config.RayServePort
 	if servePort == 0 {
 		servePort = 8000
 	}
 
+	modelID := config.ModelID
+	if modelID == "" {
+		modelID = "THUDM/glm-4-9b-chat"
+	}
+	maxModelLen := config.MaxModelLen
+	if maxModelLen == 0 {
+		maxModelLen = 4096
+	}
+	dtype := config.DType
+	if dtype == "" {
+		dtype = "auto"
+	}
+	gpuMemUtil := config.GPUMemUtil
+	if gpuMemUtil <= 0 {
+		gpuMemUtil = 0.90
+	}
+
 	script := fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 
-echo '[gpuscale] Starting Ray worker on %s'
+echo '[gpuscale] Starting vLLM worker on %s'
 echo '[gpuscale] Instance: %s, GPU: %s'
+echo '[gpuscale] Model: %s'
 
-# Install Ray if needed
-if ! command -v ray &> /dev/null; then
-  echo '[gpuscale] Installing Ray...'
-  pip install -q 'ray[serve]' 2>&1 | tail -5
+# Install vLLM if not present (pre-built images like vllm/vllm-openai already have it)
+if ! python -c "import vllm" 2>/dev/null; then
+  echo '[gpuscale] Installing vLLM...'
+  pip install vllm 2>&1 | tail -10
 fi
 
-# Start Ray
-`, config.ProviderName, config.InstanceID, config.GPUType)
+`, config.ProviderName, config.InstanceID, config.GPUType, modelID)
 
-	if config.RayHeadAddr == "" {
-		script += fmt.Sprintf(`echo '[gpuscale] Starting Ray head node...'
-ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=%d --num-gpus=1
-`, dashPort)
-	} else {
-		script += fmt.Sprintf(`echo '[gpuscale] Joining Ray cluster at %s...'
-ray start --address=%s --num-gpus=1
-`, config.RayHeadAddr, config.RayHeadAddr)
+	// Optional model pre-cache
+	if config.ModelCacheURL != "" {
+		script += fmt.Sprintf(`# Pre-cache model weights
+echo '[gpuscale] Pre-caching model from %s...'
+mkdir -p /opt/models
+if command -v rclone &> /dev/null; then
+  rclone sync '%s' /opt/models/ --progress
+else
+  echo '[gpuscale] rclone not found, skipping pre-cache'
+fi
+
+`, config.ModelCacheURL, config.ModelCacheURL)
 	}
 
-	script += `
-# Wait for Ray to be ready
-echo '[gpuscale] Waiting for Ray...'
-for i in $(seq 1 30); do
-  if ray status 2>/dev/null | grep -q 'Available resources'; then
-    echo '[gpuscale] Ray is ready!'
-    break
-  fi
-  sleep 2
-done
+	trustFlag := ""
+	if config.TrustRemoteCode {
+		trustFlag = "\n  --trust-remote-code \\"
+	}
 
-echo '[gpuscale] Ray worker ready for inference'
-tail -f /dev/null
-`
+	script += fmt.Sprintf(`# Start vLLM OpenAI-compatible server
+echo '[gpuscale] Starting vLLM serve on port %d...'
+exec python -m vllm.entrypoints.openai.api_server \
+  --model '%s' \
+  --host 0.0.0.0 \
+  --port %d \
+  --gpu-memory-utilization %.2f \
+  --max-model-len %d \
+  --dtype %s%s
+`, servePort, modelID, servePort, gpuMemUtil, maxModelLen, dtype, trustFlag)
 
 	return script
 }

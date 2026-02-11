@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
-	"github.com/munhq/gpuscale/internal/bootstrap"
 	"github.com/munhq/gpuscale/internal/provider"
 	"github.com/munhq/gpuscale/internal/scheduler"
 	"github.com/go-logr/logr"
@@ -19,12 +18,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// DisruptionController watches managed nodes and destroys idle ones after cooldown.
+// DisruptionController watches managed nodes and GPUNodeClaims, destroying idle ones after cooldown.
+// Supports two modes:
+//   - full-node: watches Kubernetes Node objects, pod-based idle detection, drain-and-destroy
+//   - ray-worker: watches GPUNodeClaim objects, metrics-based idle detection, simple destroy
 type DisruptionController struct {
 	client.Client
 	Log            logr.Logger
 	Registry       *provider.Registry
 	CooldownPeriod time.Duration
+	WorkerStore    *WorkerStore
 }
 
 // NewDisruptionController creates a new disruption controller.
@@ -37,35 +40,41 @@ func NewDisruptionController(c client.Client, log logr.Logger, reg *provider.Reg
 	}
 }
 
-// Reconcile checks if a managed node is idle and should be destroyed.
+// Reconcile is the main entry point. It handles both full-node (Node events) and
+// ray-worker (GPUNodeClaim events) disruption.
 func (r *DisruptionController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("node", req.Name)
+	log := r.Log.WithValues("claim", req.NamespacedName)
 
-	// Fetch the node
-	var node corev1.Node
-	if err := r.Get(ctx, req.NamespacedName, &node); err != nil {
+	var claim v1alpha1.GPUNodeClaim
+	if err := r.Get(ctx, req.NamespacedName, &claim); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Only process managed nodes
-	if node.Labels[scheduler.LabelManaged] != "true" {
+	// Only process Ready claims
+	if claim.Status.Phase != v1alpha1.ClaimPhaseReady {
 		return ctrl.Result{}, nil
 	}
 
-	// Find the corresponding GPUNodeClaim
-	claim, err := r.findClaimForNode(ctx, &node)
-	if err != nil {
-		log.Error(err, "Failed to find claim for node")
+	// Branch based on node type
+	if claim.Status.NodeType == "full-node" {
+		return r.reconcileFullNode(ctx, &claim, log)
+	}
+	return r.reconcileRayWorker(ctx, &claim, log)
+}
+
+// --- Full-node path: pod-based idle detection on Kubernetes nodes ---
+
+func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	nodeName := claim.Status.NodeName
+	if nodeName == "" {
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+
+	// Fetch the node
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		log.Error(err, "Failed to get node for full-node claim")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	if claim == nil {
-		log.Info("No GPUNodeClaim found for managed node, skipping")
-		return ctrl.Result{}, nil
-	}
-
-	// Don't process nodes that are already draining or terminated
-	if claim.Status.Phase == v1alpha1.ClaimPhaseDraining || claim.Status.Phase == v1alpha1.ClaimPhaseTerminated {
-		return ctrl.Result{}, nil
 	}
 
 	// Check if node is idle (no GPU workload pods)
@@ -76,7 +85,6 @@ func (r *DisruptionController) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if !idle {
-		// Node has active GPU workloads; clear idle timestamp
 		if claim.Status.IdleSince != nil {
 			claim.Status.IdleSince = nil
 			if err := r.Status().Update(ctx, claim); err != nil {
@@ -86,51 +94,9 @@ func (r *DisruptionController) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
-	// Node is idle — check if we've been tracking how long
-	now := metav1.Now()
-	if claim.Status.IdleSince == nil {
-		claim.Status.IdleSince = &now
-		if err := r.Status().Update(ctx, claim); err != nil {
-			log.Error(err, "Failed to set idle timestamp")
-		}
-		log.Info("Node became idle, starting cooldown timer")
-		return ctrl.Result{RequeueAfter: r.CooldownPeriod}, nil
-	}
-
-	// Check if cooldown has expired
-	idleDuration := time.Since(claim.Status.IdleSince.Time)
-	if idleDuration < r.CooldownPeriod {
-		remaining := r.CooldownPeriod - idleDuration
-		log.Info("Node idle but cooldown not expired", "remaining", remaining.String())
-		return ctrl.Result{RequeueAfter: remaining}, nil
-	}
-
-	// Check pool min-nodes constraint
-	pool, err := r.getPool(ctx, claim.Spec.PoolRef)
-	if err != nil {
-		log.Error(err, "Failed to get pool")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	if pool != nil {
-		activeCount := r.countActiveNodes(ctx, pool.Name)
-		if activeCount <= pool.Spec.Scaling.MinNodes {
-			log.Info("At minimum nodes, not scaling down", "active", activeCount, "min", pool.Spec.Scaling.MinNodes)
-			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-		}
-	}
-
-	// Cooldown expired — drain and destroy
-	log.Info("Node idle past cooldown, initiating drain and destroy",
-		"idleDuration", idleDuration.String(),
-		"cooldown", r.CooldownPeriod.String(),
-	)
-
-	if err := r.drainAndDestroy(ctx, &node, claim); err != nil {
-		log.Error(err, "Failed to drain and destroy node")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	return ctrl.Result{}, nil
+	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
+		return r.drainAndDestroy(ctx, &node, claim, log)
+	})
 }
 
 func (r *DisruptionController) isNodeIdle(ctx context.Context, node *corev1.Node) (bool, error) {
@@ -140,15 +106,12 @@ func (r *DisruptionController) isNodeIdle(ctx context.Context, node *corev1.Node
 	}
 
 	for _, pod := range podList.Items {
-		// Skip DaemonSet pods
 		if isDaemonSetPod(&pod) {
 			continue
 		}
-		// Skip completed/failed pods
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		// If there's any running GPU pod, the node is not idle
 		if scheduler.IsGPUPod(&pod) && pod.Status.Phase == corev1.PodRunning {
 			return false, nil
 		}
@@ -165,20 +128,18 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 	return false
 }
 
-func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1.Node, claim *v1alpha1.GPUNodeClaim) error {
-	log := r.Log.WithValues("node", node.Name, "claim", claim.Name)
-
+func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1.Node, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
 	// Update claim phase to Draining
 	claim.Status.Phase = v1alpha1.ClaimPhaseDraining
 	if err := r.Status().Update(ctx, claim); err != nil {
-		return fmt.Errorf("updating claim phase to Draining: %w", err)
+		return ctrl.Result{}, fmt.Errorf("updating claim phase to Draining: %w", err)
 	}
 
 	// Cordon the node
 	if !node.Spec.Unschedulable {
 		node.Spec.Unschedulable = true
 		if err := r.Update(ctx, node); err != nil {
-			return fmt.Errorf("cordoning node: %w", err)
+			return ctrl.Result{}, fmt.Errorf("cordoning node: %w", err)
 		}
 		log.Info("Node cordoned")
 	}
@@ -186,7 +147,7 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 	// Evict non-DaemonSet pods
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
-		return fmt.Errorf("listing pods for drain: %w", err)
+		return ctrl.Result{}, fmt.Errorf("listing pods for drain: %w", err)
 	}
 	for _, pod := range podList.Items {
 		if isDaemonSetPod(&pod) {
@@ -203,7 +164,7 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 	// Destroy the provider instance
 	prov, ok := r.Registry.Get(claim.Status.Provider)
 	if !ok {
-		return fmt.Errorf("provider %q not found in registry", claim.Status.Provider)
+		return ctrl.Result{}, fmt.Errorf("provider %q not found in registry", claim.Status.Provider)
 	}
 	if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
 		log.Error(err, "Failed to destroy provider instance")
@@ -211,7 +172,7 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 		log.Info("Provider instance destroyed", "instanceID", claim.Status.InstanceID)
 	}
 
-	// Delete the K8s node object
+	// Delete the Kubernetes node object
 	if err := r.Delete(ctx, node); err != nil {
 		log.Error(err, "Failed to delete node object")
 	}
@@ -219,11 +180,16 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 	// Update claim to Terminated
 	claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 	if err := r.Status().Update(ctx, claim); err != nil {
-		return fmt.Errorf("updating claim phase to Terminated: %w", err)
+		return ctrl.Result{}, fmt.Errorf("updating claim phase to Terminated: %w", err)
+	}
+
+	// Remove from Dragonfly
+	if err := r.WorkerStore.RemoveWorker(ctx, claim.Name); err != nil {
+		log.Error(err, "Failed to remove worker from Dragonfly")
 	}
 
 	log.Info("Node drain and destroy complete")
-	return nil
+	return ctrl.Result{}, nil
 }
 
 func (r *DisruptionController) findClaimForNode(ctx context.Context, node *corev1.Node) (*v1alpha1.GPUNodeClaim, error) {
@@ -243,6 +209,144 @@ func (r *DisruptionController) findClaimForNode(ctx context.Context, node *corev
 		}
 	}
 	return nil, nil
+}
+
+// --- Ray-worker path: demand-based idle detection ---
+// Ray workers join the Ray cluster and don't serve requests directly.
+// Idle detection: check if the provider instance is still alive, and if
+// there are demand-signal pods pending for this pool. If KEDA has scaled
+// down all demand pods, the worker is idle.
+
+func (r *DisruptionController) reconcileRayWorker(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	// Check if the provider instance is still alive
+	prov, ok := r.Registry.Get(claim.Status.Provider)
+	if !ok {
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+	instance, err := prov.GetInstance(ctx, claim.Status.InstanceID)
+	if err != nil {
+		log.Error(err, "Failed to check instance status")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if instance.Status == "stopped" || instance.Status == "error" {
+		log.Info("Ray worker instance died, destroying", "status", instance.Status)
+		return r.destroyWorker(ctx, claim, log)
+	}
+
+	// Check if there are demand-signal pods for this pool.
+	// If KEDA has scaled demand to 0, there's no demand → worker is idle.
+	hasDemand, err := r.hasDemandPods(ctx)
+	if err != nil {
+		log.Error(err, "Failed to check demand pods")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	if hasDemand {
+		// There's demand — clear idle and recheck
+		if claim.Status.IdleSince != nil {
+			claim.Status.IdleSince = nil
+			if err := r.Status().Update(ctx, claim); err != nil {
+				log.Error(err, "Failed to clear idle timestamp")
+			}
+			log.Info("Demand pods exist, worker is not idle")
+		}
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+
+	// No demand pods → worker is idle
+	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
+		return r.destroyWorker(ctx, claim, log)
+	})
+}
+
+// hasDemandPods checks if there are any pending demand-signal GPU pods.
+func (r *DisruptionController) hasDemandPods(ctx context.Context) (bool, error) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.MatchingLabels{
+		"app": "gpu-demand",
+	}); err != nil {
+		return false, err
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	claim.Status.Phase = v1alpha1.ClaimPhaseDraining
+	if err := r.Status().Update(ctx, claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating claim phase to Draining: %w", err)
+	}
+
+	prov, ok := r.Registry.Get(claim.Status.Provider)
+	if !ok {
+		return ctrl.Result{}, fmt.Errorf("provider %q not found in registry", claim.Status.Provider)
+	}
+	if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+		log.Error(err, "Failed to destroy worker instance")
+	} else {
+		log.Info("Worker instance destroyed", "instanceID", claim.Status.InstanceID)
+	}
+
+	claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+	if err := r.Status().Update(ctx, claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating claim phase to Terminated: %w", err)
+	}
+
+	// Remove from Dragonfly
+	if err := r.WorkerStore.RemoveWorker(ctx, claim.Name); err != nil {
+		log.Error(err, "Failed to remove worker from Dragonfly")
+	}
+
+	log.Info("Worker destroy complete")
+	return ctrl.Result{}, nil
+}
+
+// --- Shared helpers ---
+
+// handleIdleClaim processes idle detection and cooldown for any claim type.
+// The destroyFn callback performs the type-specific destruction.
+func (r *DisruptionController) handleIdleClaim(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger, destroyFn func() (ctrl.Result, error)) (ctrl.Result, error) {
+	now := metav1.Now()
+	if claim.Status.IdleSince == nil {
+		claim.Status.IdleSince = &now
+		if err := r.Status().Update(ctx, claim); err != nil {
+			log.Error(err, "Failed to set idle timestamp")
+		}
+		log.Info("Claim became idle, starting cooldown timer")
+		return ctrl.Result{RequeueAfter: r.CooldownPeriod}, nil
+	}
+
+	idleDuration := time.Since(claim.Status.IdleSince.Time)
+	if idleDuration < r.CooldownPeriod {
+		remaining := r.CooldownPeriod - idleDuration
+		log.Info("Idle but cooldown not expired", "remaining", remaining.String())
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	// Check pool min-nodes constraint
+	pool, err := r.getPool(ctx, claim.Spec.PoolRef)
+	if err != nil {
+		log.Error(err, "Failed to get pool")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if pool != nil {
+		activeCount := r.countActiveNodes(ctx, pool.Name)
+		if activeCount <= pool.Spec.Scaling.MinNodes {
+			log.Info("At minimum nodes, not scaling down", "active", activeCount, "min", pool.Spec.Scaling.MinNodes)
+			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		}
+	}
+
+	log.Info("Idle past cooldown, initiating destroy",
+		"idleDuration", idleDuration.String(),
+		"cooldown", r.CooldownPeriod.String(),
+	)
+
+	return destroyFn()
 }
 
 func (r *DisruptionController) getPool(ctx context.Context, name string) (*v1alpha1.GPUNodePool, error) {
@@ -268,8 +372,9 @@ func (r *DisruptionController) countActiveNodes(ctx context.Context, poolName st
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// Watches both Nodes (for full-node disruption) and GPUNodeClaims (for ray-worker disruption).
 func (r *DisruptionController) SetupWithManager(mgr ctrl.Manager) error {
-	// Index pods by node name for efficient lookups
+	// Index pods by node name for efficient lookups (full-node path)
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
 		pod := obj.(*corev1.Pod)
 		if pod.Spec.NodeName == "" {
@@ -280,10 +385,11 @@ func (r *DisruptionController) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("indexing pods by nodeName: %w", err)
 	}
 
-	_ = bootstrap.IsNodeReady // reference to prevent unused import (used in reconciler.go)
-
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("disruptor").
+		// Watch GPUNodeClaims directly (handles ray-worker claims + full-node claims)
+		For(&v1alpha1.GPUNodeClaim{}).
+		// Also watch Nodes — map managed nodes to their corresponding GPUNodeClaim
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(
 			func(ctx context.Context, obj client.Object) []reconcile.Request {
 				node, ok := obj.(*corev1.Node)
@@ -293,10 +399,20 @@ func (r *DisruptionController) SetupWithManager(mgr ctrl.Manager) error {
 				if node.Labels[scheduler.LabelManaged] != "true" {
 					return nil
 				}
+				// Find the claim for this node and enqueue it
+				claim, err := r.findClaimForNode(ctx, node)
+				if err != nil || claim == nil {
+					return nil
+				}
 				return []reconcile.Request{
-					{NamespacedName: types.NamespacedName{Name: node.Name}},
+					{NamespacedName: types.NamespacedName{
+						Name:      claim.Name,
+						Namespace: claim.Namespace,
+					}},
 				}
 			},
 		)).
-		Complete(r)
+		Complete(reconcile.Func(func(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+			return r.Reconcile(ctx, req)
+		}))
 }

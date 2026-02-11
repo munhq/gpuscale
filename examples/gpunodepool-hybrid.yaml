@@ -1,34 +1,34 @@
+# Hybrid pool: Vast.ai for cheap spot + Verda for on-demand fallback.
+# Both providers run standalone ray-worker vLLM instances.
+# GPUScale tries Vast.ai first (cheaper), falls back to Verda if no offers.
 apiVersion: gpuscale.io/v1alpha1
 kind: GPUNodePool
 metadata:
   name: hybrid-inference-pool
 spec:
-  # Multiple providers with different node types
   providers:
-    # Vast.ai with ray-worker mode (containers work!)
+    # Vast.ai spot — cheapest, but less reliable
     - name: vast.ai
-      nodeType: ray-worker  # Run Ray Serve directly, no K3s
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-vastai-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
       capacityType: spot
-      maxPrice: 0.30  # $/hr per GPU
+      maxPrice: 0.30
 
-    # Verda with k3s mode (VMs join cluster)
+    # Verda on-demand — more expensive, guaranteed availability
     - name: verda
-      nodeType: k3s  # Full K3s integration
+      nodeType: ray-worker
       apiKeySecret:
-        name: gpuscale-verda-credentials
+        name: gpuscale-provider-credentials
         namespace: gpuscale-system
-      capacityType: spot
+      capacityType: on-demand
       maxPrice: 1.00
 
-  # GPU requirements (applied to all providers)
   requirements:
     gpuTypes: ["RTX 4090", "RTX 3090", "A100"]
-    minVRAM: 24  # GB
+    minVRAM: 24
 
-  # Scaling behavior
   scaling:
     batchWindow: "10s"
     cooldownPeriod: "10m"
@@ -36,30 +36,19 @@ spec:
     minNodes: 0
     interruptionPollInterval: "30s"
 
-  # Bootstrap configuration
   bootstrap:
-    # For ray-worker nodes (Vast.ai)
-    image: "rayproject/ray:latest-gpu"
-
-    # Ray configuration (only for ray-worker type)
+    image: "rayproject/ray-llm:2.53.0-py311-cu128"
     rayConfig:
-      dashboardPort: 8265
       servePort: 8000
-      # Leave headAddress empty = run as standalone head nodes
+    modelConfig:
+      modelId: "THUDM/glm-4-9b-chat"
+      modelSource: "THUDM/glm-4-9b-chat"
+      maxModelLen: 8192
+      dtype: auto
+      gpuMemoryUtilization: 0.90
+      enablePrefixCaching: true
+      maxOngoingRequests: 64
 
-    # For k3s nodes (Verda) - also include these fields
-    vpnSetupKeySecret:
-      name: gpuscale-netbird-key
-      namespace: gpuscale-system
-    k3sTokenSecret:
-      name: gpuscale-k3s-token
-      namespace: gpuscale-system
-    k3sURL: "https://10.100.0.1:6443"
-
-    # Optional: pre-cache models
-    modelCacheURL: "s3:your-bucket/models"
-
-  # Limits
   limits:
     maxGPUs: 20
     maxCostPerHour: 10.00

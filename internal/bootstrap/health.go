@@ -10,6 +10,7 @@ import (
 )
 
 // NodeHealthChecker checks whether a node has joined the cluster and is ready.
+// Used by the full-node bootstrap path.
 type NodeHealthChecker struct {
 	client client.Client
 }
@@ -84,3 +85,4 @@ func (h *NodeHealthChecker) findNodeByInstanceID(ctx context.Context, instanceID
 	}
 	return &nodeList.Items[0], nil
 }
+

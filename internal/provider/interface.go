@@ -40,14 +40,25 @@ type Offer struct {
 
 // BootstrapConfig contains the configuration needed to bootstrap a node.
 type BootstrapConfig struct {
-	NodeType      string            // "k3s" or "ray-worker"
-	Image         string            // Docker image for the node
-	NetbirdKey    string            // Netbird VPN setup key (k3s only)
-	K3sURL        string            // K3s server URL (k3s only)
-	K3sToken      string            // K3s join token (k3s only)
-	RayHeadAddr   string            // Ray head address (ray-worker only, empty = run as head)
-	RayDashPort   int               // Ray dashboard port (ray-worker only, default 8265)
-	RayServePort  int               // Ray serve port (ray-worker only, default 8000)
+	NodeType     string // "full-node" or "ray-worker"
+	Image        string // Docker image for the node
+	NetbirdKey   string // VPN setup key (full-node only)
+	K8sURL       string // Kubernetes API server URL (full-node only)
+	K8sToken     string // Kubernetes join token (full-node only)
+	RayHeadAddr  string // Ray head address (ray-worker only, empty = run as head)
+	RayDashPort  int    // Ray dashboard port (ray-worker only, default 8265)
+	RayServePort int    // Ray serve port (ray-worker only, default 8000)
+
+	// Model config (ray-worker only)
+	ModelID             string  // HuggingFace model ID (e.g., "THUDM/glm-4-9b-chat")
+	ModelSource         string  // HuggingFace model source (defaults to ModelID)
+	MaxModelLen         int     // vLLM max_model_len
+	DType               string  // "auto", "float16", "bfloat16"
+	GPUMemUtil          float64 // gpu_memory_utilization (0.0-1.0)
+	TrustRemoteCode     bool    // allow custom model code
+	EnablePrefixCaching bool    // vLLM prefix caching for KV cache reuse
+	MaxOngoingRequests  int     // max concurrent requests per worker
+
 	ModelCacheURL string            // optional rclone URL for model cache
 	InstanceID    string            // unique ID for tracking
 	GPUType       string            // GPU type label
@@ -59,7 +70,7 @@ type BootstrapConfig struct {
 type Instance struct {
 	ProviderName string
 	InstanceID   string // provider's instance ID (for destroy)
-	NodeType     string // "k3s" or "ray-worker"
+	NodeType     string // "full-node" or "ray-worker"
 	IP           string // public or VPN IP
 	SSHPort      int
 	Endpoint     string // HTTP endpoint for ray-worker (e.g., "http://host:8000")

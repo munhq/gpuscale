@@ -7,6 +7,7 @@ import (
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
 	gpucontroller "github.com/munhq/gpuscale/internal/controller"
+	gpumetrics "github.com/munhq/gpuscale/internal/metrics"
 	"github.com/munhq/gpuscale/internal/provider"
 	"github.com/munhq/gpuscale/internal/provider/runpod"
 	"github.com/munhq/gpuscale/internal/provider/vastai"
@@ -18,6 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
@@ -30,11 +32,12 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr          string
-		healthProbeAddr      string
-		batchWindow          time.Duration
-		cooldownPeriod       time.Duration
-		interruptionInterval time.Duration
+		metricsAddr            string
+		healthProbeAddr        string
+		batchWindow            time.Duration
+		cooldownPeriod         time.Duration
+		interruptionInterval   time.Duration
+		workerMetricsInterval  time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -42,6 +45,7 @@ func main() {
 	flag.DurationVar(&batchWindow, "batch-window", 10*time.Second, "Duration to batch pending pods before provisioning.")
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 10*time.Minute, "Duration to wait before destroying idle nodes.")
 	flag.DurationVar(&interruptionInterval, "interruption-poll-interval", 30*time.Second, "Interval for polling provider APIs for interruptions.")
+	flag.DurationVar(&workerMetricsInterval, "worker-metrics-interval", 1*time.Minute, "Interval for scraping vLLM metrics from workers.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -85,6 +89,15 @@ func main() {
 		setupLog.Info("WARNING: No providers configured. Set VASTAI_API_KEY, VERDA_CLIENT_ID/VERDA_CLIENT_SECRET, or RUNPOD_API_KEY.")
 	}
 
+	// Dragonfly/Redis worker store for observability
+	redisURL := os.Getenv("REDIS_URL")
+	workerStore := gpucontroller.NewWorkerStore(redisURL)
+	if workerStore != nil {
+		setupLog.Info("Dragonfly worker store enabled", "url", redisURL)
+	} else {
+		setupLog.Info("Dragonfly worker store disabled (REDIS_URL not set)")
+	}
+
 	// Create selector
 	sel := scheduler.NewSelector(registry, ctrl.Log.WithName("selector"))
 
@@ -107,6 +120,7 @@ func main() {
 		registry,
 		cooldownPeriod,
 	)
+	disruptionCtrl.WorkerStore = workerStore
 	if err := disruptionCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create disruption controller")
 		os.Exit(1)
@@ -117,6 +131,11 @@ func main() {
 		ctrl.Log.WithName("claim-reconciler"),
 		registry,
 	)
+	claimReconciler.WorkerStore = workerStore
+	if rayHead := os.Getenv("RAY_HEAD_ADDRESS"); rayHead != "" {
+		claimReconciler.RayHeadAddress = rayHead
+		setupLog.Info("Ray head address configured from env", "address", rayHead)
+	}
 	if err := claimReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create claim reconciler")
 		os.Exit(1)
@@ -140,6 +159,17 @@ func main() {
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Unable to set up ready check")
+		os.Exit(1)
+	}
+
+	// Worker metrics collector — scrapes vLLM /metrics from Ready workers
+	// and re-exposes them on the controller's :8080/metrics with provider labels.
+	workerCollector := gpumetrics.NewWorkerMetricsCollector(mgr.GetClient(), workerMetricsInterval)
+	ctrlmetrics.Registry.MustRegister(workerCollector)
+
+	// Start collector as a background goroutine managed by the manager
+	if err := mgr.Add(workerCollector); err != nil {
+		setupLog.Error(err, "Unable to start worker metrics collector")
 		os.Exit(1)
 	}
 

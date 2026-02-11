@@ -74,8 +74,26 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Check if we're already provisioning for this pod
+	// Check if we're already provisioning for this pod (in-memory fast path)
 	r.mu.Lock()
+	if r.provisioningFor[pod.UID] {
+		r.mu.Unlock()
+		return ctrl.Result{}, nil
+	}
+	r.mu.Unlock()
+
+	// Persistent dedup: check if an existing GPUNodeClaim already covers this pod.
+	// This survives controller restarts — the in-memory map is just a fast path.
+	if r.claimExistsForPod(ctx, string(pod.UID)) {
+		log.Info("Claim already exists for pod, skipping", "podUID", pod.UID)
+		r.mu.Lock()
+		r.provisioningFor[pod.UID] = true // cache it
+		r.mu.Unlock()
+		return ctrl.Result{}, nil
+	}
+
+	r.mu.Lock()
+	// Re-check after persistent lookup (another reconcile may have added it)
 	if r.provisioningFor[pod.UID] {
 		r.mu.Unlock()
 		return ctrl.Result{}, nil
@@ -204,9 +222,21 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		return
 	}
 
+	// Determine NodeType from the pool's provider config
+	nodeType := "ray-worker" // default
+	for _, p := range pool.Spec.Providers {
+		if p.Name == offer.ProviderName {
+			if p.NodeType != "" {
+				nodeType = p.NodeType
+			}
+			break
+		}
+	}
+
 	// Update claim status with the selected offer
 	claim.Status = v1alpha1.GPUNodeClaimStatus{
 		Provider:     offer.ProviderName,
+		NodeType:     nodeType,
 		GPUType:      offer.GPUType,
 		GPUCount:     offer.GPUCount,
 		PricePerHour: offer.PricePerHour,
@@ -258,6 +288,28 @@ func (r *ProvisioningController) checkPoolLimits(ctx context.Context, pool *v1al
 		}
 	}
 	return nil
+}
+
+// claimExistsForPod checks whether any active (non-Terminated) GPUNodeClaim
+// already references this pod UID. This prevents double-provisioning after
+// controller restarts when the in-memory map is lost.
+func (r *ProvisioningController) claimExistsForPod(ctx context.Context, podUID string) bool {
+	var claims v1alpha1.GPUNodeClaimList
+	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+		r.Log.Error(err, "Failed to list claims for dedup check")
+		return false // fail open — let the batch process handle limits
+	}
+	for _, c := range claims.Items {
+		if c.Status.Phase == v1alpha1.ClaimPhaseTerminated {
+			continue
+		}
+		for _, ref := range c.Spec.PodRefs {
+			if ref.UID == podUID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (r *ProvisioningController) releaseProvisioningLocks(pods []*corev1.Pod) {
