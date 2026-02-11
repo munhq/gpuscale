@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -22,6 +23,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+// claimNamespace returns the namespace for GPUNodeClaims.
+// Reads POD_NAMESPACE env (set via downward API) with fallback to gpu-workloads.
+func claimNamespace() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "gpu-workloads"
+}
 
 // ProvisioningController watches for pending GPU pods and creates GPUNodeClaims.
 type ProvisioningController struct {
@@ -202,7 +212,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	claim := &v1alpha1.GPUNodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("claim-%s", claimID),
-			Namespace: "gpuscale-system",
+			Namespace: claimNamespace(),
 		},
 		Spec: v1alpha1.GPUNodeClaimSpec{
 			PoolRef: pool.Name,
@@ -257,7 +267,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 func (r *ProvisioningController) checkPoolLimits(ctx context.Context, pool *v1alpha1.GPUNodePool) error {
 	// Count existing claims for this pool
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		return fmt.Errorf("listing claims: %w", err)
 	}
 
@@ -295,7 +305,7 @@ func (r *ProvisioningController) checkPoolLimits(ctx context.Context, pool *v1al
 // controller restarts when the in-memory map is lost.
 func (r *ProvisioningController) claimExistsForPod(ctx context.Context, podUID string) bool {
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		r.Log.Error(err, "Failed to list claims for dedup check")
 		return false // fail open — let the batch process handle limits
 	}

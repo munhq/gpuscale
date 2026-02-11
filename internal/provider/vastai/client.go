@@ -38,21 +38,21 @@ type BundleSearchResult struct {
 
 // BundleOffer represents a single machine offer from Vast.ai.
 type BundleOffer struct {
-	ID            int     `json:"id"`
-	MachineID     int     `json:"machine_id"`
-	GPUName       string  `json:"gpu_name"`
-	NumGPUs       int     `json:"num_gpus"`
-	GPURAMTotal   float64 `json:"gpu_totalram"`  // total VRAM in MB
-	GPUMemBW      float64 `json:"gpu_mem_bw"`    // memory bandwidth
-	DPHTotal      float64 `json:"dph_total"`     // dollars per hour total
-	DPHBase       float64 `json:"dph_base"`      // base price
-	Reliability   float64 `json:"reliability2"`  // reliability score 0-1
-	DiskSpace     float64 `json:"disk_space"`    // available disk in GB
-	RAMTotal      float64 `json:"cpu_ram"`       // system RAM in MB
-	CUDAVersion   float64 `json:"cuda_max_good"` // max CUDA version
-	Interruptible *bool   `json:"interruptible"` // whether this is a spot/interruptible offer
-	Verified      bool    `json:"verified"`
-	Geolocation   string  `json:"geolocation"`
+	ID          int     `json:"id"`
+	MachineID   int     `json:"machine_id"`
+	GPUName     string  `json:"gpu_name"`
+	NumGPUs     int     `json:"num_gpus"`
+	GPURAMTotal float64 `json:"gpu_total_ram"` // total VRAM in MB
+	GPUMemBW    float64 `json:"gpu_mem_bw"`    // memory bandwidth
+	DPHTotal    float64 `json:"dph_total"`     // dollars per hour total
+	DPHBase     float64 `json:"dph_base"`      // base price
+	Reliability float64 `json:"reliability2"`  // reliability score 0-1
+	DiskSpace   float64 `json:"disk_space"`    // available disk in GB
+	RAMTotal    float64 `json:"cpu_ram"`       // system RAM in MB
+	CUDAVersion float64 `json:"cuda_max_good"` // max CUDA version
+	Rentable    bool    `json:"rentable"`      // whether this offer is available for renting
+	Verified    bool    `json:"verified"`
+	Geolocation string  `json:"geolocation"`
 }
 
 // InstanceCreateRequest is the body for creating an instance on Vast.ai.

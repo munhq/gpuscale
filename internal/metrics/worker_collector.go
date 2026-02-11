@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,13 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+func claimNamespace() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "gpu-workloads"
+}
 
 // WorkerMetricsCollector scrapes /metrics from Ready GPUNodeClaim endpoints
 // and re-exposes them with provider/instance labels.
@@ -104,7 +112,7 @@ func (c *WorkerMetricsCollector) Start(ctx context.Context) error {
 
 func (c *WorkerMetricsCollector) scrapeAll(ctx context.Context) {
 	var claims v1alpha1.GPUNodeClaimList
-	if err := c.client.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := c.client.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		log.Printf("worker metrics: failed to list claims: %v", err)
 		return
 	}

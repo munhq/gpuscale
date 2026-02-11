@@ -57,7 +57,7 @@ func (r *InterruptionController) checkForInterruptions(ctx context.Context) {
 
 	// List all active GPUNodeClaims
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		log.Error(err, "Failed to list GPUNodeClaims")
 		return
 	}

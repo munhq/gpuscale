@@ -199,7 +199,7 @@ func (r *DisruptionController) findClaimForNode(ctx context.Context, node *corev
 	}
 
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		return nil, err
 	}
 
@@ -359,7 +359,7 @@ func (r *DisruptionController) getPool(ctx context.Context, name string) (*v1alp
 
 func (r *DisruptionController) countActiveNodes(ctx context.Context, poolName string) int {
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		return 0
 	}
 	count := 0

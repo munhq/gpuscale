@@ -126,12 +126,8 @@ type InstanceType struct {
 	OnDemandPrice float64 `json:"on_demand_price"`
 }
 
-// InstanceTypesResponse wraps the instance types API response.
-type InstanceTypesResponse struct {
-	Data []InstanceType `json:"data"`
-}
-
 // ListInstanceTypes returns available instance types.
+// The Verda API returns either a raw JSON array or {"data": [...]}.
 func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) {
 	resp, err := c.doRequest(ctx, http.MethodGet, "/instance-types?currency=usd", nil)
 	if err != nil {
@@ -144,11 +140,24 @@ func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) 
 		return nil, fmt.Errorf("verda instance-types returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result InstanceTypesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	// Try raw array first (current API format), fall back to wrapped object.
+	var types []InstanceType
+	if err := json.Unmarshal(body, &types); err == nil {
+		return types, nil
+	}
+
+	var wrapped struct {
+		Data []InstanceType `json:"data"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
-	return result.Data, nil
+	return wrapped.Data, nil
 }
 
 // AvailabilityResponse wraps the availability check response.
@@ -175,13 +184,23 @@ func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isS
 		return nil, fmt.Errorf("verda availability returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result struct {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	var avail []AvailabilityResponse
+	if err := json.Unmarshal(body, &avail); err == nil {
+		return avail, nil
+	}
+
+	var wrapped struct {
 		Data []AvailabilityResponse `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &wrapped); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
-	return result.Data, nil
+	return wrapped.Data, nil
 }
 
 // CreateInstanceRequest is the body for creating a Verda instance.

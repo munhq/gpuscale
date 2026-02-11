@@ -69,8 +69,11 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			vramGB = 1
 		}
 
+		// When searching with rentable=true, the API returns spot-eligible offers.
+		// Use the capacity type from the original request since the response
+		// no longer includes an interruptible field.
 		capacityType := "on-demand"
-		if o.Interruptible != nil && *o.Interruptible {
+		if req.CapacityType == "spot" {
 			capacityType = "spot"
 		}
 
