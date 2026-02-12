@@ -28,6 +28,19 @@ func NewSelector(registry *Registry, log *slog.Logger) *Selector {
 
 // SelectBestOffer queries all providers in parallel and returns the best offer.
 func (s *Selector) SelectBestOffer(ctx context.Context, req GPURequirements, preferredProviders []string) (*Offer, error) {
+	offers, err := s.SelectTopOffers(ctx, req, preferredProviders, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(offers) == 0 {
+		return nil, ErrNoOffersAvailable
+	}
+	return &offers[0], nil
+}
+
+// SelectTopOffers queries all providers in parallel and returns the top N offers sorted by price.
+// This is useful for spot market provisioning where offers can become stale quickly.
+func (s *Selector) SelectTopOffers(ctx context.Context, req GPURequirements, preferredProviders []string, limit int) ([]Offer, error) {
 	providers := s.registry.List()
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("no providers registered")
@@ -87,16 +100,21 @@ func (s *Selector) SelectBestOffer(ctx context.Context, req GPURequirements, pre
 		return filtered[i].Reliability > filtered[j].Reliability
 	})
 
-	best := filtered[0]
-	s.log.Info("selected best offer",
-		"provider", best.ProviderName,
-		"gpu", best.GPUType,
-		"count", best.GPUCount,
-		"vram", best.VRAM,
-		"price", best.PricePerHour,
-		"capacity", best.CapacityType,
-	)
-	return &best, nil
+	// Return top N offers
+	if limit > 0 && limit < len(filtered) {
+		filtered = filtered[:limit]
+	}
+
+	if len(filtered) > 0 {
+		s.log.Info("selected top offers",
+			"count", len(filtered),
+			"best_provider", filtered[0].ProviderName,
+			"best_gpu", filtered[0].GPUType,
+			"best_price", filtered[0].PricePerHour,
+		)
+	}
+
+	return filtered, nil
 }
 
 func filterByRequirements(offers []Offer, req GPURequirements) []Offer {
