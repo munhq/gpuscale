@@ -114,16 +114,37 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 }
 
 // InstanceType represents a Verda instance type with pricing.
+// Matches the actual API response format with nested objects.
 type InstanceType struct {
-	ID            string  `json:"id"`
-	GPUType       string  `json:"gpu_type"`
-	GPUCount      int     `json:"gpu_count"`
-	VRAMGB        int     `json:"vram_gb"`
-	VCPU          int     `json:"vcpu"`
-	RAMGB         int     `json:"ram_gb"`
-	DiskGB        int     `json:"disk_gb"`
-	SpotPrice     float64 `json:"spot_price"`
-	OnDemandPrice float64 `json:"on_demand_price"`
+	ID           string `json:"id"`
+	InstanceType string `json:"instance_type"`
+	Model        string `json:"model"` // GPU model name
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+
+	CPU struct {
+		Description   string `json:"description"`
+		NumberOfCores int    `json:"number_of_cores"`
+	} `json:"cpu"`
+
+	GPU struct {
+		Description  string `json:"description"`
+		NumberOfGPUs int    `json:"number_of_gpus"`
+	} `json:"gpu"`
+
+	GPUMemory struct {
+		Description      string `json:"description"`
+		SizeInGigabytes int     `json:"size_in_gigabytes"`
+	} `json:"gpu_memory"`
+
+	Memory struct {
+		Description      string `json:"description"`
+		SizeInGigabytes int     `json:"size_in_gigabytes"`
+	} `json:"memory"`
+
+	PricePerHour string `json:"price_per_hour"` // String in API, convert to float64
+	SpotPrice    string `json:"spot_price"`     // String in API, convert to float64
+	P2P          string `json:"p2p,omitempty"`
 }
 
 // ListInstanceTypes returns available instance types.

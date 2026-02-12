@@ -3,6 +3,7 @@ package verda
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,27 +34,40 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 	var offers []provider.Offer
 	for _, t := range types {
+		// Extract nested fields
+		gpuCount := t.GPU.NumberOfGPUs
+		vramGB := t.GPUMemory.SizeInGigabytes
+		ramGB := t.Memory.SizeInGigabytes
+		gpuType := t.Model
+
 		// Filter by GPU count
-		if req.GPUCount > 0 && t.GPUCount < req.GPUCount {
+		if req.GPUCount > 0 && gpuCount < req.GPUCount {
 			continue
 		}
 		// Filter by VRAM
-		if req.MinVRAM > 0 && t.VRAMGB < req.MinVRAM {
+		if req.MinVRAM > 0 && vramGB < req.MinVRAM {
 			continue
 		}
 		// Filter by RAM
-		if req.MinRAM > 0 && t.RAMGB < req.MinRAM {
+		if req.MinRAM > 0 && ramGB < req.MinRAM {
 			continue
 		}
 		// Filter by GPU type
-		if len(req.GPUTypes) > 0 && !matchesGPUType(t.GPUType, req.GPUTypes) {
+		if len(req.GPUTypes) > 0 && !matchesGPUType(gpuType, req.GPUTypes) {
 			continue
 		}
 
-		price := t.OnDemandPrice
+		// Parse string prices to float64
+		onDemandPrice, err := parsePrice(t.PricePerHour)
+		if err != nil {
+			continue // Skip offers with invalid prices
+		}
+		spotPrice, _ := parsePrice(t.SpotPrice) // Ignore error, spotPrice can be 0
+
+		price := onDemandPrice
 		capacityType := "on-demand"
-		if req.CapacityType == "spot" && t.SpotPrice > 0 {
-			price = t.SpotPrice
+		if req.CapacityType == "spot" && spotPrice > 0 {
+			price = spotPrice
 			capacityType = "spot"
 		}
 
@@ -65,14 +79,14 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		offers = append(offers, provider.Offer{
 			ProviderName: p.Name(),
 			OfferID:      t.ID,
-			GPUType:      t.GPUType,
-			GPUCount:     t.GPUCount,
-			VRAM:         t.VRAMGB,
+			GPUType:      gpuType,
+			GPUCount:     gpuCount,
+			VRAM:         vramGB,
 			PricePerHour: price,
 			CapacityType: capacityType,
 			Reliability:  0.95, // Verda doesn't expose reliability; use a reasonable default
-			DiskGB:       t.DiskGB,
-			RAMGB:        t.RAMGB,
+			DiskGB:       0,    // Verda API doesn't expose disk in this endpoint
+			RAMGB:        ramGB,
 		})
 	}
 
@@ -260,6 +274,13 @@ exec python -m vllm.entrypoints.openai.api_server \
   --dtype %s%s%s
 `, config.InstanceID, config.GPUType, modelID, cacheScript,
 		modelID, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
+}
+
+func parsePrice(priceStr string) (float64, error) {
+	if priceStr == "" {
+		return 0, nil
+	}
+	return strconv.ParseFloat(strings.TrimSpace(priceStr), 64)
 }
 
 func matchesGPUType(gpuType string, wanted []string) bool {
