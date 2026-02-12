@@ -148,16 +148,27 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 		return nil, fmt.Errorf("vast.ai create returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var instance InstanceResponse
-	if err := json.Unmarshal(respBody, &instance); err != nil {
-		// Log first 500 chars for debugging
+	// Vast.ai create response format: {"success": true, "new_contract": <instance_id>}
+	var createResp struct {
+		Success     bool   `json:"success"`
+		NewContract int    `json:"new_contract"`
+		Error       string `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(respBody, &createResp); err != nil {
 		preview := string(respBody)
 		if len(preview) > 500 {
 			preview = preview[:500] + "..."
 		}
-		return nil, fmt.Errorf("decoding response: %w. Response: %s", err, preview)
+		return nil, fmt.Errorf("decoding create response: %w. Response: %s", err, preview)
 	}
-	return &instance, nil
+
+	if !createResp.Success || createResp.NewContract == 0 {
+		return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s",
+			createResp.Success, createResp.NewContract, createResp.Error)
+	}
+
+	// Immediately fetch the full instance details using the new contract ID
+	return c.GetInstance(ctx, createResp.NewContract)
 }
 
 // GetInstance returns the details of a specific instance.
