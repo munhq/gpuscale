@@ -139,14 +139,23 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 	}
 	defer resp.Body.Close()
 
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		respBody, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("vast.ai create returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var instance InstanceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&instance); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+	if err := json.Unmarshal(respBody, &instance); err != nil {
+		// Log first 500 chars for debugging
+		preview := string(respBody)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		return nil, fmt.Errorf("decoding response: %w. Response: %s", err, preview)
 	}
 	return &instance, nil
 }
