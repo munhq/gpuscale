@@ -155,7 +155,12 @@ func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) 
 		Data []InstanceType `json:"data"`
 	}
 	if err := json.Unmarshal(body, &wrapped); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		// Log first 500 chars of response for debugging
+		preview := string(body)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		return nil, fmt.Errorf("decoding response (tried both array and wrapped formats): %w. Response preview: %s", err, preview)
 	}
 	return wrapped.Data, nil
 }
