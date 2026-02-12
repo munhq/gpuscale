@@ -3,7 +3,7 @@ package bootstrap
 import (
 	"testing"
 
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 func TestGenerateEnvVars(t *testing.T) {

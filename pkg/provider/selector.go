@@ -1,24 +1,25 @@
-package scheduler
+package provider
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/munhq/gpuscale/internal/provider"
-	"github.com/go-logr/logr"
 )
 
 // Selector searches across providers and selects the best offer.
 type Selector struct {
-	registry *provider.Registry
-	log      logr.Logger
+	registry *Registry
+	log      *slog.Logger
 }
 
-// NewSelector creates a new offer selector.
-func NewSelector(registry *provider.Registry, log logr.Logger) *Selector {
+// NewSelector creates a new offer selector. If log is nil, uses slog.Default().
+func NewSelector(registry *Registry, log *slog.Logger) *Selector {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Selector{
 		registry: registry,
 		log:      log,
@@ -26,7 +27,7 @@ func NewSelector(registry *provider.Registry, log logr.Logger) *Selector {
 }
 
 // SelectBestOffer queries all providers in parallel and returns the best offer.
-func (s *Selector) SelectBestOffer(ctx context.Context, req provider.GPURequirements, preferredProviders []string) (*provider.Offer, error) {
+func (s *Selector) SelectBestOffer(ctx context.Context, req GPURequirements, preferredProviders []string) (*Offer, error) {
 	providers := s.registry.List()
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("no providers registered")
@@ -34,7 +35,7 @@ func (s *Selector) SelectBestOffer(ctx context.Context, req provider.GPURequirem
 
 	// If preferred providers specified, filter to those first
 	if len(preferredProviders) > 0 {
-		filtered := make([]provider.Provider, 0)
+		filtered := make([]Provider, 0)
 		for _, p := range providers {
 			for _, name := range preferredProviders {
 				if p.Name() == name {
@@ -51,17 +52,17 @@ func (s *Selector) SelectBestOffer(ctx context.Context, req provider.GPURequirem
 	// Query all providers in parallel
 	var (
 		mu        sync.Mutex
-		allOffers []provider.Offer
+		allOffers []Offer
 		wg        sync.WaitGroup
 	)
 
 	for _, p := range providers {
 		wg.Add(1)
-		go func(prov provider.Provider) {
+		go func(prov Provider) {
 			defer wg.Done()
 			offers, err := prov.SearchOffers(ctx, req)
 			if err != nil {
-				s.log.Error(err, "Failed to search offers", "provider", prov.Name())
+				s.log.Error("failed to search offers", "provider", prov.Name(), "error", err)
 				return
 			}
 			mu.Lock()
@@ -75,7 +76,7 @@ func (s *Selector) SelectBestOffer(ctx context.Context, req provider.GPURequirem
 	filtered := filterByRequirements(allOffers, req)
 
 	if len(filtered) == 0 {
-		return nil, provider.ErrNoOffersAvailable
+		return nil, ErrNoOffersAvailable
 	}
 
 	// Sort by price (primary), reliability (secondary)
@@ -87,7 +88,7 @@ func (s *Selector) SelectBestOffer(ctx context.Context, req provider.GPURequirem
 	})
 
 	best := filtered[0]
-	s.log.Info("Selected best offer",
+	s.log.Info("selected best offer",
 		"provider", best.ProviderName,
 		"gpu", best.GPUType,
 		"count", best.GPUCount,
@@ -98,34 +99,27 @@ func (s *Selector) SelectBestOffer(ctx context.Context, req provider.GPURequirem
 	return &best, nil
 }
 
-func filterByRequirements(offers []provider.Offer, req provider.GPURequirements) []provider.Offer {
-	var result []provider.Offer
+func filterByRequirements(offers []Offer, req GPURequirements) []Offer {
+	var result []Offer
 	for _, o := range offers {
-		// GPU count
 		if req.GPUCount > 0 && o.GPUCount < req.GPUCount {
 			continue
 		}
-		// VRAM
 		if req.MinVRAM > 0 && o.VRAM < req.MinVRAM {
 			continue
 		}
-		// Price
 		if req.MaxPrice > 0 && o.PricePerHour > req.MaxPrice {
 			continue
 		}
-		// Capacity type
 		if req.CapacityType != "" && o.CapacityType != req.CapacityType {
 			continue
 		}
-		// GPU type
 		if len(req.GPUTypes) > 0 && !matchesAnyGPUType(o.GPUType, req.GPUTypes) {
 			continue
 		}
-		// Disk
 		if req.MinDisk > 0 && o.DiskGB > 0 && o.DiskGB < req.MinDisk {
 			continue
 		}
-		// RAM
 		if req.MinRAM > 0 && o.RAMGB > 0 && o.RAMGB < req.MinRAM {
 			continue
 		}

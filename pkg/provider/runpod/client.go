@@ -53,12 +53,12 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 // GPUType represents an available RunPod GPU type.
 type GPUType struct {
-	ID               string  `json:"id"`
-	DisplayName      string  `json:"displayName"`
-	MemoryInGB       int     `json:"memoryInGb"`
-	SecurePrice      float64 `json:"securePrice"`
-	CommunityPrice   float64 `json:"communityPrice"`
-	SecureSpotPrice  float64 `json:"secureSpotPrice"`
+	ID                 string  `json:"id"`
+	DisplayName        string  `json:"displayName"`
+	MemoryInGB         int     `json:"memoryInGb"`
+	SecurePrice        float64 `json:"securePrice"`
+	CommunityPrice     float64 `json:"communityPrice"`
+	SecureSpotPrice    float64 `json:"secureSpotPrice"`
 	CommunitySpotPrice float64 `json:"communitySpotPrice"`
 }
 
@@ -84,36 +84,36 @@ func (c *Client) ListGPUTypes(ctx context.Context) ([]GPUType, error) {
 
 // CreatePodRequest is the body for creating a RunPod pod.
 type CreatePodRequest struct {
-	Name          string            `json:"name"`
-	ImageName     string            `json:"imageName"`
-	GPUTypeID     string            `json:"gpuTypeId"`
-	GPUCount      int               `json:"gpuCount"`
-	CloudType     string            `json:"cloudType"` // "SECURE", "COMMUNITY", "ALL"
-	VolumeInGB    int               `json:"volumeInGb"`
-	ContainerDiskInGB int           `json:"containerDiskInGb"`
-	Env           map[string]string `json:"env,omitempty"`
-	DockerArgs    string            `json:"dockerArgs,omitempty"`
-	Ports         string            `json:"ports,omitempty"`
-	StartSSH      bool              `json:"startSsh"`
+	Name              string            `json:"name"`
+	ImageName         string            `json:"imageName"`
+	GPUTypeID         string            `json:"gpuTypeId"`
+	GPUCount          int               `json:"gpuCount"`
+	CloudType         string            `json:"cloudType"` // "SECURE", "COMMUNITY", "ALL"
+	VolumeInGB        int               `json:"volumeInGb"`
+	ContainerDiskInGB int               `json:"containerDiskInGb"`
+	Env               map[string]string `json:"env,omitempty"`
+	DockerArgs        string            `json:"dockerArgs,omitempty"`
+	Ports             string            `json:"ports,omitempty"`
+	StartSSH          bool              `json:"startSsh"`
 }
 
 // PodResponse represents a RunPod pod.
 type PodResponse struct {
-	ID           string  `json:"id"`
-	Name         string  `json:"name"`
-	DesiredStatus string `json:"desiredStatus"`
-	Runtime      *struct {
-		Uptime int    `json:"uptimeInSeconds"`
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	DesiredStatus string  `json:"desiredStatus"`
+	Runtime       *struct {
+		Uptime int `json:"uptimeInSeconds"`
 		GPUs   []struct {
 			ID          string `json:"id"`
 			DisplayName string `json:"displayName"`
 			MemoryInGB  int    `json:"memoryInGb"`
 		} `json:"gpus"`
 		Ports []struct {
-			IP         string `json:"ip"`
-			PublicPort int    `json:"publicPort"`
-			PrivatePort int   `json:"privatePort"`
-			Type       string `json:"type"`
+			IP          string `json:"ip"`
+			PublicPort  int    `json:"publicPort"`
+			PrivatePort int    `json:"privatePort"`
+			Type        string `json:"type"`
 		} `json:"ports"`
 	} `json:"runtime"`
 	Machine struct {

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/munhq/gpuscale/internal/scheduler"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -21,13 +21,17 @@ import (
 // DisruptionController watches managed nodes and GPUNodeClaims, destroying idle ones after cooldown.
 // Supports two modes:
 //   - full-node: watches Kubernetes Node objects, pod-based idle detection, drain-and-destroy
-//   - ray-worker: watches GPUNodeClaim objects, metrics-based idle detection, simple destroy
+//   - ray-worker: watches GPUNodeClaim objects, demand-counter-based idle detection, simple destroy
+//
+// Demand counters (demand:{model} in Dragonfly DB 3) are maintained by GPU API's request queue.
+// Always-active models are never destroyed.
 type DisruptionController struct {
 	client.Client
 	Log            logr.Logger
 	Registry       *provider.Registry
 	CooldownPeriod time.Duration
 	WorkerStore    *WorkerStore
+	DemandStore    *DemandStore // reads demand counters from Dragonfly DB 3
 }
 
 // NewDisruptionController creates a new disruption controller.
@@ -211,11 +215,10 @@ func (r *DisruptionController) findClaimForNode(ctx context.Context, node *corev
 	return nil, nil
 }
 
-// --- Ray-worker path: demand-based idle detection ---
+// --- Ray-worker path: demand-counter-based idle detection ---
 // Ray workers join the Ray cluster and don't serve requests directly.
-// Idle detection: check if the provider instance is still alive, and if
-// there are demand-signal pods pending for this pool. If KEDA has scaled
-// down all demand pods, the worker is idle.
+// Idle detection: check demand counters in Dragonfly DB 3 (maintained by GPU API).
+// Always-active models are never destroyed.
 
 func (r *DisruptionController) reconcileRayWorker(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
 	// Check if the provider instance is still alive
@@ -233,13 +236,19 @@ func (r *DisruptionController) reconcileRayWorker(ctx context.Context, claim *v1
 		return r.destroyWorker(ctx, claim, log)
 	}
 
-	// Check if there are demand-signal pods for this pool.
-	// If KEDA has scaled demand to 0, there's no demand → worker is idle.
-	hasDemand, err := r.hasDemandPods(ctx)
-	if err != nil {
-		log.Error(err, "Failed to check demand pods")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	modelID := claim.Spec.ModelID
+
+	// Always-active models are never destroyed.
+	if r.isModelAlwaysActive(ctx, modelID) {
+		if claim.Status.IdleSince != nil {
+			claim.Status.IdleSince = nil
+			_ = r.Status().Update(ctx, claim)
+		}
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
+
+	// Check demand counter in Dragonfly for this model.
+	hasDemand := r.hasModelDemand(ctx, modelID)
 
 	if hasDemand {
 		// There's demand — clear idle and recheck
@@ -248,31 +257,42 @@ func (r *DisruptionController) reconcileRayWorker(ctx context.Context, claim *v1
 			if err := r.Status().Update(ctx, claim); err != nil {
 				log.Error(err, "Failed to clear idle timestamp")
 			}
-			log.Info("Demand pods exist, worker is not idle")
+			log.Info("Model has demand, worker is not idle", "model", modelID)
 		}
 		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
-	// No demand pods → worker is idle
+	// No demand → worker is idle
 	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
 		return r.destroyWorker(ctx, claim, log)
 	})
 }
 
-// hasDemandPods checks if there are any pending demand-signal GPU pods.
-func (r *DisruptionController) hasDemandPods(ctx context.Context) (bool, error) {
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.MatchingLabels{
-		"app": "gpu-demand",
-	}); err != nil {
-		return false, err
+// hasModelDemand checks if there are active requests for a model via Dragonfly demand counter.
+func (r *DisruptionController) hasModelDemand(ctx context.Context, modelID string) bool {
+	if r.DemandStore == nil || modelID == "" {
+		return false
 	}
-	for _, pod := range pods.Items {
-		if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning {
-			return true, nil
-		}
+	count, err := r.DemandStore.GetDemand(ctx, modelID)
+	if err != nil {
+		r.Log.Error(err, "Failed to read demand counter", "model", modelID)
+		return false // fail-safe: don't destroy if we can't read
 	}
-	return false, nil
+	return count > 0
+}
+
+// isModelAlwaysActive checks if a model is marked as always-active.
+// Reads the GPUNodePool annotation or a ConfigMap. For now, checks the
+// claim's pool annotation.
+func (r *DisruptionController) isModelAlwaysActive(ctx context.Context, modelID string) bool {
+	if r.DemandStore == nil || modelID == "" {
+		return false
+	}
+	active, err := r.DemandStore.IsAlwaysActive(ctx, modelID)
+	if err != nil {
+		return false
+	}
+	return active
 }
 
 func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {

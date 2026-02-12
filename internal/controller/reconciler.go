@@ -9,7 +9,7 @@ import (
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
 	"github.com/munhq/gpuscale/internal/bootstrap"
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -114,6 +114,13 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	if err := r.Get(ctx, types.NamespacedName{Name: claim.Spec.PoolRef}, &pool); err != nil {
 		log.Error(err, "Failed to get pool")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Provider is set by the provisioner in a status update after claim creation.
+	// If it's empty, the provisioner hasn't updated yet — requeue quickly.
+	if claim.Status.Provider == "" {
+		log.Info("Claim pending, waiting for provisioner to set provider")
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// Get the provider

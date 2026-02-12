@@ -6,8 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/munhq/gpuscale/internal/bootstrap"
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 // Provider implements the provider.Provider interface for RunPod.
@@ -101,13 +100,27 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	var dockerArgs string
 	var ports string
 
-	if config.NodeType == "ray-worker" {
-		// Ray worker mode — standalone vLLM in container
-		image = config.Image
+	image = config.Image
+
+	if config.OnStartScript != "" {
+		// Caller provided a bootstrap script — use it as-is.
+		// RunPod doesn't support onstart scripts directly, so we embed it in docker args.
+		if image == "" {
+			if config.NodeType == "full-node" {
+				image = "ghcr.io/munhq/gpuscale-node:latest"
+			} else {
+				image = "rayproject/ray-llm:2.53.0-py311-cu128"
+			}
+		}
+		env = config.OnStartEnv
+		// RunPod uses docker args — wrap the script as a bash -c command
+		dockerArgs = fmt.Sprintf("bash -c %q", config.OnStartScript)
+		ports = "22/tcp"
+	} else if config.NodeType == "ray-worker" {
+		// Fallback: no script provided, generate standalone vLLM via docker args.
 		if image == "" {
 			image = "vllm/vllm-openai:latest"
 		}
-
 		env = map[string]string{
 			"GPU_TYPE":    config.GPUType,
 			"PROVIDER":    config.ProviderName,
@@ -120,7 +133,6 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 			env["MODEL_CACHE_URL"] = config.ModelCacheURL
 		}
 
-		// Build vLLM serve command as docker args
 		servePort := config.RayServePort
 		if servePort == 0 {
 			servePort = 8000
@@ -146,22 +158,21 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 			"--model %s --host 0.0.0.0 --port %d --gpu-memory-utilization %.2f --max-model-len %d --dtype %s",
 			modelID, servePort, gpuMemUtil, maxModelLen, dtype,
 		)
+		if config.TensorParallelSize > 1 {
+			dockerArgs += fmt.Sprintf(" --tensor-parallel-size %d", config.TensorParallelSize)
+		}
 		if config.TrustRemoteCode {
 			dockerArgs += " --trust-remote-code"
 		}
-
 		ports = fmt.Sprintf("%d/http", servePort)
 	} else {
-		// Full-node mode — VM joins Kubernetes cluster via VPN
-		image = config.Image
-		if image == "" {
-			image = "ghcr.io/munhq/gpuscale-node:latest"
-		}
-		env = bootstrap.GenerateEnvVars(config)
-		ports = "22/tcp"
+		return nil, fmt.Errorf("full-node requires OnStartScript")
 	}
 
 	for k, v := range config.ExtraEnv {
+		if env == nil {
+			env = make(map[string]string)
+		}
 		env[k] = v
 	}
 

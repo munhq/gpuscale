@@ -6,8 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/munhq/gpuscale/internal/bootstrap"
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 // Provider implements the provider.Provider interface for Vast.ai.
@@ -104,13 +103,26 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	var onstart string
 	var image string
 
-	if config.NodeType == "ray-worker" {
-		// Ray worker mode — standalone vLLM in container
-		image = config.Image
+	image = config.Image
+
+	if config.OnStartScript != "" {
+		// Caller provided a bootstrap script — use it as-is.
+		// This covers ray-worker (ray start), full-node (VPN+K3s), or any custom script.
+		onstart = config.OnStartScript
+		env = config.OnStartEnv
+		if image == "" {
+			if config.NodeType == "full-node" {
+				image = "ghcr.io/munhq/gpuscale-node:latest"
+			} else {
+				image = "rayproject/ray-llm:2.53.0-py311-cu128"
+			}
+		}
+	} else if config.NodeType == "ray-worker" {
+		// Fallback: no script provided, generate standalone vLLM bootstrap.
+		// This is the legacy path — prefer passing OnStartScript from provisioner.
 		if image == "" {
 			image = "vllm/vllm-openai:latest"
 		}
-
 		env = map[string]string{
 			"GPU_TYPE":    config.GPUType,
 			"PROVIDER":    config.ProviderName,
@@ -125,18 +137,9 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		for k, v := range config.ExtraEnv {
 			env[k] = v
 		}
-
 		onstart = generateVLLMBootstrapScript(config)
-
 	} else {
-		// Full-node mode — VM joins Kubernetes cluster via VPN
-		image = config.Image
-		if image == "" {
-			image = "ghcr.io/munhq/gpuscale-node:latest"
-		}
-
-		env = bootstrap.GenerateEnvVars(config)
-		onstart = bootstrap.GenerateScript(config)
+		return nil, fmt.Errorf("full-node requires OnStartScript")
 	}
 
 	createReq := InstanceCreateRequest{
@@ -218,16 +221,18 @@ fi
 
 `, config.ProviderName, config.InstanceID, config.GPUType, modelID)
 
-	// Optional model pre-cache
+	// Optional model pre-cache from object storage (R2/S3)
 	if config.ModelCacheURL != "" {
-		script += fmt.Sprintf(`# Pre-cache model weights
+		script += fmt.Sprintf(`# Pre-cache model weights from object storage
 echo '[gpuscale] Pre-caching model from %s...'
 mkdir -p /opt/models
-if command -v rclone &> /dev/null; then
-  rclone sync '%s' /opt/models/ --progress
-else
-  echo '[gpuscale] rclone not found, skipping pre-cache'
+if ! command -v rclone &> /dev/null; then
+  echo '[gpuscale] Installing rclone...'
+  curl -s https://rclone.org/install.sh | bash 2>&1 | tail -5
 fi
+export HF_HOME=/opt/models
+rclone sync '%s' /opt/models/ --progress --transfers=8 --checkers=16
+echo '[gpuscale] Pre-cache complete'
 
 `, config.ModelCacheURL, config.ModelCacheURL)
 	}
@@ -235,6 +240,11 @@ fi
 	trustFlag := ""
 	if config.TrustRemoteCode {
 		trustFlag = "\n  --trust-remote-code \\"
+	}
+
+	tpFlag := ""
+	if config.TensorParallelSize > 1 {
+		tpFlag = fmt.Sprintf("\n  --tensor-parallel-size %d \\", config.TensorParallelSize)
 	}
 
 	script += fmt.Sprintf(`# Start vLLM OpenAI-compatible server
@@ -245,8 +255,8 @@ exec python -m vllm.entrypoints.openai.api_server \
   --port %d \
   --gpu-memory-utilization %.2f \
   --max-model-len %d \
-  --dtype %s%s
-`, servePort, modelID, servePort, gpuMemUtil, maxModelLen, dtype, trustFlag)
+  --dtype %s%s%s
+`, servePort, modelID, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 
 	return script
 }

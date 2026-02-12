@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 // GenerateRayWorkerScript creates a bootstrap script for a ray-worker that joins

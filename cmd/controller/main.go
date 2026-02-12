@@ -8,11 +8,10 @@ import (
 	"github.com/munhq/gpuscale/api/v1alpha1"
 	gpucontroller "github.com/munhq/gpuscale/internal/controller"
 	gpumetrics "github.com/munhq/gpuscale/internal/metrics"
-	"github.com/munhq/gpuscale/internal/provider"
-	"github.com/munhq/gpuscale/internal/provider/runpod"
-	"github.com/munhq/gpuscale/internal/provider/vastai"
-	"github.com/munhq/gpuscale/internal/provider/verda"
-	"github.com/munhq/gpuscale/internal/scheduler"
+	"github.com/munhq/gpuscale/pkg/provider"
+	"github.com/munhq/gpuscale/pkg/provider/runpod"
+	"github.com/munhq/gpuscale/pkg/provider/vastai"
+	"github.com/munhq/gpuscale/pkg/provider/verda"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -34,7 +33,6 @@ func main() {
 	var (
 		metricsAddr            string
 		healthProbeAddr        string
-		batchWindow            time.Duration
 		cooldownPeriod         time.Duration
 		interruptionInterval   time.Duration
 		workerMetricsInterval  time.Duration
@@ -42,7 +40,6 @@ func main() {
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&healthProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.DurationVar(&batchWindow, "batch-window", 10*time.Second, "Duration to batch pending pods before provisioning.")
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 10*time.Minute, "Duration to wait before destroying idle nodes.")
 	flag.DurationVar(&interruptionInterval, "interruption-poll-interval", 30*time.Second, "Interval for polling provider APIs for interruptions.")
 	flag.DurationVar(&workerMetricsInterval, "worker-metrics-interval", 1*time.Minute, "Interval for scraping vLLM metrics from workers.")
@@ -98,21 +95,17 @@ func main() {
 		setupLog.Info("Dragonfly worker store disabled (REDIS_URL not set)")
 	}
 
-	// Create selector
-	sel := scheduler.NewSelector(registry, ctrl.Log.WithName("selector"))
+	// Demand store — reads demand counters from Dragonfly DB 3 (maintained by GPU API)
+	demandStore := gpucontroller.NewDemandStore(redisURL)
+	if demandStore != nil {
+		setupLog.Info("Demand store enabled (Dragonfly DB 3)", "url", redisURL)
+	} else {
+		setupLog.Info("Demand store disabled (no REDIS_URL or connection failed)")
+	}
 
 	// Set up controllers
-	provisioningCtrl := gpucontroller.NewProvisioningController(
-		mgr.GetClient(),
-		ctrl.Log.WithName("provisioner"),
-		sel,
-		registry,
-		batchWindow,
-	)
-	if err := provisioningCtrl.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Unable to create provisioning controller")
-		os.Exit(1)
-	}
+	// NOTE: ProvisioningController removed — GPU API now triggers provisioning directly.
+	// GPUScale is lifecycle-only: claim reconciliation + disruption (scale-down).
 
 	disruptionCtrl := gpucontroller.NewDisruptionController(
 		mgr.GetClient(),
@@ -121,6 +114,7 @@ func main() {
 		cooldownPeriod,
 	)
 	disruptionCtrl.WorkerStore = workerStore
+	disruptionCtrl.DemandStore = demandStore
 	if err := disruptionCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create disruption controller")
 		os.Exit(1)

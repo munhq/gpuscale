@@ -3,6 +3,7 @@ module github.com/munhq/gpuscale
 go 1.25.0
 
 require (
+	github.com/munhq/gpuscale/pkg/provider v0.0.0
 	github.com/go-logr/logr v1.4.3
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.23.2
@@ -66,3 +67,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2-0.20260122202528-d9cc6641c482 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/munhq/gpuscale/pkg/provider => ../pkg/provider

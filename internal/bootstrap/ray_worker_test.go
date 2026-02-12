@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 func TestGenerateRayWorkerScriptDefaults(t *testing.T) {

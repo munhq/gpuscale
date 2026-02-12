@@ -6,8 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/munhq/gpuscale/internal/bootstrap"
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 // Provider implements the provider.Provider interface for Verda.
@@ -82,11 +81,14 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, config provider.BootstrapConfig) (*provider.Instance, error) {
 	var script string
-	if config.NodeType == "ray-worker" {
+	if config.OnStartScript != "" {
+		// Caller provided a bootstrap script — use it as-is.
+		script = config.OnStartScript
+	} else if config.NodeType == "ray-worker" {
+		// Fallback: no script provided, generate standalone vLLM bootstrap.
 		script = generateVLLMBootstrapScript(config)
 	} else {
-		// Full-node mode — VM joins Kubernetes cluster via VPN
-		script = bootstrap.GenerateScript(config)
+		return nil, fmt.Errorf("full-node requires OnStartScript")
 	}
 
 	scriptResp, err := p.client.CreateStartupScript(ctx, fmt.Sprintf("gpuscale-%s", config.InstanceID), script)
@@ -216,6 +218,28 @@ func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 		trustFlag = " \\\n  --trust-remote-code"
 	}
 
+	tpFlag := ""
+	if config.TensorParallelSize > 1 {
+		tpFlag = fmt.Sprintf(" \\\n  --tensor-parallel-size %d", config.TensorParallelSize)
+	}
+
+	// Optional model pre-cache
+	cacheScript := ""
+	if config.ModelCacheURL != "" {
+		cacheScript = fmt.Sprintf(`
+# Pre-cache model weights from object storage
+echo '[gpuscale] Pre-caching model from %s...'
+mkdir -p /opt/models
+if ! command -v rclone &> /dev/null; then
+  echo '[gpuscale] Installing rclone...'
+  curl -s https://rclone.org/install.sh | bash 2>&1 | tail -5
+fi
+export HF_HOME=/opt/models
+rclone sync '%s' /opt/models/ --progress --transfers=8 --checkers=16
+echo '[gpuscale] Pre-cache complete'
+`, config.ModelCacheURL, config.ModelCacheURL)
+	}
+
 	return fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 
@@ -225,7 +249,7 @@ echo '[gpuscale] Model: %s'
 
 # Install vLLM
 pip install vllm 2>&1 | tail -10
-
+%s
 # Start vLLM OpenAI-compatible server
 exec python -m vllm.entrypoints.openai.api_server \
   --model '%s' \
@@ -233,9 +257,9 @@ exec python -m vllm.entrypoints.openai.api_server \
   --port %d \
   --gpu-memory-utilization %.2f \
   --max-model-len %d \
-  --dtype %s%s
-`, config.InstanceID, config.GPUType, modelID,
-		modelID, servePort, gpuMemUtil, maxModelLen, dtype, trustFlag)
+  --dtype %s%s%s
+`, config.InstanceID, config.GPUType, modelID, cacheScript,
+		modelID, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 }
 
 func matchesGPUType(gpuType string, wanted []string) bool {

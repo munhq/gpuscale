@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 // GenerateScript generates a bootstrap script for a full-node provider instance.

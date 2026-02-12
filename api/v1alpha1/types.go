@@ -234,6 +234,10 @@ type GPUNodeClaimSpec struct {
 	// PoolRef is the name of the GPUNodePool that created this claim.
 	PoolRef string `json:"poolRef"`
 
+	// ModelID is the model this claim was provisioned for.
+	// Used by the disruptor to check demand and always-active status.
+	ModelID string `json:"modelId,omitempty"`
+
 	// Requirements describe the GPU resources needed.
 	Requirements ClaimRequirements `json:"requirements"`
 

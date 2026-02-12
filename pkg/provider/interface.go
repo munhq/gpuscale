@@ -58,12 +58,19 @@ type BootstrapConfig struct {
 	TrustRemoteCode     bool    // allow custom model code
 	EnablePrefixCaching bool    // vLLM prefix caching for KV cache reuse
 	MaxOngoingRequests  int     // max concurrent requests per worker
+	TensorParallelSize  int     // tensor_parallel_size for vLLM multi-GPU
 
 	ModelCacheURL string            // optional rclone URL for model cache
 	InstanceID    string            // unique ID for tracking
 	GPUType       string            // GPU type label
 	ProviderName  string            // provider name label
 	ExtraEnv      map[string]string // additional env vars
+
+	// Pre-generated bootstrap script and env vars for full-node mode.
+	// Callers set these when they have the bootstrap package available.
+	// If empty for ray-worker mode, providers generate their own vLLM script.
+	OnStartScript string            // pre-generated startup script
+	OnStartEnv    map[string]string // pre-generated environment variables
 }
 
 // Instance represents a running instance on a provider.

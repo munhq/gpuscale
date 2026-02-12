@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
-	"github.com/munhq/gpuscale/internal/provider"
+	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
