@@ -148,6 +148,9 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 		return nil, fmt.Errorf("vast.ai create returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// DEBUG: Log the actual response
+	fmt.Printf("[VAST.AI DEBUG] Create response (status %d): %s\n", resp.StatusCode, string(respBody))
+
 	// Vast.ai create response format: {"success": true, "new_contract": <instance_id>}
 	var createResp struct {
 		Success     bool   `json:"success"`
@@ -161,6 +164,10 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 		}
 		return nil, fmt.Errorf("decoding create response: %w. Response: %s", err, preview)
 	}
+
+	// DEBUG: Log what we parsed
+	fmt.Printf("[VAST.AI DEBUG] Parsed: success=%v, new_contract=%d, error=%s\n",
+		createResp.Success, createResp.NewContract, createResp.Error)
 
 	if !createResp.Success || createResp.NewContract == 0 {
 		return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s",
