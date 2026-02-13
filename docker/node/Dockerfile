@@ -14,8 +14,9 @@ RUN apt-get update && apt-get install -y \
 # Install Netbird VPN client
 RUN curl -fsSL https://pkgs.netbird.io/install.sh | sh
 
-# Install K3s agent binary (don't start it yet)
-RUN curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="agent" sh -
+# Install K3s binary manually (avoid systemd issues in Docker build)
+RUN curl -sfL https://github.com/k3s-io/k3s/releases/download/v1.31.4%2Bk3s1/k3s -o /usr/local/bin/k3s \
+    && chmod +x /usr/local/bin/k3s
 
 # Bootstrap script will be injected by provider at runtime via cloud-init/user-data
 # The script connects to Netbird VPN and joins K8s cluster
