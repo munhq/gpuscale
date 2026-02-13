@@ -194,6 +194,12 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	}
 	offer := offers[0]
 
+	// Generate bootstrap script for full-node mode
+	if nodeType == "full-node" {
+		config.OnStartScript = bootstrap.GenerateScript(config)
+		log.Info("Generated full-node bootstrap script", "scriptLength", len(config.OnStartScript))
+	}
+
 	// Transition to Provisioning
 	now := metav1.Now()
 	claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
