@@ -31,6 +31,9 @@ type ProvisioningController struct {
 	Selector *scheduler.Selector
 	Registry *provider.Registry
 
+	// DemandStore reads API queue depth and model configs from Dragonfly DB 3
+	DemandStore *DemandStore
+
 	// Batch window for collecting pending pods before provisioning
 	BatchWindow time.Duration
 
@@ -130,6 +133,27 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 
 	log := r.Log.WithValues("batchSize", len(batch))
 	log.Info("Processing pending pod batch")
+
+	// Query demand data from Dragonfly (Task #1: API queue metrics)
+	if r.DemandStore != nil {
+		demands, err := r.DemandStore.GetAllDemands(ctx)
+		if err != nil {
+			log.Error(err, "Failed to query demand data from Dragonfly")
+		} else {
+			log.Info("Demand data from API queue", "demands", len(demands))
+			for _, d := range demands {
+				if d.QueueDepth > 0 || d.ActiveDemand > 0 || d.AlwaysActive {
+					log.Info("Model demand",
+						"model", d.Model,
+						"queue", d.QueueDepth,
+						"active", d.ActiveDemand,
+						"vram", d.VRAMRequired,
+						"alwaysActive", d.AlwaysActive,
+					)
+				}
+			}
+		}
+	}
 
 	// Find the matching GPUNodePool
 	var pools v1alpha1.GPUNodePoolList

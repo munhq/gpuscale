@@ -83,6 +83,170 @@ func (s *DemandStore) IsAlwaysActive(ctx context.Context, model string) (bool, e
 	return cfg.AlwaysActive, nil
 }
 
+// ModelConfig represents the full model configuration from GPU API.
+type ModelConfig struct {
+	ID           string  `json:"id"`
+	VRAMRequired int     `json:"vramRequired"` // GB total VRAM needed
+	AlwaysActive bool    `json:"alwaysActive"`
+	MinReplicas  int     `json:"minReplicas"`
+	MaxReplicas  int     `json:"maxReplicas"`
+	NodeType     string  `json:"nodeType"`     // "ray-worker" or "full-node"
+	MaxPricePerGPU float64 `json:"maxPricePerGPU"`
+}
+
+// GetModelConfig retrieves the full model configuration from Dragonfly.
+// Returns nil if the model config doesn't exist.
+func (s *DemandStore) GetModelConfig(ctx context.Context, model string) (*ModelConfig, error) {
+	if s == nil || s.rdb == nil {
+		return nil, nil
+	}
+
+	data, err := s.rdb.HGet(ctx, modelConfigHashKey, model).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading model config for %s: %w", model, err)
+	}
+
+	var cfg ModelConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing model config for %s: %w", model, err)
+	}
+	return &cfg, nil
+}
+
+// GetAllModelConfigs retrieves all model configurations from Dragonfly.
+func (s *DemandStore) GetAllModelConfigs(ctx context.Context) (map[string]*ModelConfig, error) {
+	if s == nil || s.rdb == nil {
+		return nil, nil
+	}
+
+	data, err := s.rdb.HGetAll(ctx, modelConfigHashKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("reading all model configs: %w", err)
+	}
+
+	configs := make(map[string]*ModelConfig, len(data))
+	for model, jsonStr := range data {
+		var cfg ModelConfig
+		if err := json.Unmarshal([]byte(jsonStr), &cfg); err != nil {
+			continue // skip invalid entries
+		}
+		configs[model] = &cfg
+	}
+	return configs, nil
+}
+
+// queueKey returns the Dragonfly key for a model's request queue.
+func queueKey(model string) string { return "chatqueue:" + model }
+
+// GetQueueDepth returns the number of queued requests for a model.
+// Returns 0 if the queue doesn't exist.
+func (s *DemandStore) GetQueueDepth(ctx context.Context, model string) (int64, error) {
+	if s == nil || s.rdb == nil {
+		return 0, nil
+	}
+	length, err := s.rdb.LLen(ctx, queueKey(model)).Result()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return length, err
+}
+
+// ModelDemand aggregates all demand signals for a model.
+type ModelDemand struct {
+	Model        string
+	QueueDepth   int64 // pending requests in chatqueue:{model}
+	ActiveDemand int64 // active requests from demand:{model}
+	VRAMRequired int   // VRAM needed to load the model (GB)
+	AlwaysActive bool  // should stay warm
+}
+
+// GetModelDemand retrieves all demand data for a specific model.
+func (s *DemandStore) GetModelDemand(ctx context.Context, model string) (*ModelDemand, error) {
+	if s == nil || s.rdb == nil {
+		return nil, nil
+	}
+
+	cfg, err := s.GetModelConfig(ctx, model)
+	if err != nil {
+		return nil, fmt.Errorf("getting config for %s: %w", model, err)
+	}
+	if cfg == nil {
+		return nil, nil // model not configured
+	}
+
+	queueDepth, err := s.GetQueueDepth(ctx, model)
+	if err != nil {
+		return nil, fmt.Errorf("getting queue depth for %s: %w", model, err)
+	}
+
+	activeDemand, err := s.GetDemand(ctx, model)
+	if err != nil {
+		return nil, fmt.Errorf("getting active demand for %s: %w", model, err)
+	}
+
+	return &ModelDemand{
+		Model:        model,
+		QueueDepth:   queueDepth,
+		ActiveDemand: activeDemand,
+		VRAMRequired: cfg.VRAMRequired,
+		AlwaysActive: cfg.AlwaysActive,
+	}, nil
+}
+
+// GetAllDemands retrieves demand data for all configured models.
+func (s *DemandStore) GetAllDemands(ctx context.Context) ([]*ModelDemand, error) {
+	if s == nil || s.rdb == nil {
+		return nil, nil
+	}
+
+	configs, err := s.GetAllModelConfigs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	demands := make([]*ModelDemand, 0, len(configs))
+	for model, cfg := range configs {
+		queueDepth, _ := s.GetQueueDepth(ctx, model)
+		activeDemand, _ := s.GetDemand(ctx, model)
+
+		demands = append(demands, &ModelDemand{
+			Model:        model,
+			QueueDepth:   queueDepth,
+			ActiveDemand: activeDemand,
+			VRAMRequired: cfg.VRAMRequired,
+			AlwaysActive: cfg.AlwaysActive,
+		})
+	}
+	return demands, nil
+}
+
+// GetGPUVRAM looks up VRAM capacity for a GPU type from gpu_api:gpu_specs.
+// Returns 0 if not found (caller should handle fallback).
+func (s *DemandStore) GetGPUVRAM(ctx context.Context, gpuType string) (int, error) {
+	if s == nil || s.rdb == nil {
+		return 0, nil
+	}
+
+	data, err := s.rdb.HGet(ctx, "gpu_api:gpu_specs", gpuType).Bytes()
+	if err == redis.Nil {
+		return 0, nil // not found
+	}
+	if err != nil {
+		return 0, fmt.Errorf("reading GPU spec for %s: %w", gpuType, err)
+	}
+
+	var spec struct {
+		VRAMGB int `json:"vram_gb"`
+	}
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return 0, fmt.Errorf("parsing GPU spec for %s: %w", gpuType, err)
+	}
+	return spec.VRAMGB, nil
+}
+
 // Close shuts down the Redis connection.
 func (s *DemandStore) Close() {
 	if s != nil && s.rdb != nil {

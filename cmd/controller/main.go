@@ -118,6 +118,7 @@ func main() {
 		registry,
 		batchWindow,
 	)
+	provisioningCtrl.DemandStore = demandStore
 	if err := provisioningCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create provisioning controller")
 		os.Exit(1)
