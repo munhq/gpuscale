@@ -159,8 +159,10 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	}
 
 	// Query Ray cluster capacity (Task #2: Ray capacity metrics)
+	var capacity *ClusterCapacity
 	if r.RayCapacityStore != nil {
-		capacity, err := r.RayCapacityStore.GetCapacity(ctx, r.DemandStore)
+		var err error
+		capacity, err = r.RayCapacityStore.GetCapacity(ctx, r.DemandStore)
 		if err != nil {
 			log.Error(err, "Failed to query Ray cluster capacity")
 		} else {
@@ -181,6 +183,35 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 					"usedVRAM", node.UsedVRAM,
 					"freeVRAM", node.FreeVRAM,
 				)
+			}
+		}
+	}
+
+	// Bin-packing decision (Task #3: determine if provisioning needed)
+	if r.DemandStore != nil && capacity != nil {
+		demands, err := r.DemandStore.GetAllDemands(ctx)
+		if err != nil {
+			log.Error(err, "Failed to get demands for bin-packing")
+		} else {
+			decision, err := r.DecideProvisioning(ctx, demands, capacity)
+			if err != nil {
+				log.Error(err, "Failed to make provisioning decision")
+			} else if !decision.ShouldProvision {
+				log.Info("Bin-packing decision: skip provisioning",
+					"reason", decision.Reason,
+				)
+				r.releaseProvisioningLocks(batch)
+				return
+			} else {
+				log.Info("Bin-packing decision: provision",
+					"reason", decision.Reason,
+					"models", decision.Models,
+					"requiredVRAM", decision.RequiredVRAM,
+					"requiredGPUs", decision.RequiredGPUs,
+					"gpuType", decision.GPUType,
+				)
+				// Override requirements from bin-packing
+				// (will be used below in SearchOffers)
 			}
 		}
 	}
