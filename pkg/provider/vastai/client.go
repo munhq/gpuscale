@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 const baseURL = "https://cloud.vast.ai/api/v0"
@@ -142,6 +144,11 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound ||
+		(resp.StatusCode >= 400 && strings.Contains(string(respBody), "no_such_ask")) {
+		return nil, fmt.Errorf("vast.ai offer %d expired: %s: %w", offerID, string(respBody), provider.ErrOfferExpired)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {

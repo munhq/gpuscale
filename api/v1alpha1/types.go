@@ -234,6 +234,14 @@ type GPUNodeClaimSpec struct {
 	// PoolRef is the name of the GPUNodePool that created this claim.
 	PoolRef string `json:"poolRef"`
 
+	// Provider is the name of the provider selected for this claim.
+	// Set at creation time by the provisioner so it survives status update failures.
+	Provider string `json:"provider,omitempty"`
+
+	// NodeType is the deployment mode: "full-node" or "ray-worker".
+	// Set at creation time by the provisioner so it survives status update failures.
+	NodeType string `json:"nodeType,omitempty"`
+
 	// ModelID is the model this claim was provisioned for.
 	// Used by the disruptor to check demand and always-active status.
 	ModelID string `json:"modelId,omitempty"`
@@ -319,6 +327,10 @@ type GPUNodeClaimStatus struct {
 
 	// IdleSince is when the node last became idle (no GPU workloads).
 	IdleSince *metav1.Time `json:"idleSince,omitempty"`
+
+	// RetryCount tracks how many times provisioning has been retried.
+	// Used for exponential backoff on failure.
+	RetryCount int `json:"retryCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true

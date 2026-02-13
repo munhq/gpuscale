@@ -285,13 +285,26 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		})
 	}
 
+	// Determine NodeType from the pool's provider config
+	nodeType := "ray-worker" // default
+	for _, p := range pool.Spec.Providers {
+		if p.Name == offer.ProviderName {
+			if p.NodeType != "" {
+				nodeType = p.NodeType
+			}
+			break
+		}
+	}
+
 	claim := &v1alpha1.GPUNodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("claim-%s", claimID),
 			Namespace: "gpuscale-system",
 		},
 		Spec: v1alpha1.GPUNodeClaimSpec{
-			PoolRef: pool.Name,
+			PoolRef:  pool.Name,
+			Provider: offer.ProviderName,
+			NodeType: nodeType,
 			Requirements: v1alpha1.ClaimRequirements{
 				GPUCount: merged.GPUCount,
 				MinVRAM:  merged.MinVRAM,
@@ -308,28 +321,41 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		return
 	}
 
-	// Determine NodeType from the pool's provider config
-	nodeType := "ray-worker" // default
-	for _, p := range pool.Spec.Providers {
-		if p.Name == offer.ProviderName {
-			if p.NodeType != "" {
-				nodeType = p.NodeType
+	// Update claim status with the selected offer.
+	// Retry with a fresh Get on conflict to handle "object has been modified" races.
+	const maxStatusRetries = 3
+	for attempt := 1; attempt <= maxStatusRetries; attempt++ {
+		// Re-fetch the claim to get the latest resourceVersion
+		if attempt > 1 {
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      claim.Name,
+				Namespace: claim.Namespace,
+			}, claim); err != nil {
+				log.Error(err, "Failed to re-fetch GPUNodeClaim for status update", "attempt", attempt)
+				break
 			}
+		}
+
+		claim.Status = v1alpha1.GPUNodeClaimStatus{
+			Provider:     offer.ProviderName,
+			NodeType:     nodeType,
+			GPUType:      offer.GPUType,
+			GPUCount:     offer.GPUCount,
+			PricePerHour: offer.PricePerHour,
+			Phase:        v1alpha1.ClaimPhasePending,
+		}
+		if err := r.Status().Update(ctx, claim); err != nil {
+			log.Error(err, "Failed to update GPUNodeClaim status", "attempt", attempt)
+			if attempt < maxStatusRetries {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			// Final attempt failed -- the ClaimReconciler will still work because
+			// Provider and NodeType are in the Spec (set at creation).
+			log.Info("Status update failed after retries; ClaimReconciler will read provider from Spec")
+		} else {
 			break
 		}
-	}
-
-	// Update claim status with the selected offer
-	claim.Status = v1alpha1.GPUNodeClaimStatus{
-		Provider:     offer.ProviderName,
-		NodeType:     nodeType,
-		GPUType:      offer.GPUType,
-		GPUCount:     offer.GPUCount,
-		PricePerHour: offer.PricePerHour,
-		Phase:        v1alpha1.ClaimPhasePending,
-	}
-	if err := r.Status().Update(ctx, claim); err != nil {
-		log.Error(err, "Failed to update GPUNodeClaim status")
 	}
 
 	log.Info("Created GPUNodeClaim",

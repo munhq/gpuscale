@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -116,30 +117,33 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Provider is set by the provisioner in a status update after claim creation.
-	// If it's empty, the provisioner hasn't updated yet — requeue quickly.
-	if claim.Status.Provider == "" {
+	// Resolve provider name: prefer Spec (survives status update failures), fallback to Status.
+	providerName := claim.Spec.Provider
+	if providerName == "" {
+		providerName = claim.Status.Provider
+	}
+	if providerName == "" {
 		log.Info("Claim pending, waiting for provisioner to set provider")
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	// Get the provider
-	prov, ok := r.Registry.Get(claim.Status.Provider)
+	prov, ok := r.Registry.Get(providerName)
 	if !ok {
-		log.Error(fmt.Errorf("provider %q not found", claim.Status.Provider), "Provider not registered")
+		log.Error(fmt.Errorf("provider %q not found", providerName), "Provider not registered")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Build bootstrap config
 	instanceID := claim.Name
-	nodeType := claim.Status.NodeType
+	nodeType := resolveClaimNodeType(claim)
 	config := provider.BootstrapConfig{
 		NodeType:      nodeType,
 		Image:         pool.Spec.Bootstrap.Image,
 		ModelCacheURL: pool.Spec.Bootstrap.ModelCacheURL,
 		InstanceID:    instanceID,
 		GPUType:       claim.Status.GPUType,
-		ProviderName:  claim.Status.Provider,
+		ProviderName:  providerName,
 	}
 
 	// Full-node specific: read VPN and Kubernetes join secrets
@@ -178,7 +182,9 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		}
 	}
 
-	// Search for a matching offer
+	// Search for a matching offer and create instance with retry on stale offers.
+	// Vast.ai offers expire quickly, so if CreateInstance fails with ErrOfferExpired,
+	// we re-search for fresh offers and retry (up to 3 attempts).
 	reqs := provider.GPURequirements{
 		GPUCount:     claim.Spec.Requirements.GPUCount,
 		MinVRAM:      claim.Spec.Requirements.MinVRAM,
@@ -187,41 +193,76 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		CapacityType: "spot",
 	}
 
-	offers, err := prov.SearchOffers(ctx, reqs)
-	if err != nil || len(offers) == 0 {
-		log.Error(err, "Failed to find offer for provisioning")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	offer := offers[0]
-
-	// Generate bootstrap script for full-node mode
+	// Generate bootstrap script for full-node mode (only need to do this once)
 	if nodeType == "full-node" {
 		config.OnStartScript = bootstrap.GenerateScript(config)
 		log.Info("Generated full-node bootstrap script", "scriptLength", len(config.OnStartScript))
 	}
 
-	// Transition to Provisioning
-	now := metav1.Now()
-	claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
-	claim.Status.ProvisionedAt = &now
-	if err := r.Status().Update(ctx, claim); err != nil {
-		return ctrl.Result{}, err
+	const maxOfferRetries = 3
+	var instance *provider.Instance
+	var lastErr error
+	for attempt := 1; attempt <= maxOfferRetries; attempt++ {
+		offers, err := prov.SearchOffers(ctx, reqs)
+		if err != nil || len(offers) == 0 {
+			log.Error(err, "Failed to find offer for provisioning", "attempt", attempt)
+			lastErr = err
+			if attempt < maxOfferRetries {
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+			break
+		}
+		offer := offers[0]
+
+		// Transition to Provisioning on first attempt
+		if attempt == 1 {
+			now := metav1.Now()
+			claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
+			claim.Status.ProvisionedAt = &now
+			if err := r.Status().Update(ctx, claim); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		instance, err = prov.CreateInstance(ctx, offer, config)
+		if err != nil {
+			if errors.Is(err, provider.ErrOfferExpired) && attempt < maxOfferRetries {
+				log.Info("Offer expired, retrying with fresh search",
+					"attempt", attempt,
+					"offerID", offer.OfferID,
+					"provider", offer.ProviderName,
+				)
+				lastErr = err
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+			lastErr = err
+			break
+		}
+		// Success
+		lastErr = nil
+		break
 	}
 
-	// Create instance
-	instance, err := prov.CreateInstance(ctx, offer, config)
-	if err != nil {
-		log.Error(err, "Failed to create instance")
+	if lastErr != nil || instance == nil {
+		log.Error(lastErr, "Failed to create instance after retries")
+		now := metav1.Now()
 		claim.Status.Phase = v1alpha1.ClaimPhasePending
+		errMsg := "unknown error"
+		if lastErr != nil {
+			errMsg = lastErr.Error()
+		}
 		claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
 			Type:               "ProvisionFailed",
 			Status:             metav1.ConditionTrue,
 			LastTransitionTime: now,
 			Reason:             "CreateInstanceFailed",
-			Message:            err.Error(),
+			Message:            errMsg,
 		})
+		claim.Status.RetryCount++
 		_ = r.Status().Update(ctx, claim)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: r.backoffDuration(claim.Status.RetryCount)}, nil
 	}
 
 	log.Info("Instance created",
@@ -232,15 +273,17 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	)
 
 	// Update claim with instance details
+	successNow := metav1.Now()
 	claim.Status.InstanceID = instance.InstanceID
 	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
+	claim.Status.RetryCount = 0 // Reset on success
 	if instance.Endpoint != "" {
 		claim.Status.Endpoint = instance.Endpoint
 	}
 	claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
 		Type:               "InstanceCreated",
 		Status:             metav1.ConditionTrue,
-		LastTransitionTime: now,
+		LastTransitionTime: successNow,
 		Reason:             "InstanceCreated",
 		Message:            fmt.Sprintf("Instance %s created on %s", instance.InstanceID, instance.ProviderName),
 	})
@@ -268,8 +311,10 @@ func (r *ClaimReconciler) handleProvisioning(ctx context.Context, claim *v1alpha
 }
 
 func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
-	prov, ok := r.Registry.Get(claim.Status.Provider)
+	providerName := resolveClaimProvider(claim)
+	prov, ok := r.Registry.Get(providerName)
 	if !ok {
+		log.Error(fmt.Errorf("provider %q not found", providerName), "Provider not registered")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -297,7 +342,8 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 	}
 
 	// Branch based on node type
-	if claim.Status.NodeType == "ray-worker" {
+	nodeType := resolveClaimNodeType(claim)
+	if nodeType == "ray-worker" {
 		return r.handleBootstrappingRayWorker(ctx, claim, instance, prov, log)
 	}
 	return r.handleBootstrappingFullNode(ctx, claim, prov, log)
@@ -551,6 +597,38 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// resolveClaimProvider returns the provider name, preferring Spec over Status.
+// Spec.Provider is set at creation time and survives status update failures.
+func resolveClaimProvider(claim *v1alpha1.GPUNodeClaim) string {
+	if claim.Spec.Provider != "" {
+		return claim.Spec.Provider
+	}
+	return claim.Status.Provider
+}
+
+// resolveClaimNodeType returns the node type, preferring Spec over Status.
+func resolveClaimNodeType(claim *v1alpha1.GPUNodeClaim) string {
+	if claim.Spec.NodeType != "" {
+		return claim.Spec.NodeType
+	}
+	return claim.Status.NodeType
+}
+
+// backoffDuration returns an exponential backoff duration based on retry count.
+// The progression is: 30s, 60s, 120s, 240s, capped at 5 minutes.
+func (r *ClaimReconciler) backoffDuration(retryCount int) time.Duration {
+	base := 30 * time.Second
+	d := base
+	for i := 1; i < retryCount; i++ {
+		d *= 2
+	}
+	const maxBackoff = 5 * time.Minute
+	if d > maxBackoff {
+		d = maxBackoff
+	}
+	return d
 }
 
 // SetupWithManager sets up the controller with the Manager.

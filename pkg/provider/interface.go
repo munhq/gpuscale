@@ -10,6 +10,7 @@ var (
 	ErrNoOffersAvailable = errors.New("no offers matching requirements are available")
 	ErrInstanceNotFound  = errors.New("instance not found")
 	ErrProviderAPI       = errors.New("provider API error")
+	ErrOfferExpired      = errors.New("offer expired or no longer available")
 )
 
 // GPURequirements describes what GPU resources are needed.
