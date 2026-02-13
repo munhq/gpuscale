@@ -34,6 +34,9 @@ type ProvisioningController struct {
 	// DemandStore reads API queue depth and model configs from Dragonfly DB 3
 	DemandStore *DemandStore
 
+	// RayCapacityStore queries Ray cluster for current GPU capacity
+	RayCapacityStore *RayCapacityStore
+
 	// Batch window for collecting pending pods before provisioning
 	BatchWindow time.Duration
 
@@ -151,6 +154,33 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 						"alwaysActive", d.AlwaysActive,
 					)
 				}
+			}
+		}
+	}
+
+	// Query Ray cluster capacity (Task #2: Ray capacity metrics)
+	if r.RayCapacityStore != nil {
+		capacity, err := r.RayCapacityStore.GetCapacity(ctx, r.DemandStore)
+		if err != nil {
+			log.Error(err, "Failed to query Ray cluster capacity")
+		} else {
+			log.Info("Ray cluster capacity",
+				"nodes", len(capacity.Nodes),
+				"totalGPUs", capacity.TotalGPUs,
+				"totalVRAM", capacity.TotalVRAM,
+				"usedVRAM", capacity.UsedVRAM,
+				"freeVRAM", capacity.FreeVRAM,
+				"loadedModels", len(capacity.LoadedModels),
+			)
+			for _, node := range capacity.Nodes {
+				log.Info("Ray node",
+					"nodeID", node.NodeID,
+					"gpuType", node.GPUType,
+					"gpuCount", node.GPUCount,
+					"totalVRAM", node.TotalVRAM,
+					"usedVRAM", node.UsedVRAM,
+					"freeVRAM", node.FreeVRAM,
+				)
 			}
 		}
 	}

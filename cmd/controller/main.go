@@ -106,6 +106,18 @@ func main() {
 		setupLog.Info("Demand store disabled (no REDIS_URL or connection failed)")
 	}
 
+	// Ray capacity store — queries Ray cluster for GPU capacity
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "gpu-workloads"
+	}
+	prometheusURL := os.Getenv("PROMETHEUS_URL")
+	if prometheusURL == "" {
+		prometheusURL = "http://prometheus-operated.monitoring.svc.cluster.local:9090"
+	}
+	rayCapacityStore := gpucontroller.NewRayCapacityStore(mgr.GetClient(), namespace, prometheusURL)
+	setupLog.Info("Ray capacity store enabled", "namespace", namespace, "prometheus", prometheusURL)
+
 	// Create selector for choosing best offers across providers
 	sel := gpuscheduler.NewSelector(registry, ctrl.Log.WithName("selector"))
 
@@ -119,6 +131,7 @@ func main() {
 		batchWindow,
 	)
 	provisioningCtrl.DemandStore = demandStore
+	provisioningCtrl.RayCapacityStore = rayCapacityStore
 	if err := provisioningCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create provisioning controller")
 		os.Exit(1)
