@@ -4,7 +4,8 @@ WORKDIR /workspace
 # Copy both gpuscale and pkg/provider (needed by go.mod replace directive)
 COPY gpuscale/go.mod gpuscale/go.sum gpuscale/
 COPY pkg/ pkg/
-COPY go.work go.work.sum ./
+# Disable go.work - we only need pkg/provider, not gpu-api
+ENV GOWORK=off
 WORKDIR /workspace/gpuscale
 RUN go mod download
 
