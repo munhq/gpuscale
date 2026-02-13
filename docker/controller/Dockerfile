@@ -14,6 +14,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -o gpuscale-controller ./cmd/controller
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
-COPY --from=builder /workspace/gpuscale-controller .
+COPY --from=builder /workspace/gpuscale/gpuscale-controller .
 USER 65532:65532
 ENTRYPOINT ["/gpuscale-controller"]
