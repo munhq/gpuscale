@@ -3,7 +3,7 @@ package scheduler
 import (
 	"strconv"
 
-	"github.com/munhq/gpuscale/pkg/provider"
+	"github.com/munhq/gpuscale/internal/provider"
 	corev1 "k8s.io/api/core/v1"
 )
 

@@ -8,6 +8,7 @@ import (
 	"github.com/munhq/gpuscale/api/v1alpha1"
 	gpucontroller "github.com/munhq/gpuscale/internal/controller"
 	gpumetrics "github.com/munhq/gpuscale/internal/metrics"
+	gpuscheduler "github.com/munhq/gpuscale/internal/scheduler"
 	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/munhq/gpuscale/pkg/provider/runpod"
 	"github.com/munhq/gpuscale/pkg/provider/vastai"
@@ -33,6 +34,7 @@ func main() {
 	var (
 		metricsAddr            string
 		healthProbeAddr        string
+		batchWindow            time.Duration
 		cooldownPeriod         time.Duration
 		interruptionInterval   time.Duration
 		workerMetricsInterval  time.Duration
@@ -40,6 +42,7 @@ func main() {
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&healthProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.DurationVar(&batchWindow, "batch-window", 10*time.Second, "Duration to batch pending pods before provisioning.")
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 10*time.Minute, "Duration to wait before destroying idle nodes.")
 	flag.DurationVar(&interruptionInterval, "interruption-poll-interval", 30*time.Second, "Interval for polling provider APIs for interruptions.")
 	flag.DurationVar(&workerMetricsInterval, "worker-metrics-interval", 1*time.Minute, "Interval for scraping vLLM metrics from workers.")
@@ -103,9 +106,22 @@ func main() {
 		setupLog.Info("Demand store disabled (no REDIS_URL or connection failed)")
 	}
 
+	// Create selector for choosing best offers across providers
+	sel := gpuscheduler.NewSelector(registry, ctrl.Log.WithName("selector"))
+
 	// Set up controllers
-	// NOTE: ProvisioningController removed — GPU API now triggers provisioning directly.
-	// GPUScale is lifecycle-only: claim reconciliation + disruption (scale-down).
+	// ProvisioningController watches pending GPU pods (created by KEDA) and provisions instances
+	provisioningCtrl := gpucontroller.NewProvisioningController(
+		mgr.GetClient(),
+		ctrl.Log.WithName("provisioner"),
+		sel,
+		registry,
+		batchWindow,
+	)
+	if err := provisioningCtrl.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create provisioning controller")
+		os.Exit(1)
+	}
 
 	disruptionCtrl := gpucontroller.NewDisruptionController(
 		mgr.GetClient(),

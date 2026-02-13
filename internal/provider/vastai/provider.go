@@ -1,0 +1,329 @@
+package vastai
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/munhq/gpuscale/internal/bootstrap"
+	"github.com/munhq/gpuscale/internal/provider"
+)
+
+// Provider implements the provider.Provider interface for Vast.ai.
+type Provider struct {
+	client *Client
+}
+
+// New creates a new Vast.ai provider.
+func New(apiKey string) *Provider {
+	return &Provider{
+		client: NewClient(apiKey),
+	}
+}
+
+func (p *Provider) Name() string {
+	return "vast.ai"
+}
+
+func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
+	params := map[string]string{
+		"order":    "dph_total",
+		"type":     "ask",
+		"verified": "true",
+	}
+
+	if req.GPUCount > 0 {
+		params["num_gpus"] = strconv.Itoa(req.GPUCount)
+	}
+	if req.MinVRAM > 0 {
+		// Vast.ai uses MB for gpu_totalram
+		params["min_gpu_totalram"] = strconv.Itoa(req.MinVRAM * 1024)
+	}
+	if req.MaxPrice > 0 {
+		params["max_dph_total"] = fmt.Sprintf("%.2f", req.MaxPrice)
+	}
+	if req.MinDisk > 0 {
+		params["min_disk_space"] = strconv.Itoa(req.MinDisk)
+	}
+	if req.MinRAM > 0 {
+		// Vast.ai uses MB for cpu_ram
+		params["min_cpu_ram"] = strconv.Itoa(req.MinRAM * 1024)
+	}
+	if len(req.GPUTypes) > 0 {
+		params["gpu_name"] = req.GPUTypes[0]
+	}
+	if req.CapacityType == "spot" {
+		params["rentable"] = "true"
+	}
+
+	offers, err := p.client.SearchOffers(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("searching vast.ai offers: %w", err)
+	}
+
+	result := make([]provider.Offer, 0, len(offers))
+	for _, o := range offers {
+		vramGB := int(o.GPURAMTotal / 1024) // convert MB to GB
+		if vramGB == 0 && o.GPURAMTotal > 0 {
+			vramGB = 1
+		}
+
+		capacityType := "on-demand"
+		if o.Interruptible != nil && *o.Interruptible {
+			capacityType = "spot"
+		}
+
+		result = append(result, provider.Offer{
+			ProviderName: p.Name(),
+			OfferID:      strconv.Itoa(o.ID),
+			GPUType:      o.GPUName,
+			GPUCount:     o.NumGPUs,
+			VRAM:         vramGB,
+			PricePerHour: o.DPHTotal,
+			CapacityType: capacityType,
+			Region:       o.Geolocation,
+			Reliability:  o.Reliability,
+			DiskGB:       int(o.DiskSpace),
+			RAMGB:        int(o.RAMTotal / 1024),
+		})
+	}
+	return result, nil
+}
+
+func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, config provider.BootstrapConfig) (*provider.Instance, error) {
+	offerID, err := strconv.Atoi(offer.OfferID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid offer ID %q: %w", offer.OfferID, err)
+	}
+
+	var env map[string]string
+	var onstart string
+	var image string
+
+	if config.NodeType == "ray-worker" {
+		// Ray worker mode — standalone vLLM in container
+		image = config.Image
+		if image == "" {
+			image = "vllm/vllm-openai:latest"
+		}
+
+		env = map[string]string{
+			"GPU_TYPE":    config.GPUType,
+			"PROVIDER":    config.ProviderName,
+			"INSTANCE_ID": config.InstanceID,
+		}
+		if config.ModelID != "" {
+			env["MODEL_ID"] = config.ModelID
+		}
+		if config.ModelCacheURL != "" {
+			env["MODEL_CACHE_URL"] = config.ModelCacheURL
+		}
+		for k, v := range config.ExtraEnv {
+			env[k] = v
+		}
+
+		onstart = generateVLLMBootstrapScript(config)
+
+	} else {
+		// Full-node mode — VM joins Kubernetes cluster via VPN
+		image = config.Image
+		if image == "" {
+			image = "ghcr.io/munhq/gpuscale-node:latest"
+		}
+
+		env = bootstrap.GenerateEnvVars(config)
+		onstart = bootstrap.GenerateScript(config)
+	}
+
+	createReq := InstanceCreateRequest{
+		Image:   image,
+		Disk:    50,
+		RunType: "args",
+		Env:     env,
+		Onstart: onstart,
+	}
+
+	resp, err := p.client.CreateInstance(ctx, offerID, createReq)
+	if err != nil {
+		return nil, fmt.Errorf("creating vast.ai instance: %w", err)
+	}
+
+	// Build endpoint for ray-worker type
+	endpoint := ""
+	if config.NodeType == "ray-worker" {
+		servePort := config.RayServePort
+		if servePort == 0 {
+			servePort = 8000
+		}
+		if resp.SSHHost != "" {
+			endpoint = fmt.Sprintf("http://%s:%d", resp.SSHHost, servePort)
+		}
+	}
+
+	return &provider.Instance{
+		ProviderName: p.Name(),
+		InstanceID:   strconv.Itoa(resp.ID),
+		NodeType:     config.NodeType,
+		IP:           resp.SSHHost,
+		SSHPort:      resp.SSHPort,
+		Endpoint:     endpoint,
+		Status:       normalizeStatus(resp.ActualStatus),
+		GPUType:      resp.GPUName,
+		GPUCount:     resp.NumGPUs,
+		PricePerHour: resp.DPHTotal,
+		CreatedAt:    time.Now(),
+	}, nil
+}
+
+// generateVLLMBootstrapScript creates an inline bootstrap script for vLLM workers.
+func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
+	servePort := config.RayServePort
+	if servePort == 0 {
+		servePort = 8000
+	}
+
+	modelID := config.ModelID
+	if modelID == "" {
+		modelID = "THUDM/glm-4-9b-chat"
+	}
+	maxModelLen := config.MaxModelLen
+	if maxModelLen == 0 {
+		maxModelLen = 4096
+	}
+	dtype := config.DType
+	if dtype == "" {
+		dtype = "auto"
+	}
+	gpuMemUtil := config.GPUMemUtil
+	if gpuMemUtil <= 0 {
+		gpuMemUtil = 0.90
+	}
+
+	script := fmt.Sprintf(`#!/bin/bash
+set -euo pipefail
+
+echo '[gpuscale] Starting vLLM worker on %s'
+echo '[gpuscale] Instance: %s, GPU: %s'
+echo '[gpuscale] Model: %s'
+
+# Install vLLM if not present (pre-built images like vllm/vllm-openai already have it)
+if ! python -c "import vllm" 2>/dev/null; then
+  echo '[gpuscale] Installing vLLM...'
+  pip install vllm 2>&1 | tail -10
+fi
+
+`, config.ProviderName, config.InstanceID, config.GPUType, modelID)
+
+	// Optional model pre-cache
+	if config.ModelCacheURL != "" {
+		script += fmt.Sprintf(`# Pre-cache model weights
+echo '[gpuscale] Pre-caching model from %s...'
+mkdir -p /opt/models
+if command -v rclone &> /dev/null; then
+  rclone sync '%s' /opt/models/ --progress
+else
+  echo '[gpuscale] rclone not found, skipping pre-cache'
+fi
+
+`, config.ModelCacheURL, config.ModelCacheURL)
+	}
+
+	trustFlag := ""
+	if config.TrustRemoteCode {
+		trustFlag = "\n  --trust-remote-code \\"
+	}
+
+	script += fmt.Sprintf(`# Start vLLM OpenAI-compatible server
+echo '[gpuscale] Starting vLLM serve on port %d...'
+exec python -m vllm.entrypoints.openai.api_server \
+  --model '%s' \
+  --host 0.0.0.0 \
+  --port %d \
+  --gpu-memory-utilization %.2f \
+  --max-model-len %d \
+  --dtype %s%s
+`, servePort, modelID, servePort, gpuMemUtil, maxModelLen, dtype, trustFlag)
+
+	return script
+}
+
+func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error {
+	id, err := strconv.Atoi(instanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance ID %q: %w", instanceID, err)
+	}
+	return p.client.DestroyInstance(ctx, id)
+}
+
+func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provider.Instance, error) {
+	id, err := strconv.Atoi(instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid instance ID %q: %w", instanceID, err)
+	}
+
+	resp, err := p.client.GetInstance(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, provider.ErrInstanceNotFound
+	}
+
+	createdAt := time.Time{}
+	if resp.StartDate > 0 {
+		createdAt = time.Unix(int64(resp.StartDate), 0)
+	}
+
+	return &provider.Instance{
+		ProviderName: p.Name(),
+		InstanceID:   strconv.Itoa(resp.ID),
+		IP:           resp.SSHHost,
+		SSHPort:      resp.SSHPort,
+		Status:       normalizeStatus(resp.ActualStatus),
+		GPUType:      resp.GPUName,
+		GPUCount:     resp.NumGPUs,
+		PricePerHour: resp.DPHTotal,
+		CreatedAt:    createdAt,
+	}, nil
+}
+
+func (p *Provider) ListInstances(ctx context.Context) ([]*provider.Instance, error) {
+	instances, err := p.client.ListInstances(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*provider.Instance, 0, len(instances))
+	for _, inst := range instances {
+		createdAt := time.Time{}
+		if inst.StartDate > 0 {
+			createdAt = time.Unix(int64(inst.StartDate), 0)
+		}
+		result = append(result, &provider.Instance{
+			ProviderName: p.Name(),
+			InstanceID:   strconv.Itoa(inst.ID),
+			IP:           inst.SSHHost,
+			SSHPort:      inst.SSHPort,
+			Status:       normalizeStatus(inst.ActualStatus),
+			GPUType:      inst.GPUName,
+			GPUCount:     inst.NumGPUs,
+			PricePerHour: inst.DPHTotal,
+			CreatedAt:    createdAt,
+		})
+	}
+	return result, nil
+}
+
+func normalizeStatus(vastStatus string) string {
+	switch vastStatus {
+	case "running":
+		return "running"
+	case "loading", "creating", "pulling":
+		return "starting"
+	case "exited", "stopped", "offline":
+		return "stopped"
+	default:
+		return "error"
+	}
+}
