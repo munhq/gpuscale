@@ -1,5 +1,6 @@
 # GPUScale
 
+<!-- force rebuild -->
 Multi-cloud GPU autoscaler for Kubernetes. Dynamically provisions standalone vLLM inference workers from spot GPU providers (Vast.ai, Verda, RunPod) when demand exceeds in-cluster capacity.
 
 ## Why GPUScale?
