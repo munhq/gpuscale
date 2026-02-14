@@ -60,6 +60,9 @@ func NewProvisioningController(c client.Client, log logr.Logger, sel *scheduler.
 }
 
 // Reconcile processes pending GPU pods.
+// Dedup is demand-level: we count active (non-Terminated) claims and only
+// provision if there are more pending demand pods than active claims.
+// This prevents duplicate claims when pods get recreated (rolling updates).
 func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pod", req.NamespacedName)
 
@@ -77,40 +80,32 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 	if !scheduler.IsUnschedulable(&pod) {
-		// Requeue — might become unschedulable soon
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Check if we're already provisioning for this pod (in-memory fast path)
+	// Demand-level dedup: count active claims vs pending demand pods.
+	// If we already have enough claims in flight, don't create more.
+	activeClaims := r.countActiveClaims(ctx)
+	pendingDemandPods := r.countPendingDemandPods(ctx)
+
+	if activeClaims >= pendingDemandPods {
+		log.V(1).Info("Sufficient claims already exist",
+			"activeClaims", activeClaims,
+			"pendingDemandPods", pendingDemandPods,
+		)
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// In-memory dedup to prevent multiple reconciles from creating claims concurrently.
 	r.mu.Lock()
 	if r.provisioningFor[pod.UID] {
 		r.mu.Unlock()
 		return ctrl.Result{}, nil
 	}
-	r.mu.Unlock()
 
-	// Persistent dedup: check if an existing GPUNodeClaim already covers this pod.
-	// This survives controller restarts — the in-memory map is just a fast path.
-	if r.claimExistsForPod(ctx, string(pod.UID)) {
-		log.Info("Claim already exists for pod, skipping", "podUID", pod.UID)
-		r.mu.Lock()
-		r.provisioningFor[pod.UID] = true // cache it
-		r.mu.Unlock()
-		return ctrl.Result{}, nil
-	}
-
-	r.mu.Lock()
-	// Re-check after persistent lookup (another reconcile may have added it)
-	if r.provisioningFor[pod.UID] {
-		r.mu.Unlock()
-		return ctrl.Result{}, nil
-	}
-
-	// Add to batch
 	r.pendingBatch = append(r.pendingBatch, &pod)
 	r.provisioningFor[pod.UID] = true
 
-	// Start batch timer if not running
 	if r.batchTimer == nil {
 		r.batchTimer = time.AfterFunc(r.BatchWindow, func() {
 			r.processBatch(context.Background())
@@ -118,7 +113,10 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	r.mu.Unlock()
 
-	log.Info("Pod added to provisioning batch", "gpu", "true")
+	log.Info("Pod added to provisioning batch",
+		"activeClaims", activeClaims,
+		"pendingDemandPods", pendingDemandPods,
+	)
 	return ctrl.Result{}, nil
 }
 
@@ -402,26 +400,38 @@ func (r *ProvisioningController) checkPoolLimits(ctx context.Context, pool *v1al
 	return nil
 }
 
-// claimExistsForPod checks whether any active (non-Terminated) GPUNodeClaim
-// already references this pod UID. This prevents double-provisioning after
-// controller restarts when the in-memory map is lost.
-func (r *ProvisioningController) claimExistsForPod(ctx context.Context, podUID string) bool {
+// countActiveClaims returns the number of non-Terminated GPUNodeClaims.
+func (r *ProvisioningController) countActiveClaims(ctx context.Context) int {
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
-		r.Log.Error(err, "Failed to list claims for dedup check")
-		return false // fail open — let the batch process handle limits
+	if err := r.List(ctx, &claims); err != nil {
+		r.Log.Error(err, "Failed to list claims for dedup")
+		return 0
 	}
+	count := 0
 	for _, c := range claims.Items {
-		if c.Status.Phase == v1alpha1.ClaimPhaseTerminated {
-			continue
-		}
-		for _, ref := range c.Spec.PodRefs {
-			if ref.UID == podUID {
-				return true
-			}
+		if c.Status.Phase != v1alpha1.ClaimPhaseTerminated {
+			count++
 		}
 	}
-	return false
+	return count
+}
+
+// countPendingDemandPods returns the number of pending GPU demand-signal pods.
+func (r *ProvisioningController) countPendingDemandPods(ctx context.Context) int {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.MatchingLabels{
+		"app": "gpu-demand",
+	}); err != nil {
+		r.Log.Error(err, "Failed to list demand pods for dedup")
+		return 0
+	}
+	count := 0
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodPending {
+			count++
+		}
+	}
+	return count
 }
 
 func (r *ProvisioningController) releaseProvisioningLocks(pods []*corev1.Pod) {

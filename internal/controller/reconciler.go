@@ -17,7 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+const claimFinalizer = "gpuscale.io/instance-cleanup"
 
 // ClaimReconciler manages the lifecycle of GPUNodeClaims.
 // Supports two bootstrap paths:
@@ -84,6 +87,19 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	var claim v1alpha1.GPUNodeClaim
 	if err := r.Get(ctx, req.NamespacedName, &claim); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Handle deletion: finalizer ensures we destroy the provider instance.
+	if !claim.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, &claim, log)
+	}
+
+	// Ensure finalizer is set on new claims.
+	if !controllerutil.ContainsFinalizer(&claim, claimFinalizer) {
+		controllerutil.AddFinalizer(&claim, claimFinalizer)
+		if err := r.Update(ctx, &claim); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	switch claim.Status.Phase {
@@ -596,6 +612,44 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 		log.Error(err, "Failed to remove worker from Dragonfly")
 	}
 
+	return ctrl.Result{}, nil
+}
+
+// handleDeletion destroys the provider instance before allowing the claim to be deleted.
+func (r *ClaimReconciler) handleDeletion(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(claim, claimFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	// Destroy the provider instance if one was created.
+	instanceID := claim.Status.InstanceID
+	providerName := resolveClaimProvider(claim)
+	if instanceID != "" && instanceID != "0" && providerName != "" {
+		prov, ok := r.Registry.Get(providerName)
+		if ok {
+			if err := prov.DestroyInstance(ctx, instanceID); err != nil {
+				log.Error(err, "Failed to destroy instance during deletion", "instanceID", instanceID, "provider", providerName)
+				// Don't block deletion forever — log and proceed.
+			} else {
+				log.Info("Destroyed provider instance on claim deletion", "instanceID", instanceID, "provider", providerName)
+			}
+		} else {
+			log.Error(fmt.Errorf("provider %q not found", providerName), "Cannot destroy instance, provider not registered")
+		}
+	}
+
+	// Clean up Dragonfly worker entry.
+	if r.WorkerStore != nil {
+		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+	}
+
+	// Remove finalizer to allow K8s to delete the object.
+	controllerutil.RemoveFinalizer(claim, claimFinalizer)
+	if err := r.Update(ctx, claim); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Finalizer completed, claim will be deleted")
 	return ctrl.Result{}, nil
 }
 

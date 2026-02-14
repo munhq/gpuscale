@@ -174,11 +174,22 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 			createResp.Success, createResp.NewContract, createResp.Error)
 	}
 
-	// Immediately fetch the full instance details using the new contract ID
-	return c.GetInstance(ctx, createResp.NewContract)
+	// Try to fetch the full instance details using the new contract ID.
+	// The instance might not be queryable immediately after creation.
+	instance, err := c.GetInstance(ctx, createResp.NewContract)
+	if err != nil || instance == nil {
+		// GetInstance failed — return a minimal response using the contract ID.
+		// The reconciler will get full details on subsequent polls.
+		return &InstanceResponse{
+			ID:           createResp.NewContract,
+			ActualStatus: "created",
+		}, nil
+	}
+	return instance, nil
 }
 
 // GetInstance returns the details of a specific instance.
+// Vast.ai wraps the response: {"instances": {<instance fields>}}.
 func (c *Client) GetInstance(ctx context.Context, instanceID int) (*InstanceResponse, error) {
 	reqURL := fmt.Sprintf("%s/instances/%d/", c.baseURL, instanceID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -197,16 +208,36 @@ func (c *Client) GetInstance(ctx context.Context, instanceID int) (*InstanceResp
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("vast.ai get instance returned %d: %s", resp.StatusCode, string(body))
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	var instance InstanceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&instance); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("vast.ai get instance returned %d: %s", resp.StatusCode, string(respBody))
 	}
-	return &instance, nil
+
+	// Vast.ai returns {"instances": {<instance>}} for single-instance GET.
+	var wrapped struct {
+		Instances InstanceResponse `json:"instances"`
+	}
+	if err := json.Unmarshal(respBody, &wrapped); err != nil {
+		// Fallback: try decoding as flat InstanceResponse
+		var instance InstanceResponse
+		if err2 := json.Unmarshal(respBody, &instance); err2 != nil {
+			preview := string(respBody)
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			return nil, fmt.Errorf("decoding get-instance response: %w. Response: %s", err, preview)
+		}
+		return &instance, nil
+	}
+	if wrapped.Instances.ID == 0 {
+		return nil, fmt.Errorf("vast.ai returned instance with ID=0 for request %d", instanceID)
+	}
+	return &wrapped.Instances, nil
 }
 
 // ListInstances returns all instances.
