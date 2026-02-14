@@ -142,10 +142,15 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("full-node requires OnStartScript")
 	}
 
+	// Use ssh_proxy mode when we have an onstart script — "args" mode
+	// uses the docker entrypoint and ignores onstart, causing the script
+	// content to be treated as a file path (exec error).
+	runType := "ssh_proxy"
+
 	createReq := InstanceCreateRequest{
 		Image:   image,
 		Disk:    50,
-		RunType: "args",
+		RunType: runType,
 		Env:     env,
 		Onstart: onstart,
 	}

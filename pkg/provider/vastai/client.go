@@ -58,11 +58,13 @@ type BundleOffer struct {
 }
 
 // InstanceCreateRequest is the body for creating an instance on Vast.ai.
+// RunType should be "ssh_proxy" or "ssh_direc" when using Onstart scripts.
+// "args" mode uses the docker entrypoint and ignores Onstart.
 type InstanceCreateRequest struct {
 	Image   string            `json:"image"`
 	Disk    float64           `json:"disk"`
-	Onstart string            `json:"onstart"`
-	Env     map[string]string `json:"env"`
+	Onstart string            `json:"onstart,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
 	RunType string            `json:"runtype"`
 }
 
@@ -170,22 +172,18 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 	}
 
 	if !createResp.Success || createResp.NewContract == 0 {
-		return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s",
-			createResp.Success, createResp.NewContract, createResp.Error)
+		return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s, raw=%s",
+			createResp.Success, createResp.NewContract, createResp.Error, string(respBody))
 	}
 
-	// Try to fetch the full instance details using the new contract ID.
-	// The instance might not be queryable immediately after creation.
-	instance, err := c.GetInstance(ctx, createResp.NewContract)
-	if err != nil || instance == nil {
-		// GetInstance failed — return a minimal response using the contract ID.
-		// The reconciler will get full details on subsequent polls.
-		return &InstanceResponse{
-			ID:           createResp.NewContract,
-			ActualStatus: "created",
-		}, nil
-	}
-	return instance, nil
+	// Return the contract ID directly. Don't call GetInstance here — the
+	// instance may not be queryable immediately after creation, and any
+	// parsing issues could override the valid contract ID with 0.
+	// The ClaimReconciler polls GetInstance during the Bootstrapping phase.
+	return &InstanceResponse{
+		ID:           createResp.NewContract,
+		ActualStatus: "created",
+	}, nil
 }
 
 // GetInstance returns the details of a specific instance.

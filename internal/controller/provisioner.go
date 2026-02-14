@@ -133,7 +133,20 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	}
 
 	log := r.Log.WithValues("batchSize", len(batch))
-	log.Info("Processing pending pod batch")
+
+	// Re-check dedup at batch processing time — the reconcile-time check
+	// may be stale because multiple pods can queue between check and batch fire.
+	activeClaims := r.countActiveClaims(ctx)
+	pendingDemandPods := r.countPendingDemandPods(ctx)
+	log.Info("Processing pending pod batch",
+		"activeClaims", activeClaims,
+		"pendingDemandPods", pendingDemandPods,
+	)
+	if activeClaims >= pendingDemandPods {
+		log.Info("Skipping batch: sufficient claims already exist")
+		r.releaseProvisioningLocks(batch)
+		return
+	}
 
 	// Query demand data from Dragonfly (Task #1: API queue metrics)
 	if r.DemandStore != nil {
@@ -297,7 +310,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	claim := &v1alpha1.GPUNodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("claim-%s", claimID),
-			Namespace: "gpuscale-system",
+			Namespace: claimNamespace(),
 		},
 		Spec: v1alpha1.GPUNodeClaimSpec{
 			PoolRef:  pool.Name,
@@ -312,6 +325,10 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 			PodRefs: podRefs,
 		},
 	}
+
+	// Add finalizer before creation so it's always present.
+	// This ensures the provider instance is destroyed when the claim is deleted.
+	claim.Finalizers = []string{"gpuscale.io/instance-cleanup"}
 
 	if err := r.Create(ctx, claim); err != nil {
 		log.Error(err, "Failed to create GPUNodeClaim")
@@ -367,7 +384,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 func (r *ProvisioningController) checkPoolLimits(ctx context.Context, pool *v1alpha1.GPUNodePool) error {
 	// Count existing claims for this pool
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace("gpuscale-system")); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		return fmt.Errorf("listing claims: %w", err)
 	}
 
@@ -403,7 +420,7 @@ func (r *ProvisioningController) checkPoolLimits(ctx context.Context, pool *v1al
 // countActiveClaims returns the number of non-Terminated GPUNodeClaims.
 func (r *ProvisioningController) countActiveClaims(ctx context.Context) int {
 	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims); err != nil {
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
 		r.Log.Error(err, "Failed to list claims for dedup")
 		return 0
 	}
