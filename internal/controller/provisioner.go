@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
-	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/munhq/gpuscale/internal/scheduler"
+	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
@@ -25,11 +25,10 @@ import (
 )
 
 // ProvisioningController watches for pending GPU pods and creates GPUNodeClaims.
+// It does NOT select offers — that's the coordinator's job via ClaimReconciler.
 type ProvisioningController struct {
 	client.Client
-	Log      logr.Logger
-	Selector *scheduler.Selector
-	Registry *provider.Registry
+	Log logr.Logger
 
 	// DemandStore reads API queue depth and model configs from Dragonfly DB 3
 	DemandStore *DemandStore
@@ -48,12 +47,10 @@ type ProvisioningController struct {
 }
 
 // NewProvisioningController creates a new provisioning controller.
-func NewProvisioningController(c client.Client, log logr.Logger, sel *scheduler.Selector, reg *provider.Registry, batchWindow time.Duration) *ProvisioningController {
+func NewProvisioningController(c client.Client, log logr.Logger, batchWindow time.Duration) *ProvisioningController {
 	return &ProvisioningController{
 		Client:          c,
 		Log:             log,
-		Selector:        sel,
-		Registry:        reg,
 		BatchWindow:     batchWindow,
 		provisioningFor: make(map[types.UID]bool),
 	}
@@ -272,20 +269,8 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		merged.GPUTypes = pool.Spec.Requirements.GPUTypes
 	}
 
-	// Find best offer
-	providerNames := make([]string, 0, len(pool.Spec.Providers))
-	for _, p := range pool.Spec.Providers {
-		providerNames = append(providerNames, p.Name)
-	}
-
-	offer, err := r.Selector.SelectBestOffer(ctx, merged, providerNames)
-	if err != nil {
-		log.Error(err, "No suitable offer found")
-		r.releaseProvisioningLocks(batch)
-		return
-	}
-
-	// Create GPUNodeClaim
+	// Create GPUNodeClaim with requirements only — the coordinator picks
+	// the provider and offer at provision time via ClaimReconciler.
 	claimID := uuid.New().String()[:8]
 	podRefs := make([]v1alpha1.PodReference, 0, len(batch))
 	for _, pod := range batch {
@@ -296,15 +281,10 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		})
 	}
 
-	// Determine NodeType from the pool's provider config
-	nodeType := "ray-worker" // default
-	for _, p := range pool.Spec.Providers {
-		if p.Name == offer.ProviderName {
-			if p.NodeType != "" {
-				nodeType = p.NodeType
-			}
-			break
-		}
+	// Determine NodeType from the pool's provider config.
+	nodeType := "ray-worker"
+	if len(pool.Spec.Providers) > 0 && pool.Spec.Providers[0].NodeType != "" {
+		nodeType = pool.Spec.Providers[0].NodeType
 	}
 
 	claim := &v1alpha1.GPUNodeClaim{
@@ -314,7 +294,6 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		},
 		Spec: v1alpha1.GPUNodeClaimSpec{
 			PoolRef:  pool.Name,
-			Provider: offer.ProviderName,
 			NodeType: nodeType,
 			Requirements: v1alpha1.ClaimRequirements{
 				GPUCount: merged.GPUCount,
@@ -327,7 +306,6 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	}
 
 	// Add finalizer before creation so it's always present.
-	// This ensures the provider instance is destroyed when the claim is deleted.
 	claim.Finalizers = []string{"gpuscale.io/instance-cleanup"}
 
 	if err := r.Create(ctx, claim); err != nil {
@@ -336,48 +314,11 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		return
 	}
 
-	// Update claim status with the selected offer.
-	// Retry with a fresh Get on conflict to handle "object has been modified" races.
-	const maxStatusRetries = 3
-	for attempt := 1; attempt <= maxStatusRetries; attempt++ {
-		// Re-fetch the claim to get the latest resourceVersion
-		if attempt > 1 {
-			if err := r.Get(ctx, types.NamespacedName{
-				Name:      claim.Name,
-				Namespace: claim.Namespace,
-			}, claim); err != nil {
-				log.Error(err, "Failed to re-fetch GPUNodeClaim for status update", "attempt", attempt)
-				break
-			}
-		}
-
-		claim.Status = v1alpha1.GPUNodeClaimStatus{
-			Provider:     offer.ProviderName,
-			NodeType:     nodeType,
-			GPUType:      offer.GPUType,
-			GPUCount:     offer.GPUCount,
-			PricePerHour: offer.PricePerHour,
-			Phase:        v1alpha1.ClaimPhasePending,
-		}
-		if err := r.Status().Update(ctx, claim); err != nil {
-			log.Error(err, "Failed to update GPUNodeClaim status", "attempt", attempt)
-			if attempt < maxStatusRetries {
-				time.Sleep(200 * time.Millisecond)
-				continue
-			}
-			// Final attempt failed -- the ClaimReconciler will still work because
-			// Provider and NodeType are in the Spec (set at creation).
-			log.Info("Status update failed after retries; ClaimReconciler will read provider from Spec")
-		} else {
-			break
-		}
-	}
-
 	log.Info("Created GPUNodeClaim",
 		"claim", claim.Name,
-		"provider", offer.ProviderName,
-		"gpu", offer.GPUType,
-		"price", offer.PricePerHour,
+		"nodeType", nodeType,
+		"gpuCount", merged.GPUCount,
+		"minVRAM", merged.MinVRAM,
 	)
 }
 

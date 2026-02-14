@@ -3,13 +3,13 @@ package controller
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
 	"github.com/munhq/gpuscale/internal/bootstrap"
+	"github.com/munhq/gpuscale/internal/coordinator"
 	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +32,7 @@ type ClaimReconciler struct {
 	client.Client
 	Log           logr.Logger
 	Registry      *provider.Registry
+	Coordinator   *coordinator.Coordinator
 	HealthChecker *bootstrap.NodeHealthChecker
 
 	// SecretReader is used to fetch bootstrap secrets.
@@ -133,21 +134,15 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Resolve provider name: prefer Spec (survives status update failures), fallback to Status.
-	providerName := claim.Spec.Provider
-	if providerName == "" {
-		providerName = claim.Status.Provider
-	}
-	if providerName == "" {
-		log.Info("Claim pending, waiting for provisioner to set provider")
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-
-	// Get the provider
-	prov, ok := r.Registry.Get(providerName)
-	if !ok {
-		log.Error(fmt.Errorf("provider %q not found", providerName), "Provider not registered")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	// Determine provider list: if claim already specifies a provider (legacy),
+	// constrain to that; otherwise use all pool providers.
+	providerNames := make([]string, 0, len(pool.Spec.Providers))
+	if claim.Spec.Provider != "" {
+		providerNames = append(providerNames, claim.Spec.Provider)
+	} else {
+		for _, p := range pool.Spec.Providers {
+			providerNames = append(providerNames, p.Name)
+		}
 	}
 
 	// Build bootstrap config
@@ -159,7 +154,6 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		ModelCacheURL: pool.Spec.Bootstrap.ModelCacheURL,
 		InstanceID:    instanceID,
 		GPUType:       claim.Status.GPUType,
-		ProviderName:  providerName,
 	}
 
 	// Full-node specific: read VPN and Kubernetes join secrets
@@ -198,9 +192,6 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		}
 	}
 
-	// Search for a matching offer and create instance with retry on stale offers.
-	// Vast.ai offers expire quickly, so if CreateInstance fails with ErrOfferExpired,
-	// we re-search for fresh offers and retry (up to 3 attempts).
 	reqs := provider.GPURequirements{
 		GPUCount:     claim.Spec.Requirements.GPUCount,
 		MinVRAM:      claim.Spec.Requirements.MinVRAM,
@@ -209,90 +200,70 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		CapacityType: "spot",
 	}
 
-	// Generate bootstrap script for full-node mode (only need to do this once)
-	if nodeType == "full-node" {
-		config.OnStartScript = bootstrap.GenerateScript(config)
-		log.Info("Generated full-node bootstrap script", "scriptLength", len(config.OnStartScript))
+	// Note: full-node bootstrap script is generated inside the coordinator
+	// per-offer, since it needs ProviderName and GPUType from the selected offer.
+
+	// Transition to Provisioning before calling coordinator.
+	now := metav1.Now()
+	claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
+	claim.Status.ProvisionedAt = &now
+	if err := r.Status().Update(ctx, claim); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	const maxOfferRetries = 3
-	var instance *provider.Instance
-	var lastErr error
-	for attempt := 1; attempt <= maxOfferRetries; attempt++ {
-		offers, err := prov.SearchOffers(ctx, reqs)
-		if err != nil || len(offers) == 0 {
-			log.Error(err, "Failed to find offer for provisioning", "attempt", attempt)
-			lastErr = err
-			if attempt < maxOfferRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			break
+	// Provision via coordinator: handles offer caching, blacklisting, rate limiting, retries.
+	result, err := r.Coordinator.ProvisionInstance(ctx, reqs, config, providerNames)
+	if err != nil {
+		log.Error(err, "Coordinator failed to provision instance")
+		// Re-fetch claim to avoid conflict on status update.
+		if fetchErr := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); fetchErr != nil {
+			return ctrl.Result{}, fetchErr
 		}
-		offer := offers[0]
-
-		// Transition to Provisioning on first attempt
-		if attempt == 1 {
-			now := metav1.Now()
-			claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
-			claim.Status.ProvisionedAt = &now
-			if err := r.Status().Update(ctx, claim); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-
-		instance, err = prov.CreateInstance(ctx, offer, config)
-		if err != nil {
-			if errors.Is(err, provider.ErrOfferExpired) && attempt < maxOfferRetries {
-				log.Info("Offer expired, retrying with fresh search",
-					"attempt", attempt,
-					"offerID", offer.OfferID,
-					"provider", offer.ProviderName,
-				)
-				lastErr = err
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
-				continue
-			}
-			lastErr = err
-			break
-		}
-		// Success
-		lastErr = nil
-		break
-	}
-
-	if lastErr != nil || instance == nil {
-		log.Error(lastErr, "Failed to create instance after retries")
-		now := metav1.Now()
 		claim.Status.Phase = v1alpha1.ClaimPhasePending
-		errMsg := "unknown error"
-		if lastErr != nil {
-			errMsg = lastErr.Error()
-		}
 		claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
 			Type:               "ProvisionFailed",
 			Status:             metav1.ConditionTrue,
-			LastTransitionTime: now,
+			LastTransitionTime: metav1.Now(),
 			Reason:             "CreateInstanceFailed",
-			Message:            errMsg,
+			Message:            err.Error(),
 		})
 		claim.Status.RetryCount++
 		_ = r.Status().Update(ctx, claim)
 		return ctrl.Result{RequeueAfter: r.backoffDuration(claim.Status.RetryCount)}, nil
 	}
 
-	log.Info("Instance created",
+	instance := result.Instance
+	offer := result.Offer
+	log.Info("Instance created via coordinator",
 		"provider", instance.ProviderName,
 		"instanceID", instance.InstanceID,
 		"gpu", instance.GPUType,
 		"nodeType", nodeType,
+		"attempts", result.Attempts,
 	)
 
-	// Update claim with instance details
+	// Re-fetch claim to get latest resourceVersion before status update.
+	if err := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Update claim spec with the provider chosen by coordinator (if not already set).
+	if claim.Spec.Provider == "" {
+		claim.Spec.Provider = offer.ProviderName
+		if err := r.Update(ctx, claim); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Update claim status with instance details.
 	successNow := metav1.Now()
+	claim.Status.Provider = instance.ProviderName
+	claim.Status.GPUType = offer.GPUType
+	claim.Status.GPUCount = offer.GPUCount
+	claim.Status.PricePerHour = offer.PricePerHour
 	claim.Status.InstanceID = instance.InstanceID
 	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
-	claim.Status.RetryCount = 0 // Reset on success
+	claim.Status.RetryCount = 0
 	if instance.Endpoint != "" {
 		claim.Status.Endpoint = instance.Endpoint
 	}

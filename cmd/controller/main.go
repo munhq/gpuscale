@@ -7,9 +7,10 @@ import (
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
 	gpucontroller "github.com/munhq/gpuscale/internal/controller"
+	"github.com/munhq/gpuscale/internal/coordinator"
 	gpumetrics "github.com/munhq/gpuscale/internal/metrics"
-	gpuscheduler "github.com/munhq/gpuscale/internal/scheduler"
 	"github.com/munhq/gpuscale/pkg/provider"
+	"golang.org/x/time/rate"
 	"github.com/munhq/gpuscale/pkg/provider/runpod"
 	"github.com/munhq/gpuscale/pkg/provider/vastai"
 	"github.com/munhq/gpuscale/pkg/provider/verda"
@@ -118,16 +119,24 @@ func main() {
 	rayCapacityStore := gpucontroller.NewRayCapacityStore(mgr.GetClient(), namespace, prometheusURL)
 	setupLog.Info("Ray capacity store enabled", "namespace", namespace, "prometheus", prometheusURL)
 
-	// Create selector for choosing best offers across providers
-	sel := gpuscheduler.NewSelector(registry, ctrl.Log.WithName("selector"))
+	// Create provisioning coordinator: centralized offer caching, blacklisting, rate limiting.
+	coord := coordinator.NewCoordinator(registry, ctrl.Log.WithName("coordinator"), coordinator.Options{
+		CacheTTL:         7 * time.Second,
+		BlacklistTTL:     60 * time.Second,
+		MaxAttempts:      5,
+		OffersPerAttempt: 3,
+		ProviderRates: map[string]rate.Limit{
+			"vast.ai": 1, // 1 req/sec
+			"verda":   3,
+			"runpod":  3,
+		},
+	})
 
 	// Set up controllers
-	// ProvisioningController watches pending GPU pods (created by KEDA) and provisions instances
+	// ProvisioningController watches pending GPU pods (created by KEDA) and creates claims
 	provisioningCtrl := gpucontroller.NewProvisioningController(
 		mgr.GetClient(),
 		ctrl.Log.WithName("provisioner"),
-		sel,
-		registry,
 		batchWindow,
 	)
 	provisioningCtrl.DemandStore = demandStore
@@ -155,6 +164,7 @@ func main() {
 		ctrl.Log.WithName("claim-reconciler"),
 		registry,
 	)
+	claimReconciler.Coordinator = coord
 	claimReconciler.WorkerStore = workerStore
 	if rayHead := os.Getenv("RAY_HEAD_ADDRESS"); rayHead != "" {
 		claimReconciler.RayHeadAddress = rayHead
