@@ -18,12 +18,18 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 
 	rayHeadAddr := config.RayHeadAddr
 	if rayHeadAddr == "" {
-		// Fallback: this shouldn't happen in production
 		rayHeadAddr = "localhost"
 	}
 
-	// Default GCS port is 6379
-	gcsPort := 6379
+	// RayHeadAddr may already include a port (e.g., "1.2.3.4:31637" for NodePort).
+	// Parse host and port separately so we don't double-append.
+	rayHost := rayHeadAddr
+	rayPort := "6379"
+	if idx := strings.LastIndex(rayHeadAddr, ":"); idx > 0 {
+		rayHost = rayHeadAddr[:idx]
+		rayPort = rayHeadAddr[idx+1:]
+	}
+	rayAddr := rayHost + ":" + rayPort
 
 	numGPUs := 1 // Default to 1 GPU
 	if config.ExtraEnv != nil {
@@ -41,7 +47,7 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Starting Ray worker on %s'\n", config.ProviderName))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Instance ID: %s'\n", config.InstanceID))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] GPU Type: %s'\n", config.GPUType))
-	script.WriteString(fmt.Sprintf("echo '[gpuscale] Ray Head: %s:%d'\n\n", rayHeadAddr, gcsPort))
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Ray Head: %s'\n\n", rayAddr))
 
 	// Pre-cache models if configured (Ray Serve may need them on this worker)
 	if config.ModelCacheURL != "" {
@@ -61,9 +67,9 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("mkdir -p /opt/models/huggingface\n\n")
 
 	// Wait for Ray head to be reachable
-	script.WriteString(fmt.Sprintf("echo '[gpuscale] Waiting for Ray head at %s:%d...'\n", rayHeadAddr, gcsPort))
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Waiting for Ray head at %s...'\n", rayAddr))
 	script.WriteString(fmt.Sprintf("for i in $(seq 1 60); do\n"))
-	script.WriteString(fmt.Sprintf("  if python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('%s', %d)); s.close()\" 2>/dev/null; then\n", rayHeadAddr, gcsPort))
+	script.WriteString(fmt.Sprintf("  if python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('%s', %s)); s.close()\" 2>/dev/null; then\n", rayHost, rayPort))
 	script.WriteString("    echo '[gpuscale] Ray head is reachable'\n")
 	script.WriteString("    break\n")
 	script.WriteString("  fi\n")
@@ -81,7 +87,7 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	// CONTAINER_ID (Vast.ai Docker container ID — may differ from API ID).
 	script.WriteString("GPUSCALE_INSTANCE_ID=\"${INSTANCE_ID:-${VAST_CONTAINERLABEL:-${CONTAINER_ID:-unknown}}}\"\n")
 	script.WriteString("echo \"[gpuscale] Instance ID: $GPUSCALE_INSTANCE_ID\"\n")
-	script.WriteString(fmt.Sprintf("ray start --address='%s:%d' \\\n", rayHeadAddr, gcsPort))
+	script.WriteString(fmt.Sprintf("ray start --address='%s' \\\n", rayAddr))
 	script.WriteString(fmt.Sprintf("  --num-gpus=%d \\\n", numGPUs))
 	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"'\"$GPUSCALE_INSTANCE_ID\"'\"}' \\\n",
 		config.ProviderName, config.GPUType))

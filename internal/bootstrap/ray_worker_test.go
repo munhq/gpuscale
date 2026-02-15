@@ -75,6 +75,25 @@ func TestGenerateRayWorkerScriptFallbackHead(t *testing.T) {
 	}
 }
 
+func TestGenerateRayWorkerScriptNodePort(t *testing.T) {
+	// When RayHeadAddr already includes a port (NodePort), don't double-append
+	config := provider.BootstrapConfig{
+		ProviderName: "vast.ai",
+		GPUType:      "RTX 3090",
+		RayHeadAddr:  "203.0.113.10:31637",
+	}
+
+	script := GenerateRayWorkerScript(config)
+
+	if !strings.Contains(script, "ray start --address='203.0.113.10:31637'") {
+		t.Errorf("expected NodePort address preserved, got script:\n%s", script)
+	}
+	// Must NOT have double-ported address
+	if strings.Contains(script, "31637:6379") {
+		t.Error("double-ported address found — port appended to already-ported address")
+	}
+}
+
 func TestGenerateRayWorkerScriptModelCache(t *testing.T) {
 	config := provider.BootstrapConfig{
 		RayHeadAddr:   "10.0.40.1",
