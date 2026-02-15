@@ -189,10 +189,11 @@ func (c *Coordinator) ProvisionInstance(
 			offerConfig.ProviderName = offer.ProviderName
 			offerConfig.GPUType = offer.GPUType
 
-			// Generate bootstrap script per-offer for full-node mode, since
-			// the script embeds ProviderName and GPUType as K8s node labels.
+			// Generate bootstrap script per-offer, since scripts embed ProviderName and GPUType.
 			if offerConfig.NodeType == "full-node" && offerConfig.NetbirdKey != "" {
 				offerConfig.OnStartScript = bootstrap.GenerateScript(offerConfig)
+			} else if offerConfig.NodeType == "ray-worker" && offerConfig.RayHeadAddr != "" {
+				offerConfig.OnStartScript = bootstrap.GenerateRayWorkerScript(offerConfig)
 			}
 
 			instance, err := prov.CreateInstance(ctx, offer, offerConfig)
