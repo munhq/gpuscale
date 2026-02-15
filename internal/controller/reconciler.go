@@ -542,13 +542,15 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// Check if the worker has joined the Ray cluster via dashboard API
-	joined := r.checkRayWorkerJoined(ctx, rayDashURL, instance.IP, log)
+	// Check if the worker has joined the Ray cluster via dashboard API.
+	// Match by instance ID label (set in bootstrap --labels), not by IP,
+	// since cloud instances report container-internal IPs.
+	joined := r.checkRayWorkerJoined(ctx, rayDashURL, instance.InstanceID, log)
 	if !joined {
 		if r.isBootstrapTimedOut(claim) {
 			return r.terminateTimedOut(ctx, claim, prov, log)
 		}
-		log.Info("Waiting for ray-worker to join cluster", "instanceIP", instance.IP, "rayDash", rayDashURL)
+		log.Info("Waiting for ray-worker to join cluster", "instanceID", instance.InstanceID, "rayDash", rayDashURL)
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
@@ -658,9 +660,12 @@ func (r *ClaimReconciler) buildRayDashboardURL(ctx context.Context, pool *v1alph
 }
 
 // checkRayWorkerJoined queries the Ray dashboard API to see if a worker with the
-// given IP has joined the cluster. Returns true if found alive.
-func (r *ClaimReconciler) checkRayWorkerJoined(ctx context.Context, rayDashURL string, workerIP string, log logr.Logger) bool {
-	if workerIP == "" {
+// given instance ID has joined the cluster. Workers register with a
+// "gpuscale.io/instance-id" label set by the bootstrap script (ray start --labels).
+// We match on that label rather than IP, since cloud instances report container-
+// internal IPs that don't match the SSH proxy hostname from the provider API.
+func (r *ClaimReconciler) checkRayWorkerJoined(ctx context.Context, rayDashURL string, instanceID string, log logr.Logger) bool {
+	if instanceID == "" {
 		return false
 	}
 
@@ -680,13 +685,14 @@ func (r *ClaimReconciler) checkRayWorkerJoined(ctx context.Context, rayDashURL s
 		return false
 	}
 
-	// Parse the response — Ray dashboard /nodes returns JSON with node info
-	// We look for any node whose "ip" field matches the worker IP and is alive
 	var result struct {
 		Data struct {
 			Summary []struct {
-				IP    string `json:"ip"`
-				State string `json:"state"`
+				IP     string `json:"ip"`
+				State  string `json:"state"`
+				Raylet struct {
+					Labels map[string]string `json:"labels"`
+				} `json:"raylet"`
 			} `json:"summary"`
 		} `json:"data"`
 	}
@@ -696,7 +702,8 @@ func (r *ClaimReconciler) checkRayWorkerJoined(ctx context.Context, rayDashURL s
 	}
 
 	for _, node := range result.Data.Summary {
-		if node.IP == workerIP && node.State == "ALIVE" {
+		if node.Raylet.Labels["gpuscale.io/instance-id"] == instanceID && node.State == "ALIVE" {
+			log.Info("Ray worker joined cluster", "instanceID", instanceID, "nodeIP", node.IP)
 			return true
 		}
 	}

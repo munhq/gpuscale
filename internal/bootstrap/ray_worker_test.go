@@ -30,8 +30,12 @@ func TestGenerateRayWorkerScriptDefaults(t *testing.T) {
 	if !strings.Contains(script, "gpuscale.io/provider") {
 		t.Error("expected provider label")
 	}
-	if !strings.Contains(script, "inst-123") {
-		t.Error("expected instance ID in labels")
+	if !strings.Contains(script, "gpuscale.io/instance-id") {
+		t.Error("expected instance-id label")
+	}
+	// Instance ID is resolved at runtime from INSTANCE_ID or CONTAINER_ID env vars
+	if !strings.Contains(script, "GPUSCALE_INSTANCE_ID") {
+		t.Error("expected GPUSCALE_INSTANCE_ID env var resolution")
 	}
 }
 

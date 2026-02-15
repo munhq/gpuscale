@@ -71,12 +71,20 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("  sleep 5\n")
 	script.WriteString("done\n\n")
 
-	// Join the Ray cluster as a worker node
+	// Join the Ray cluster as a worker node.
+	// CONTAINER_ID is injected by Vast.ai at runtime. We use it as instance-id
+	// label so the health check can find this specific worker in the Ray dashboard.
+	// INSTANCE_ID may also be set by other providers.
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Joining Ray cluster as worker with %d GPUs...'\n", numGPUs))
+	// Resolve instance ID: INSTANCE_ID (set by us for other providers),
+	// VAST_CONTAINERLABEL (Vast.ai's unique instance name, same as API ID),
+	// CONTAINER_ID (Vast.ai Docker container ID — may differ from API ID).
+	script.WriteString("GPUSCALE_INSTANCE_ID=\"${INSTANCE_ID:-${VAST_CONTAINERLABEL:-${CONTAINER_ID:-unknown}}}\"\n")
+	script.WriteString("echo \"[gpuscale] Instance ID: $GPUSCALE_INSTANCE_ID\"\n")
 	script.WriteString(fmt.Sprintf("ray start --address='%s:%d' \\\n", rayHeadAddr, gcsPort))
 	script.WriteString(fmt.Sprintf("  --num-gpus=%d \\\n", numGPUs))
-	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"%s\"}' \\\n",
-		config.ProviderName, config.GPUType, config.InstanceID))
+	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"'\"$GPUSCALE_INSTANCE_ID\"'\"}' \\\n",
+		config.ProviderName, config.GPUType))
 	script.WriteString("  --block\n")
 
 	return script.String()
