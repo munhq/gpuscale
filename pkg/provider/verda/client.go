@@ -262,16 +262,20 @@ func (c *Client) CreateInstance(ctx context.Context, createReq CreateInstanceReq
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("verda create returned %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
 		Data InstanceResponse `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w (body: %s)", err, string(body))
 	}
 	return &result.Data, nil
 }
@@ -369,16 +373,38 @@ func (c *Client) CreateStartupScript(ctx context.Context, name, script string) (
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("verda create script returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result struct {
-		Data StartupScriptResponse `json:"data"`
+	// Verda API may return data as an object {"data": {"id": "...", "name": "..."}}
+	// or as a raw value {"data": 12345}. Handle both.
+	var raw struct {
+		Data json.RawMessage `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decoding response: %w (body: %s)", err, string(body))
 	}
-	return &result.Data, nil
+
+	var result StartupScriptResponse
+	if err := json.Unmarshal(raw.Data, &result); err == nil && result.ID != "" {
+		return &result, nil
+	}
+
+	// data is a raw ID (number or string) — use it directly
+	var numID json.Number
+	if err := json.Unmarshal(raw.Data, &numID); err == nil {
+		return &StartupScriptResponse{ID: numID.String(), Name: name}, nil
+	}
+	var strID string
+	if err := json.Unmarshal(raw.Data, &strID); err == nil {
+		return &StartupScriptResponse{ID: strID, Name: name}, nil
+	}
+
+	return nil, fmt.Errorf("unexpected data format in response: %s", string(body))
 }

@@ -43,7 +43,9 @@ func ClassifyError(err error) ErrorCategory {
 		return ErrorConflict
 	}
 	if strings.Contains(msg, "401") || strings.Contains(msg, "403") ||
-		strings.Contains(msg, "unauthorized") || strings.Contains(msg, "forbidden") {
+		strings.Contains(msg, "unauthorized") || strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "insufficient_credit") || strings.Contains(msg, "lacks credit") ||
+		strings.Contains(msg, "billing") || strings.Contains(msg, "payment") {
 		return ErrorPermanent
 	}
 
