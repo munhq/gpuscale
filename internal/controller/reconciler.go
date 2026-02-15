@@ -727,7 +727,12 @@ func (r *ClaimReconciler) isBootstrapTimedOut(claim *v1alpha1.GPUNodeClaim) bool
 	if claim.Status.ProvisionedAt == nil {
 		return false
 	}
-	return time.Since(claim.Status.ProvisionedAt.Time) > 10*time.Minute
+	// ray-worker images (rayproject/ray-llm) are 15GB+ and take longer to pull.
+	timeout := 10 * time.Minute
+	if claim.Spec.NodeType == "ray-worker" {
+		timeout = 15 * time.Minute
+	}
+	return time.Since(claim.Status.ProvisionedAt.Time) > timeout
 }
 
 func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1.GPUNodeClaim, prov provider.Provider, log logr.Logger) (ctrl.Result, error) {
