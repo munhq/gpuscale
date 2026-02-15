@@ -257,6 +257,10 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		if err := r.Update(ctx, claim); err != nil {
 			return ctrl.Result{}, err
 		}
+		// Re-fetch after spec update to get latest resourceVersion for status update.
+		if err := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Update claim status with instance details.
@@ -317,6 +321,18 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 	}
 
 	if instance.Status == "stopped" || instance.Status == "error" {
+		// Grace period: don't terminate on "error" in the first 2 minutes.
+		// Providers can report transient error states during instance initialization.
+		if instance.Status == "error" && claim.Status.ProvisionedAt != nil {
+			if time.Since(claim.Status.ProvisionedAt.Time) < 2*time.Minute {
+				log.Info("Instance reports error but within grace period, retrying",
+					"status", instance.Status,
+					"age", time.Since(claim.Status.ProvisionedAt.Time).String(),
+				)
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			}
+		}
+
 		log.Info("Instance failed during bootstrap", "status", instance.Status)
 		claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 		now := metav1.Now()
@@ -329,6 +345,7 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 		})
 		_ = r.Status().Update(ctx, claim)
 		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+		r.retriggerIfDemandExists(ctx, claim, log)
 		return ctrl.Result{}, nil
 	}
 
@@ -628,6 +645,7 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 		}
 	}
 
+	r.retriggerIfDemandExists(ctx, claim, log)
 	return ctrl.Result{}, nil
 }
 
@@ -708,6 +726,27 @@ func (r *ClaimReconciler) hasOtherReadyClaims(ctx context.Context, modelID strin
 		}
 	}
 	return false
+}
+
+// retriggerIfDemandExists re-publishes a provision trigger when a claim terminates
+// but there are still queued requests for the model. Without this, requests would
+// sit in the queue forever because the ProvisionTrigger only fires on new pub/sub events.
+func (r *ClaimReconciler) retriggerIfDemandExists(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
+	if claim.Spec.ModelID == "" || r.DemandStore == nil {
+		return
+	}
+	depth, err := r.DemandStore.GetQueueDepth(ctx, claim.Spec.ModelID)
+	if err != nil {
+		log.Error(err, "Failed to check queue depth for re-trigger")
+		return
+	}
+	if depth > 0 {
+		log.Info("Demand exists after claim termination, re-triggering provisioning",
+			"model", claim.Spec.ModelID, "queueDepth", depth)
+		if err := r.DemandStore.PublishProvisionTrigger(ctx, claim.Spec.ModelID); err != nil {
+			log.Error(err, "Failed to publish re-trigger")
+		}
+	}
 }
 
 // backoffDuration returns an exponential backoff duration based on retry count.

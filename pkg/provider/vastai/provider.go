@@ -337,7 +337,7 @@ func normalizeStatus(vastStatus string) string {
 	switch vastStatus {
 	case "running":
 		return "running"
-	case "loading", "creating", "pulling":
+	case "loading", "creating", "pulling", "created", "scheduled", "":
 		return "starting"
 	case "exited", "stopped", "offline":
 		return "stopped"

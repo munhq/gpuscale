@@ -297,7 +297,7 @@ func normalizeStatus(status string) string {
 	switch strings.ToLower(status) {
 	case "running", "active":
 		return "running"
-	case "starting", "booting", "provisioning":
+	case "starting", "booting", "provisioning", "creating", "pending", "scheduled", "":
 		return "starting"
 	case "stopped", "shutdown", "deleted":
 		return "stopped"
