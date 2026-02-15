@@ -532,10 +532,8 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// Build Ray dashboard URL from the head address
-	// RayConfig.HeadAddress is the GCS address (e.g., "1.2.3.4:31637")
-	// Dashboard runs on the same host, port 8265
-	rayDashURL := r.buildRayDashboardURL(&pool)
+	// Discover the Ray head service inside the cluster for dashboard access.
+	rayDashURL := r.buildRayDashboardURL(ctx, &pool, claim.Namespace)
 	if rayDashURL == "" {
 		if r.isBootstrapTimedOut(claim) {
 			return r.terminateTimedOut(ctx, claim, prov, log)
@@ -613,27 +611,50 @@ func (r *ClaimReconciler) resolveRayHeadAddress(pool *v1alpha1.GPUNodePool) stri
 	return r.RayHeadAddress
 }
 
-// buildRayDashboardURL constructs the Ray dashboard URL from pool config.
-func (r *ClaimReconciler) buildRayDashboardURL(pool *v1alpha1.GPUNodePool) string {
-	headAddr := r.resolveRayHeadAddress(pool)
-	if headAddr == "" {
+// buildRayDashboardURL discovers the Ray head service inside the cluster and
+// returns its dashboard URL. The dashboard (port 8265) is only reachable via
+// the cluster-internal service — the external RayHeadAddress exposes only the
+// GCS NodePort for workers joining from outside.
+//
+// Discovery: list Services with label ray.io/node-type=head in the claim's
+// namespace, find the port named "dashboard", build the cluster-DNS URL.
+func (r *ClaimReconciler) buildRayDashboardURL(ctx context.Context, pool *v1alpha1.GPUNodePool, namespace string) string {
+	// Allow pool-level override.
+	dashPort := 0
+	if pool.Spec.Bootstrap.RayConfig != nil && pool.Spec.Bootstrap.RayConfig.DashboardPort != 0 {
+		dashPort = pool.Spec.Bootstrap.RayConfig.DashboardPort
+	}
+
+	var svcList corev1.ServiceList
+	if err := r.List(ctx, &svcList,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"ray.io/node-type": "head"},
+	); err != nil {
+		r.Log.Error(err, "Failed to list Ray head services")
 		return ""
 	}
-	// HeadAddress is "host:gcsPort" (e.g., "1.2.3.4:31637")
-	// Dashboard is on the same host at DashboardPort (default 8265)
-	dashPort := pool.Spec.Bootstrap.RayConfig.DashboardPort
-	if dashPort == 0 {
-		dashPort = 8265
+
+	if len(svcList.Items) == 0 {
+		r.Log.Info("No Ray head service found", "namespace", namespace)
+		return ""
 	}
-	// Extract host from "host:port"
-	host := headAddr
-	for i := len(headAddr) - 1; i >= 0; i-- {
-		if headAddr[i] == ':' {
-			host = headAddr[:i]
-			break
+
+	svc := svcList.Items[0]
+
+	// Find the dashboard port from the service spec if not overridden.
+	if dashPort == 0 {
+		for _, p := range svc.Spec.Ports {
+			if p.Name == "dashboard" {
+				dashPort = int(p.Port)
+				break
+			}
 		}
 	}
-	return fmt.Sprintf("http://%s:%d", host, dashPort)
+	if dashPort == 0 {
+		dashPort = 8265 // last-resort default
+	}
+
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svc.Name, svc.Namespace, dashPort)
 }
 
 // checkRayWorkerJoined queries the Ray dashboard API to see if a worker with the
