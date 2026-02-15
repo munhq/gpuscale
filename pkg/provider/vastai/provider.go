@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/munhq/gpuscale/pkg/provider"
@@ -188,6 +189,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 }
 
 // generateVLLMBootstrapScript creates an inline bootstrap script for vLLM workers.
+// vLLM handles model download internally via huggingface_hub (parallel shard downloads).
 func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 	servePort := config.RayServePort
 	if servePort == 0 {
@@ -198,6 +200,12 @@ func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 	if modelID == "" {
 		modelID = "THUDM/glm-4-9b-chat"
 	}
+	// Use source if different from ID (e.g., ID="glm-4-7", Source="hf:zai-org/GLM-4.7-Flash")
+	hfRepo := modelID
+	if config.ModelSource != "" {
+		hfRepo = strings.TrimPrefix(config.ModelSource, "hf:")
+	}
+
 	maxModelLen := config.MaxModelLen
 	if maxModelLen == 0 {
 		maxModelLen = 4096
@@ -211,37 +219,6 @@ func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 		gpuMemUtil = 0.90
 	}
 
-	script := fmt.Sprintf(`#!/bin/bash
-set -euo pipefail
-
-echo '[gpuscale] Starting vLLM worker on %s'
-echo '[gpuscale] Instance: %s, GPU: %s'
-echo '[gpuscale] Model: %s'
-
-# Install vLLM if not present (pre-built images like vllm/vllm-openai already have it)
-if ! python -c "import vllm" 2>/dev/null; then
-  echo '[gpuscale] Installing vLLM...'
-  pip install vllm 2>&1 | tail -10
-fi
-
-`, config.ProviderName, config.InstanceID, config.GPUType, modelID)
-
-	// Optional model pre-cache from object storage (R2/S3)
-	if config.ModelCacheURL != "" {
-		script += fmt.Sprintf(`# Pre-cache model weights from object storage
-echo '[gpuscale] Pre-caching model from %s...'
-mkdir -p /opt/models
-if ! command -v rclone &> /dev/null; then
-  echo '[gpuscale] Installing rclone...'
-  curl -s https://rclone.org/install.sh | bash 2>&1 | tail -5
-fi
-export HF_HOME=/opt/models
-rclone sync '%s' /opt/models/ --progress --transfers=8 --checkers=16
-echo '[gpuscale] Pre-cache complete'
-
-`, config.ModelCacheURL, config.ModelCacheURL)
-	}
-
 	trustFlag := ""
 	if config.TrustRemoteCode {
 		trustFlag = "\n  --trust-remote-code \\"
@@ -252,8 +229,13 @@ echo '[gpuscale] Pre-cache complete'
 		tpFlag = fmt.Sprintf("\n  --tensor-parallel-size %d \\", config.TensorParallelSize)
 	}
 
-	script += fmt.Sprintf(`# Start vLLM OpenAI-compatible server
-echo '[gpuscale] Starting vLLM serve on port %d...'
+	return fmt.Sprintf(`#!/bin/bash
+set -euo pipefail
+
+echo '[gpuscale] Starting vLLM worker on %s'
+echo '[gpuscale] Instance: %s, GPU: %s'
+echo '[gpuscale] Model: %s (repo: %s)'
+
 exec python -m vllm.entrypoints.openai.api_server \
   --model '%s' \
   --host 0.0.0.0 \
@@ -261,9 +243,8 @@ exec python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization %.2f \
   --max-model-len %d \
   --dtype %s%s%s
-`, servePort, modelID, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
-
-	return script
+`, config.ProviderName, config.InstanceID, config.GPUType, modelID, hfRepo,
+		hfRepo, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 }
 
 func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error {

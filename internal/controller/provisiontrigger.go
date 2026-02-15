@@ -165,9 +165,10 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 			Finalizers: []string{"gpuscale.io/instance-cleanup"},
 		},
 		Spec: v1alpha1.GPUNodeClaimSpec{
-			PoolRef:  pool.Name,
-			NodeType: nodeType,
-			ModelID:  model,
+			PoolRef:     pool.Name,
+			NodeType:    nodeType,
+			ModelID:     model,
+			ModelSource: cfg.Source,
 			Requirements: v1alpha1.ClaimRequirements{
 				GPUCount: gpuCount,
 				MinVRAM:  cfg.VRAMRequired,

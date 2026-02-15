@@ -86,7 +86,8 @@ func (s *DemandStore) IsAlwaysActive(ctx context.Context, model string) (bool, e
 // ModelConfig represents the full model configuration from GPU API.
 type ModelConfig struct {
 	ID             string   `json:"id"`
-	VRAMRequired   int      `json:"vramRequired"`   // GB total VRAM needed
+	Source         string   `json:"source"`          // HuggingFace source (e.g., "hf:zai-org/GLM-4.7-Flash")
+	VRAMRequired   int      `json:"vramRequired"`    // GB total VRAM needed
 	AlwaysActive   bool     `json:"alwaysActive"`
 	MinReplicas    int      `json:"minReplicas"`
 	MaxReplicas    int      `json:"maxReplicas"`

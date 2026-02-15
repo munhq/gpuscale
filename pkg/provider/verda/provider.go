@@ -110,9 +110,15 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating startup script: %w", err)
 	}
 
+	// Use image from pool bootstrap spec if provided, else fall back to Verda's default.
+	verdaImage := config.Image
+	if verdaImage == "" {
+		verdaImage = "ubuntu-24.04-cuda-12.8-open-docker"
+	}
+
 	createReq := CreateInstanceRequest{
 		InstanceType:    offer.OfferID,
-		Image:           "ubuntu-24.04-cuda-12.8-open-docker",
+		Image:           verdaImage,
 		Hostname:        fmt.Sprintf("gpuscale-%s", config.InstanceID),
 		StartupScriptID: scriptResp.ID,
 		IsSpot:          offer.CapacityType == "spot",
@@ -214,6 +220,10 @@ func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 	if modelID == "" {
 		modelID = "THUDM/glm-4-9b-chat"
 	}
+	hfRepo := modelID
+	if config.ModelSource != "" {
+		hfRepo = strings.TrimPrefix(config.ModelSource, "hf:")
+	}
 	maxModelLen := config.MaxModelLen
 	if maxModelLen == 0 {
 		maxModelLen = 4096
@@ -237,34 +247,19 @@ func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
 		tpFlag = fmt.Sprintf(" \\\n  --tensor-parallel-size %d", config.TensorParallelSize)
 	}
 
-	// Optional model pre-cache
-	cacheScript := ""
-	if config.ModelCacheURL != "" {
-		cacheScript = fmt.Sprintf(`
-# Pre-cache model weights from object storage
-echo '[gpuscale] Pre-caching model from %s...'
-mkdir -p /opt/models
-if ! command -v rclone &> /dev/null; then
-  echo '[gpuscale] Installing rclone...'
-  curl -s https://rclone.org/install.sh | bash 2>&1 | tail -5
-fi
-export HF_HOME=/opt/models
-rclone sync '%s' /opt/models/ --progress --transfers=8 --checkers=16
-echo '[gpuscale] Pre-cache complete'
-`, config.ModelCacheURL, config.ModelCacheURL)
-	}
-
 	return fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 
 echo '[gpuscale] Starting vLLM worker on verda'
 echo '[gpuscale] Instance: %s, GPU: %s'
-echo '[gpuscale] Model: %s'
+echo '[gpuscale] Model: %s (repo: %s)'
 
-# Install vLLM
-pip install vllm 2>&1 | tail -10
-%s
-# Start vLLM OpenAI-compatible server
+# Install vLLM if not present (Verda images may not have it pre-installed)
+if ! python -c "import vllm" 2>/dev/null; then
+  echo '[gpuscale] Installing vLLM...'
+  pip install vllm 2>&1 | tail -10
+fi
+
 exec python -m vllm.entrypoints.openai.api_server \
   --model '%s' \
   --host 0.0.0.0 \
@@ -272,8 +267,8 @@ exec python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization %.2f \
   --max-model-len %d \
   --dtype %s%s%s
-`, config.InstanceID, config.GPUType, modelID, cacheScript,
-		modelID, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
+`, config.InstanceID, config.GPUType, modelID, hfRepo,
+		hfRepo, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 }
 
 func parsePrice(priceStr string) (float64, error) {

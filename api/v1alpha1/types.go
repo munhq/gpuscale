@@ -242,9 +242,13 @@ type GPUNodeClaimSpec struct {
 	// Set at creation time by the provisioner so it survives status update failures.
 	NodeType string `json:"nodeType,omitempty"`
 
-	// ModelID is the model this claim was provisioned for.
+	// ModelID is the model this claim was provisioned for (API name, e.g., "glm-4-7").
 	// Used by the disruptor to check demand and always-active status.
 	ModelID string `json:"modelId,omitempty"`
+
+	// ModelSource is the HuggingFace source for the model (e.g., "hf:zai-org/GLM-4.7-Flash").
+	// Set by ProvisionTrigger from Dragonfly config. Used by bootstrap to download the correct weights.
+	ModelSource string `json:"modelSource,omitempty"`
 
 	// Requirements describe the GPU resources needed.
 	Requirements ClaimRequirements `json:"requirements"`

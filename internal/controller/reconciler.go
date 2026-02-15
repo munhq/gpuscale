@@ -194,6 +194,15 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 			config.EnablePrefixCaching = pool.Spec.Bootstrap.ModelConfig.EnablePrefixCaching
 			config.MaxOngoingRequests = pool.Spec.Bootstrap.ModelConfig.MaxOngoingRequests
 		}
+
+		// For cold-start claims: ProvisionTrigger sets ModelID + ModelSource on the claim spec.
+		// Use those when the pool's static ModelConfig didn't provide them.
+		if config.ModelID == "" && claim.Spec.ModelID != "" {
+			config.ModelID = claim.Spec.ModelID
+		}
+		if config.ModelSource == "" && claim.Spec.ModelSource != "" {
+			config.ModelSource = claim.Spec.ModelSource
+		}
 	}
 
 	reqs := provider.GPURequirements{
