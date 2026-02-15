@@ -247,6 +247,107 @@ func (s *DemandStore) GetGPUVRAM(ctx context.Context, gpuType string) (int, erro
 	return spec.VRAMGB, nil
 }
 
+// --- Model Registry (loaded_models) ---
+
+const (
+	loadedModelPrefix  = "loaded_models:"
+	modelLoadedChannel = "gpuscale:model_loaded"
+	provisionChannel   = "gpuscale:provision"
+)
+
+// LoadedModelInfo is the JSON value stored in loaded_models:{model}.
+type LoadedModelInfo struct {
+	ClaimName  string `json:"claimName"`
+	Provider   string `json:"provider"`
+	GPUType    string `json:"gpuType"`
+	GPUCount   int    `json:"gpuCount"`
+	InstanceID string `json:"instanceId"`
+	ReadyAt    string `json:"readyAt"`
+}
+
+// SetModelLoaded marks a model as loaded in Dragonfly and notifies GPU API.
+func (s *DemandStore) SetModelLoaded(ctx context.Context, model string, info LoadedModelInfo) error {
+	if s == nil || s.rdb == nil || model == "" {
+		return nil
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("marshaling loaded model info: %w", err)
+	}
+	if err := s.rdb.Set(ctx, loadedModelPrefix+model, data, 0).Err(); err != nil {
+		return fmt.Errorf("setting loaded_models:%s: %w", model, err)
+	}
+	// Notify GPU API queue processor to drain queued requests for this model.
+	s.rdb.Publish(ctx, modelLoadedChannel, model)
+	return nil
+}
+
+// RemoveModelLoaded deletes the loaded_models entry for a model.
+// Only deletes if no other Ready claims serve this model.
+func (s *DemandStore) RemoveModelLoaded(ctx context.Context, model string) error {
+	if s == nil || s.rdb == nil || model == "" {
+		return nil
+	}
+	return s.rdb.Del(ctx, loadedModelPrefix+model).Err()
+}
+
+// IsModelLoaded checks if a model has a loaded_models key.
+func (s *DemandStore) IsModelLoaded(ctx context.Context, model string) bool {
+	if s == nil || s.rdb == nil || model == "" {
+		return false
+	}
+	val, err := s.rdb.Exists(ctx, loadedModelPrefix+model).Result()
+	return err == nil && val > 0
+}
+
+// SubscribeProvisionTrigger subscribes to cold-start provision requests from GPU API.
+// Returns a channel that receives model IDs. Caller must cancel ctx to stop.
+func (s *DemandStore) SubscribeProvisionTrigger(ctx context.Context) <-chan string {
+	ch := make(chan string, 10)
+	if s == nil || s.rdb == nil {
+		close(ch)
+		return ch
+	}
+
+	pubsub := s.rdb.Subscribe(ctx, provisionChannel)
+	go func() {
+		defer close(ch)
+		defer pubsub.Close()
+		for {
+			msg, err := pubsub.ReceiveMessage(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			select {
+			case ch <- msg.Payload:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// PublishProvisionTrigger publishes a provision request (used by InterruptionController for auto-replace).
+func (s *DemandStore) PublishProvisionTrigger(ctx context.Context, model string) error {
+	if s == nil || s.rdb == nil {
+		return nil
+	}
+	return s.rdb.Publish(ctx, provisionChannel, model).Err()
+}
+
+// Client returns the underlying Redis client (for ProvisionTrigger to reuse).
+func (s *DemandStore) Client() *redis.Client {
+	if s == nil {
+		return nil
+	}
+	return s.rdb
+}
+
 // Close shuts down the Redis connection.
 func (s *DemandStore) Close() {
 	if s != nil && s.rdb != nil {

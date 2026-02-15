@@ -15,19 +15,23 @@ import (
 )
 
 // InterruptionController polls provider APIs to detect preempted/terminated instances.
+// When a spot instance is preempted, it terminates the claim and triggers a
+// replacement if the model still has demand or is always-active.
 type InterruptionController struct {
 	client.Client
 	Log          logr.Logger
 	Registry     *provider.Registry
+	DemandStore  *DemandStore
 	PollInterval time.Duration
 }
 
 // NewInterruptionController creates a new interruption controller.
-func NewInterruptionController(c client.Client, log logr.Logger, reg *provider.Registry, pollInterval time.Duration) *InterruptionController {
+func NewInterruptionController(c client.Client, log logr.Logger, reg *provider.Registry, ds *DemandStore, pollInterval time.Duration) *InterruptionController {
 	return &InterruptionController{
 		Client:       c,
 		Log:          log,
 		Registry:     reg,
+		DemandStore:  ds,
 		PollInterval: pollInterval,
 	}
 }
@@ -144,7 +148,38 @@ func (r *InterruptionController) handleInterruption(ctx context.Context, claim *
 		log.Error(err, "Failed to update claim status after interruption")
 	}
 
-	log.Info("Interruption handling complete — pods will re-trigger provisioning")
+	// Remove loaded_models entry for this model
+	if claim.Spec.ModelID != "" && r.DemandStore != nil {
+		_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+	}
+
+	// Auto-replace: if the model still has demand or is always-active,
+	// publish a provision trigger so ProvisionTrigger creates a replacement.
+	r.maybeAutoReplace(ctx, claim)
+
+	log.Info("Interruption handling complete")
+}
+
+func (r *InterruptionController) maybeAutoReplace(ctx context.Context, claim *v1alpha1.GPUNodeClaim) {
+	if r.DemandStore == nil || claim.Spec.ModelID == "" {
+		return
+	}
+	log := r.Log.WithValues("claim", claim.Name, "model", claim.Spec.ModelID)
+
+	alwaysActive, _ := r.DemandStore.IsAlwaysActive(ctx, claim.Spec.ModelID)
+	queueDepth, _ := r.DemandStore.GetQueueDepth(ctx, claim.Spec.ModelID)
+	activeDemand, _ := r.DemandStore.GetDemand(ctx, claim.Spec.ModelID)
+
+	if alwaysActive || queueDepth > 0 || activeDemand > 0 {
+		log.Info("Auto-replacing preempted instance",
+			"alwaysActive", alwaysActive,
+			"queueDepth", queueDepth,
+			"activeDemand", activeDemand,
+		)
+		if err := r.DemandStore.PublishProvisionTrigger(ctx, claim.Spec.ModelID); err != nil {
+			log.Error(err, "Failed to publish auto-replace trigger")
+		}
+	}
 }
 
 // SetupWithManager registers this controller as a Runnable (background loop).

@@ -166,6 +166,7 @@ func main() {
 	)
 	claimReconciler.Coordinator = coord
 	claimReconciler.WorkerStore = workerStore
+	claimReconciler.DemandStore = demandStore
 	if rayHead := os.Getenv("RAY_HEAD_ADDRESS"); rayHead != "" {
 		claimReconciler.RayHeadAddress = rayHead
 		setupLog.Info("Ray head address configured from env", "address", rayHead)
@@ -179,11 +180,26 @@ func main() {
 		mgr.GetClient(),
 		ctrl.Log.WithName("interruption"),
 		registry,
+		demandStore,
 		interruptionInterval,
 	)
 	if err := interruptionCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create interruption controller")
 		os.Exit(1)
+	}
+
+	// ProvisionTrigger — subscribes to gpuscale:provision pub/sub for instant cold-start
+	if demandStore != nil {
+		provTrigger := gpucontroller.NewProvisionTrigger(
+			mgr.GetClient(),
+			ctrl.Log.WithName("provision-trigger"),
+			demandStore,
+		)
+		if err := provTrigger.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Unable to create provision trigger")
+			os.Exit(1)
+		}
+		setupLog.Info("Provision trigger subscriber enabled (cold-start via pub/sub)")
 	}
 
 	// Health checks

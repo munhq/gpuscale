@@ -287,6 +287,22 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		nodeType = pool.Spec.Providers[0].NodeType
 	}
 
+	// Determine model from demand data for dedup in ProvisionTrigger
+	modelID := ""
+	if r.DemandStore != nil {
+		demands, err := r.DemandStore.GetAllDemands(ctx)
+		if err == nil {
+			var maxDemand int64
+			for _, d := range demands {
+				total := d.QueueDepth + d.ActiveDemand
+				if total > maxDemand || d.AlwaysActive {
+					maxDemand = total
+					modelID = d.Model
+				}
+			}
+		}
+	}
+
 	claim := &v1alpha1.GPUNodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("claim-%s", claimID),
@@ -295,6 +311,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		Spec: v1alpha1.GPUNodeClaimSpec{
 			PoolRef:  pool.Name,
 			NodeType: nodeType,
+			ModelID:  modelID,
 			Requirements: v1alpha1.ClaimRequirements{
 				GPUCount: merged.GPUCount,
 				MinVRAM:  merged.MinVRAM,

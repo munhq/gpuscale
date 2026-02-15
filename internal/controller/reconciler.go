@@ -42,6 +42,10 @@ type ClaimReconciler struct {
 	// Nil if Dragonfly integration is disabled.
 	WorkerStore *WorkerStore
 
+	// DemandStore reads/writes model state in Dragonfly DB 3.
+	// Used to set/remove loaded_models entries on Ready/Terminated.
+	DemandStore *DemandStore
+
 	// RayHeadAddress is the fallback Ray head GCS address (e.g., "1.2.3.4:31637")
 	// used when the pool's rayConfig.headAddress is empty.
 	// Set from RAY_HEAD_ADDRESS env var.
@@ -379,6 +383,23 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 		log.Error(err, "Failed to publish worker to Dragonfly")
 	}
 
+	// Mark model as loaded in Dragonfly — GPU API reads this instantly
+	if claim.Spec.ModelID != "" && r.DemandStore != nil {
+		info := LoadedModelInfo{
+			ClaimName:  claim.Name,
+			Provider:   claim.Status.Provider,
+			GPUType:    claim.Status.GPUType,
+			GPUCount:   claim.Status.GPUCount,
+			InstanceID: claim.Status.InstanceID,
+			ReadyAt:    now.Time.Format(time.RFC3339),
+		}
+		if err := r.DemandStore.SetModelLoaded(ctx, claim.Spec.ModelID, info); err != nil {
+			log.Error(err, "Failed to set loaded_models", "model", claim.Spec.ModelID)
+		} else {
+			log.Info("Model marked as loaded", "model", claim.Spec.ModelID)
+		}
+	}
+
 	if claim.Status.ProvisionedAt != nil {
 		duration := now.Time.Sub(claim.Status.ProvisionedAt.Time)
 		log.Info("Node is Ready!",
@@ -452,6 +473,23 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 	// Publish worker status to Dragonfly
 	if err := r.WorkerStore.SetWorker(ctx, claim); err != nil {
 		log.Error(err, "Failed to publish worker to Dragonfly")
+	}
+
+	// Mark model as loaded in Dragonfly — GPU API reads this instantly
+	if claim.Spec.ModelID != "" && r.DemandStore != nil {
+		info := LoadedModelInfo{
+			ClaimName:  claim.Name,
+			Provider:   claim.Status.Provider,
+			GPUType:    claim.Status.GPUType,
+			GPUCount:   claim.Status.GPUCount,
+			InstanceID: claim.Status.InstanceID,
+			ReadyAt:    now.Time.Format(time.RFC3339),
+		}
+		if err := r.DemandStore.SetModelLoaded(ctx, claim.Spec.ModelID, info); err != nil {
+			log.Error(err, "Failed to set loaded_models", "model", claim.Spec.ModelID)
+		} else {
+			log.Info("Model marked as loaded", "model", claim.Spec.ModelID)
+		}
 	}
 
 	if claim.Status.ProvisionedAt != nil {
@@ -583,6 +621,13 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 		log.Error(err, "Failed to remove worker from Dragonfly")
 	}
 
+	// Remove loaded_models entry if this was the last claim for this model.
+	if claim.Spec.ModelID != "" && r.DemandStore != nil {
+		if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
+			_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+		}
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -614,6 +659,13 @@ func (r *ClaimReconciler) handleDeletion(ctx context.Context, claim *v1alpha1.GP
 		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 	}
 
+	// Remove loaded_models entry if this was the last claim for this model.
+	if claim.Spec.ModelID != "" && r.DemandStore != nil {
+		if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
+			_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+		}
+	}
+
 	// Remove finalizer to allow K8s to delete the object.
 	controllerutil.RemoveFinalizer(claim, claimFinalizer)
 	if err := r.Update(ctx, claim); err != nil {
@@ -639,6 +691,23 @@ func resolveClaimNodeType(claim *v1alpha1.GPUNodeClaim) string {
 		return claim.Spec.NodeType
 	}
 	return claim.Status.NodeType
+}
+
+// hasOtherReadyClaims returns true if there are other Ready claims for the same model.
+func (r *ClaimReconciler) hasOtherReadyClaims(ctx context.Context, modelID string, excludeClaim string) bool {
+	var claims v1alpha1.GPUNodeClaimList
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
+		return false
+	}
+	for _, c := range claims.Items {
+		if c.Name == excludeClaim {
+			continue
+		}
+		if c.Spec.ModelID == modelID && c.Status.Phase == v1alpha1.ClaimPhaseReady {
+			return true
+		}
+	}
+	return false
 }
 
 // backoffDuration returns an exponential backoff duration based on retry count.
