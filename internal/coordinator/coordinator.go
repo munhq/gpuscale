@@ -135,8 +135,13 @@ func (c *Coordinator) ProvisionInstance(
 			return nil, lastErr
 		}
 
-		// 3. Sort by price (ascending), reliability (descending).
+		// 3. Sort: preferred GPUs first, then by price (ascending), reliability (descending).
 		sort.Slice(filtered, func(i, j int) bool {
+			iPref := isPreferredGPU(filtered[i].GPUType, req.GPUTypes)
+			jPref := isPreferredGPU(filtered[j].GPUType, req.GPUTypes)
+			if iPref != jPref {
+				return iPref // preferred GPUs sort first
+			}
 			if filtered[i].PricePerHour != filtered[j].PricePerHour {
 				return filtered[i].PricePerHour < filtered[j].PricePerHour
 			}

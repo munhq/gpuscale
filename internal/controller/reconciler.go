@@ -199,6 +199,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	reqs := provider.GPURequirements{
 		GPUCount:     claim.Spec.Requirements.GPUCount,
 		MinVRAM:      claim.Spec.Requirements.MinVRAM,
+		MaxVRAM:      claim.Spec.Requirements.MaxVRAM,
 		GPUTypes:     claim.Spec.Requirements.GPUTypes,
 		MaxPrice:     claim.Spec.Requirements.MaxPrice,
 		CapacityType: "spot",

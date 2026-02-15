@@ -260,6 +260,10 @@ type ClaimRequirements struct {
 	// MinVRAM is the minimum VRAM per GPU in GB.
 	MinVRAM int `json:"minVRAM,omitempty"`
 
+	// MaxVRAM is the maximum VRAM per GPU in GB.
+	// Prevents over-provisioning (e.g., getting an H200 for a 7B model).
+	MaxVRAM int `json:"maxVRAM,omitempty"`
+
 	// GPUTypes are the acceptable GPU types.
 	GPUTypes []string `json:"gpuTypes,omitempty"`
 

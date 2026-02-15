@@ -146,6 +146,16 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		maxPrice = cfg.MaxPricePerGPU * float64(gpuCount)
 	}
 
+	// MaxVRAM: use model config if set, otherwise auto-compute.
+	maxVRAM := cfg.MaxVRAMPerGPU
+	if maxVRAM == 0 && cfg.VRAMRequired > 0 {
+		perGPUNeed := (cfg.VRAMRequired + gpuCount - 1) / gpuCount
+		maxVRAM = perGPUNeed * 3
+		if maxVRAM > 48 {
+			maxVRAM = 48
+		}
+	}
+
 	// Create the claim
 	claimID := uuid.New().String()[:8]
 	claim := &v1alpha1.GPUNodeClaim{
@@ -161,6 +171,8 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 			Requirements: v1alpha1.ClaimRequirements{
 				GPUCount: gpuCount,
 				MinVRAM:  cfg.VRAMRequired,
+				MaxVRAM:  maxVRAM,
+				GPUTypes: cfg.PreferredGPUs,
 				MaxPrice: maxPrice,
 			},
 		},

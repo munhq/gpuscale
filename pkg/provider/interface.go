@@ -17,6 +17,7 @@ var (
 type GPURequirements struct {
 	GPUCount     int      // nvidia.com/gpu limit
 	MinVRAM      int      // GB, from annotation
+	MaxVRAM      int      // GB, max VRAM per GPU to prevent over-provisioning (0 = no limit)
 	GPUTypes     []string // preferred GPU types (empty = any)
 	MaxPrice     float64  // $/hr, 0 = no limit
 	CapacityType string   // "spot" or "on-demand"
