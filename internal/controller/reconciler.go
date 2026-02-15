@@ -150,13 +150,12 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	}
 
 	// Build bootstrap config
-	instanceID := claim.Name
 	nodeType := resolveClaimNodeType(claim)
 	config := provider.BootstrapConfig{
 		NodeType:      nodeType,
 		Image:         pool.Spec.Bootstrap.Image,
 		ModelCacheURL: pool.Spec.Bootstrap.ModelCacheURL,
-		InstanceID:    instanceID,
+		InstanceID:    claim.Name,
 		GPUType:       claim.Status.GPUType,
 	}
 
@@ -217,57 +216,107 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	// Note: full-node bootstrap script is generated inside the coordinator
 	// per-offer, since it needs ProviderName and GPUType from the selected offer.
 
-	// Transition to Provisioning before calling coordinator.
-	now := metav1.Now()
-	claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
-	claim.Status.ProvisionedAt = &now
-	if err := r.Status().Update(ctx, claim); err != nil {
-		return ctrl.Result{}, err
-	}
+	// Idempotent provisioning: check if we already created an instance on a previous
+	// attempt (stored in annotations via merge patch). This prevents orphan instances
+	// when a status update conflicts and the reconcile retries.
+	existingInstanceID := claim.Annotations["gpuscale.io/instance-id"]
+	existingProvider := claim.Annotations["gpuscale.io/provider"]
 
-	// Provision via coordinator: handles offer caching, blacklisting, rate limiting, retries.
-	result, err := r.Coordinator.ProvisionInstance(ctx, reqs, config, providerNames)
-	if err != nil {
-		log.Error(err, "Coordinator failed to provision instance")
-		// Re-fetch claim to avoid conflict on status update.
-		if fetchErr := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); fetchErr != nil {
-			return ctrl.Result{}, fetchErr
+	var instanceID string
+	var providerName string
+	var gpuType string
+	var gpuCount int
+	var pricePerHour float64
+	var endpoint string
+
+	if existingInstanceID != "" {
+		// Instance already created on a previous attempt — reuse it.
+		log.Info("Reusing instance from previous attempt",
+			"instanceID", existingInstanceID,
+			"provider", existingProvider,
+		)
+		instanceID = existingInstanceID
+		providerName = existingProvider
+		// Recover offer details from the provider.
+		if prov, ok := r.Registry.Get(providerName); ok {
+			if inst, err := prov.GetInstance(ctx, existingInstanceID); err == nil {
+				gpuType = inst.GPUType
+				endpoint = inst.IP
+			}
 		}
-		claim.Status.Phase = v1alpha1.ClaimPhasePending
-		claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
-			Type:               "ProvisionFailed",
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "CreateInstanceFailed",
-			Message:            err.Error(),
-		})
-		claim.Status.RetryCount++
-		_ = r.Status().Update(ctx, claim)
-		return ctrl.Result{RequeueAfter: r.backoffDuration(claim.Status.RetryCount)}, nil
+	} else {
+		// No existing instance — provision a new one.
+
+		// Transition to Provisioning before calling coordinator.
+		now := metav1.Now()
+		claim.Status.Phase = v1alpha1.ClaimPhaseProvisioning
+		claim.Status.ProvisionedAt = &now
+		if err := r.Status().Update(ctx, claim); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		result, err := r.Coordinator.ProvisionInstance(ctx, reqs, config, providerNames)
+		if err != nil {
+			log.Error(err, "Coordinator failed to provision instance")
+			if fetchErr := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); fetchErr != nil {
+				return ctrl.Result{}, fetchErr
+			}
+			claim.Status.Phase = v1alpha1.ClaimPhasePending
+			claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+				Type:               "ProvisionFailed",
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+				Reason:             "CreateInstanceFailed",
+				Message:            err.Error(),
+			})
+			claim.Status.RetryCount++
+			_ = r.Status().Update(ctx, claim)
+			return ctrl.Result{RequeueAfter: r.backoffDuration(claim.Status.RetryCount)}, nil
+		}
+
+		instance := result.Instance
+		offer := result.Offer
+		instanceID = instance.InstanceID
+		providerName = instance.ProviderName
+		gpuType = offer.GPUType
+		gpuCount = offer.GPUCount
+		pricePerHour = offer.PricePerHour
+		endpoint = instance.Endpoint
+
+		log.Info("Instance created via coordinator",
+			"provider", providerName,
+			"instanceID", instanceID,
+			"gpu", gpuType,
+			"nodeType", nodeType,
+			"attempts", result.Attempts,
+		)
+
+		// Immediately persist instanceID via merge patch — this CANNOT conflict.
+		// On retry, we'll find this annotation and skip provisioning.
+		patch := client.MergeFrom(claim.DeepCopy())
+		if claim.Annotations == nil {
+			claim.Annotations = make(map[string]string)
+		}
+		claim.Annotations["gpuscale.io/instance-id"] = instanceID
+		claim.Annotations["gpuscale.io/provider"] = providerName
+		if err := r.Patch(ctx, claim, patch); err != nil {
+			log.Error(err, "Failed to persist instance annotation — instance may be orphaned",
+				"instanceID", instanceID, "provider", providerName)
+			// Don't return error — fall through to status update which might succeed.
+		}
 	}
 
-	instance := result.Instance
-	offer := result.Offer
-	log.Info("Instance created via coordinator",
-		"provider", instance.ProviderName,
-		"instanceID", instance.InstanceID,
-		"gpu", instance.GPUType,
-		"nodeType", nodeType,
-		"attempts", result.Attempts,
-	)
-
-	// Re-fetch claim to get latest resourceVersion before status update.
+	// Re-fetch claim to get latest resourceVersion.
 	if err := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Update claim spec with the provider chosen by coordinator (if not already set).
+	// Update claim spec with the provider (if not already set).
 	if claim.Spec.Provider == "" {
-		claim.Spec.Provider = offer.ProviderName
+		claim.Spec.Provider = providerName
 		if err := r.Update(ctx, claim); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Re-fetch after spec update to get latest resourceVersion for status update.
 		if err := r.Get(ctx, types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, claim); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -275,22 +324,31 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 
 	// Update claim status with instance details.
 	successNow := metav1.Now()
-	claim.Status.Provider = instance.ProviderName
-	claim.Status.GPUType = offer.GPUType
-	claim.Status.GPUCount = offer.GPUCount
-	claim.Status.PricePerHour = offer.PricePerHour
-	claim.Status.InstanceID = instance.InstanceID
+	claim.Status.Provider = providerName
+	if gpuType != "" {
+		claim.Status.GPUType = gpuType
+	}
+	if gpuCount > 0 {
+		claim.Status.GPUCount = gpuCount
+	}
+	if pricePerHour > 0 {
+		claim.Status.PricePerHour = pricePerHour
+	}
+	claim.Status.InstanceID = instanceID
 	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
 	claim.Status.RetryCount = 0
-	if instance.Endpoint != "" {
-		claim.Status.Endpoint = instance.Endpoint
+	if endpoint != "" {
+		claim.Status.Endpoint = endpoint
+	}
+	if claim.Status.ProvisionedAt == nil {
+		claim.Status.ProvisionedAt = &successNow
 	}
 	claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
 		Type:               "InstanceCreated",
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: successNow,
 		Reason:             "InstanceCreated",
-		Message:            fmt.Sprintf("Instance %s created on %s", instance.InstanceID, instance.ProviderName),
+		Message:            fmt.Sprintf("Instance %s created on %s", instanceID, providerName),
 	})
 	if err := r.Status().Update(ctx, claim); err != nil {
 		return ctrl.Result{}, err
@@ -300,6 +358,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 }
 
 func (r *ClaimReconciler) handleProvisioning(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	// If instanceID is on status, move to Bootstrapping.
 	if claim.Status.InstanceID != "" {
 		claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
 		if err := r.Status().Update(ctx, claim); err != nil {
@@ -308,6 +367,20 @@ func (r *ClaimReconciler) handleProvisioning(ctx context.Context, claim *v1alpha
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// If instanceID is in annotations (created but status update failed), go back to
+	// Pending so handlePending picks up the annotation and completes the status update.
+	if id := claim.Annotations["gpuscale.io/instance-id"]; id != "" {
+		log.Info("Instance exists in annotation but not status, retrying status update",
+			"instanceID", id)
+		claim.Status.Phase = v1alpha1.ClaimPhasePending
+		if err := r.Status().Update(ctx, claim); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// No instance anywhere — genuinely failed. Go back to Pending for retry.
+	log.Info("No instance found, returning to Pending for retry")
 	claim.Status.Phase = v1alpha1.ClaimPhasePending
 	if err := r.Status().Update(ctx, claim); err != nil {
 		return ctrl.Result{}, err
