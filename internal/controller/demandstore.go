@@ -97,26 +97,48 @@ type ModelConfig struct {
 	PreferredGPUs  []string `json:"preferredGpus"`   // preferred GPU types (tried first)
 }
 
-// GetModelConfig retrieves the full model configuration from Dragonfly.
-// Returns nil if the model config doesn't exist.
+// GetModelConfig retrieves a model configuration from Dragonfly by config ID
+// or by model source path. The config hash is keyed by config ID (e.g.,
+// "glm-4-7b-flash"), but callers may pass either the config ID or the
+// HuggingFace model path (e.g., "zai-org/GLM-4.7-Flash"). If a direct key
+// lookup fails, we scan all configs for a matching source field.
 func (s *DemandStore) GetModelConfig(ctx context.Context, model string) (*ModelConfig, error) {
 	if s == nil || s.rdb == nil {
 		return nil, nil
 	}
 
+	// Try direct key lookup first (fast path for config IDs).
 	data, err := s.rdb.HGet(ctx, modelConfigHashKey, model).Bytes()
-	if err == redis.Nil {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil && err != redis.Nil {
 		return nil, fmt.Errorf("reading model config for %s: %w", model, err)
 	}
-
-	var cfg ModelConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing model config for %s: %w", model, err)
+	if err == nil {
+		var cfg ModelConfig
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return nil, fmt.Errorf("parsing model config for %s: %w", model, err)
+		}
+		return &cfg, nil
 	}
-	return &cfg, nil
+
+	// Key not found — scan all configs for a matching source field.
+	// The source field is "hf:<org>/<model>" and the caller may pass
+	// just "<org>/<model>" (from the request body model field).
+	all, err := s.rdb.HGetAll(ctx, modelConfigHashKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("scanning model configs for %s: %w", model, err)
+	}
+	hfSource := "hf:" + model
+	for _, raw := range all {
+		var cfg ModelConfig
+		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+			continue
+		}
+		if cfg.Source == model || cfg.Source == hfSource {
+			return &cfg, nil
+		}
+	}
+
+	return nil, nil
 }
 
 // GetAllModelConfigs retrieves all model configurations from Dragonfly.
