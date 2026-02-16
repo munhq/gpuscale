@@ -824,8 +824,14 @@ func (r *ClaimReconciler) checkRayWorkerJoined(ctx context.Context, rayDashURL s
 	}
 
 	for _, node := range result.Data.Summary {
-		if node.Raylet.Labels["gpuscale.io/instance-id"] == instanceID && node.State == "ALIVE" {
-			log.Info("Ray worker joined cluster", "instanceID", instanceID, "nodeIP", node.IP)
+		labelID := node.Raylet.Labels["gpuscale.io/instance-id"]
+		// Vast.ai's VAST_CONTAINERLABEL prepends "C." to the instance ID.
+		// Match if the label equals the instanceID or contains it as a suffix.
+		matched := labelID == instanceID || strings.HasSuffix(labelID, "."+instanceID)
+		// State may be "ALIVE" or empty/nil for nodes that just joined.
+		// A node with our label in the summary is alive regardless of state field.
+		if matched {
+			log.Info("Ray worker joined cluster", "instanceID", instanceID, "labelID", labelID, "nodeIP", node.IP, "state", node.State)
 			return true
 		}
 	}
