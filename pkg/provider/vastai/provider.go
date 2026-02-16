@@ -10,6 +10,11 @@ import (
 	"github.com/munhq/gpuscale/pkg/provider"
 )
 
+// minCUDAVersion is the minimum CUDA driver version required on Vast.ai hosts.
+// The rayproject/ray-llm image uses CUDA 12.8 (cu128). Hosts with older drivers
+// fail with OCI runtime errors at container start.
+const minCUDAVersion = 12.8
+
 // Provider implements the provider.Provider interface for Vast.ai.
 type Provider struct {
 	client *Client
@@ -64,6 +69,12 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 	result := make([]provider.Offer, 0, len(offers))
 	for _, o := range offers {
+		// Filter out hosts with CUDA drivers too old for our images.
+		// rayproject/ray-llm:*-cu128 needs CUDA 12.8+.
+		if o.CUDAVersion > 0 && o.CUDAVersion < minCUDAVersion {
+			continue
+		}
+
 		vramGB := int(o.GPURAMTotal / 1024) // convert MB to GB
 		if vramGB == 0 && o.GPURAMTotal > 0 {
 			vramGB = 1
