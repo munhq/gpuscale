@@ -84,6 +84,7 @@ type Instance struct {
 	SSHPort      int
 	Endpoint     string // HTTP endpoint for ray-worker (e.g., "http://host:8000")
 	Status       string // "running", "starting", "stopped", "error"
+	StatusMsg    string // provider-specific status message (error details, etc.)
 	GPUType      string
 	GPUCount     int
 	PricePerHour float64

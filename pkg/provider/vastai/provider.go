@@ -291,6 +291,7 @@ func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provide
 		IP:           resp.SSHHost,
 		SSHPort:      resp.SSHPort,
 		Status:       normalizeStatus(resp.ActualStatus),
+		StatusMsg:    resp.StatusMsg,
 		GPUType:      resp.GPUName,
 		GPUCount:     resp.NumGPUs,
 		PricePerHour: resp.DPHTotal,

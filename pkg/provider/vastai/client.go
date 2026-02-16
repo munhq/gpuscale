@@ -73,6 +73,7 @@ type InstanceResponse struct {
 	ID             int     `json:"id"`
 	MachineID      int     `json:"machine_id"`
 	ActualStatus   string  `json:"actual_status"`
+	StatusMsg      string  `json:"status_msg"`
 	CurState       string  `json:"cur_state"`
 	IntendedStatus string  `json:"intended_status"`
 	GPUName        string  `json:"gpu_name"`

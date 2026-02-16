@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
@@ -403,20 +404,26 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	if instance.Status == "stopped" || instance.Status == "error" {
+	// Detect fatal errors in StatusMsg even when status is still "starting".
+	// Vast.ai can report OCI runtime errors while ActualStatus is still "created".
+	instanceFailed := instance.Status == "stopped" || instance.Status == "error"
+	if !instanceFailed && instance.StatusMsg != "" && strings.Contains(instance.StatusMsg, "Error") {
+		instanceFailed = true
+	}
+
+	if instanceFailed {
 		// Grace period: don't terminate on "error" in the first 2 minutes.
 		// Providers can report transient error states during instance initialization.
-		if instance.Status == "error" && claim.Status.ProvisionedAt != nil {
-			if time.Since(claim.Status.ProvisionedAt.Time) < 2*time.Minute {
-				log.Info("Instance reports error but within grace period, retrying",
-					"status", instance.Status,
-					"age", time.Since(claim.Status.ProvisionedAt.Time).String(),
-				)
-				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
-			}
+		if claim.Status.ProvisionedAt != nil && time.Since(claim.Status.ProvisionedAt.Time) < 2*time.Minute {
+			log.Info("Instance reports error but within grace period, retrying",
+				"status", instance.Status,
+				"statusMsg", instance.StatusMsg,
+				"age", time.Since(claim.Status.ProvisionedAt.Time).String(),
+			)
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 
-		log.Info("Instance failed during bootstrap", "status", instance.Status)
+		log.Info("Instance failed during bootstrap", "status", instance.Status, "statusMsg", instance.StatusMsg)
 		claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 		now := metav1.Now()
 		claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
