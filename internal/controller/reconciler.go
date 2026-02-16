@@ -117,7 +117,7 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	case v1alpha1.ClaimPhaseBootstrapping:
 		return r.handleBootstrapping(ctx, &claim, log)
 	case v1alpha1.ClaimPhaseReady:
-		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		return r.handleReady(ctx, &claim, log)
 	case v1alpha1.ClaimPhaseDraining, v1alpha1.ClaimPhaseTerminated:
 		return ctrl.Result{}, nil
 	default:
@@ -414,7 +414,9 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 				Message:            "Instance no longer exists on the provider",
 			})
 			_ = r.Status().Update(ctx, claim)
-			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+			if r.WorkerStore != nil {
+				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+			}
 			r.retriggerIfDemandExists(ctx, claim, log)
 			return ctrl.Result{}, nil
 		}
@@ -461,7 +463,9 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 			Message:            fmt.Sprintf("Instance status: %s", instance.Status),
 		})
 		_ = r.Status().Update(ctx, claim)
-		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+		if r.WorkerStore != nil {
+			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+		}
 		r.retriggerIfDemandExists(ctx, claim, log)
 		return ctrl.Result{}, nil
 	}
@@ -638,6 +642,79 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
+// handleReady periodically checks that the provider instance backing a Ready claim
+// is still alive. If the instance has been destroyed (host reboot, provider kill,
+// non-spot termination), the claim is terminated and provisioning retriggered.
+func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	providerName := resolveClaimProvider(claim)
+	prov, ok := r.Registry.Get(providerName)
+	if !ok {
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+
+	instance, err := prov.GetInstance(ctx, claim.Status.InstanceID)
+	if err != nil {
+		if errors.Is(err, provider.ErrInstanceNotFound) {
+			log.Info("Ready instance no longer exists on provider, terminating",
+				"instanceID", claim.Status.InstanceID)
+			claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+			now := metav1.Now()
+			claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+				Type:               "InstanceLost",
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "InstanceGone",
+				Message:            "Instance no longer exists on the provider",
+			})
+			_ = r.Status().Update(ctx, claim)
+			if r.WorkerStore != nil {
+				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+			}
+			if claim.Spec.ModelID != "" && r.DemandStore != nil {
+				if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
+					_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+				}
+			}
+			r.retriggerIfDemandExists(ctx, claim, log)
+			return ctrl.Result{}, nil
+		}
+		// Transient error — don't terminate, just retry
+		log.V(1).Info("Failed to check Ready instance status", "error", err.Error())
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Check if instance has died (stopped/error)
+	if instance.Status == "stopped" || instance.Status == "error" {
+		log.Info("Ready instance died on provider, terminating",
+			"instanceID", claim.Status.InstanceID, "status", instance.Status, "statusMsg", instance.StatusMsg)
+		if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+			log.Error(err, "Failed to destroy dead instance", "instanceID", claim.Status.InstanceID)
+		}
+		claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+		now := metav1.Now()
+		claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+			Type:               "InstanceLost",
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: now,
+			Reason:             "InstanceDied",
+			Message:            fmt.Sprintf("Instance status: %s", instance.Status),
+		})
+		_ = r.Status().Update(ctx, claim)
+		if r.WorkerStore != nil {
+			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+		}
+		if claim.Spec.ModelID != "" && r.DemandStore != nil {
+			if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
+				_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+			}
+		}
+		r.retriggerIfDemandExists(ctx, claim, log)
+		return ctrl.Result{}, nil
+	}
+
+	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+}
+
 // resolveRayHeadAddress returns the Ray head address from the pool spec,
 // falling back to the controller's RAY_HEAD_ADDRESS env var.
 func (r *ClaimReconciler) resolveRayHeadAddress(pool *v1alpha1.GPUNodePool) string {
@@ -784,8 +861,10 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 	_ = prov.DestroyInstance(ctx, claim.Status.InstanceID)
 
 	// Remove from Dragonfly
-	if err := r.WorkerStore.RemoveWorker(ctx, claim.Name); err != nil {
-		log.Error(err, "Failed to remove worker from Dragonfly")
+	if r.WorkerStore != nil {
+		if err := r.WorkerStore.RemoveWorker(ctx, claim.Name); err != nil {
+			log.Error(err, "Failed to remove worker from Dragonfly")
+		}
 	}
 
 	// Remove loaded_models entry if this was the last claim for this model.
