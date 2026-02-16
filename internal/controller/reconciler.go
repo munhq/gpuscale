@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -400,6 +401,23 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 	// Check instance is still running
 	instance, err := prov.GetInstance(ctx, claim.Status.InstanceID)
 	if err != nil {
+		if errors.Is(err, provider.ErrInstanceNotFound) {
+			log.Info("Instance no longer exists on provider, terminating claim",
+				"instanceID", claim.Status.InstanceID, "provider", providerName)
+			claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+			now := metav1.Now()
+			claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+				Type:               "BootstrapFailed",
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "InstanceGone",
+				Message:            "Instance no longer exists on the provider",
+			})
+			_ = r.Status().Update(ctx, claim)
+			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+			r.retriggerIfDemandExists(ctx, claim, log)
+			return ctrl.Result{}, nil
+		}
 		log.Error(err, "Failed to check instance status")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
@@ -412,9 +430,15 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 	}
 
 	if instanceFailed {
+		// Skip grace period for known fatal errors that will never self-resolve.
+		// CDI/OCI runtime errors indicate a broken GPU driver config on the host.
+		fatalError := strings.Contains(instance.StatusMsg, "OCI runtime create failed") ||
+			strings.Contains(instance.StatusMsg, "CDI devices")
+
 		// Grace period: don't terminate on "error" in the first 2 minutes.
 		// Providers can report transient error states during instance initialization.
-		if claim.Status.ProvisionedAt != nil && time.Since(claim.Status.ProvisionedAt.Time) < 2*time.Minute {
+		// But skip for fatal errors — retrying won't help.
+		if !fatalError && claim.Status.ProvisionedAt != nil && time.Since(claim.Status.ProvisionedAt.Time) < 2*time.Minute {
 			log.Info("Instance reports error but within grace period, retrying",
 				"status", instance.Status,
 				"statusMsg", instance.StatusMsg,

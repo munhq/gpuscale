@@ -234,7 +234,9 @@ func (c *Client) GetInstance(ctx context.Context, instanceID int) (*InstanceResp
 		return &instance, nil
 	}
 	if wrapped.Instances.ID == 0 {
-		return nil, fmt.Errorf("vast.ai returned instance with ID=0 for request %d", instanceID)
+		// Instance was destroyed or doesn't exist — return nil so the provider
+		// maps this to ErrInstanceNotFound.
+		return nil, nil
 	}
 	return &wrapped.Instances, nil
 }
