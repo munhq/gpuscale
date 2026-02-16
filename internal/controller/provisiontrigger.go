@@ -91,7 +91,9 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		return fmt.Errorf("listing claims: %w", err)
 	}
 	for _, c := range claims.Items {
-		if c.Spec.ModelID == model && c.Status.Phase != v1alpha1.ClaimPhaseTerminated {
+		if c.Spec.ModelID == model &&
+			c.Status.Phase != v1alpha1.ClaimPhaseTerminated &&
+			c.Status.Phase != v1alpha1.ClaimPhaseDraining {
 			log.Info("Claim already exists for model", "claim", c.Name, "phase", c.Status.Phase)
 			return nil
 		}

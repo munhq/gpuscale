@@ -413,7 +413,10 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 				Reason:             "InstanceGone",
 				Message:            "Instance no longer exists on the provider",
 			})
-			_ = r.Status().Update(ctx, claim)
+			if err := r.Status().Update(ctx, claim); err != nil {
+				log.Error(err, "Failed to update claim status to Terminated")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
 			if r.WorkerStore != nil {
 				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 			}
@@ -462,7 +465,10 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 			Reason:             "InstanceDied",
 			Message:            fmt.Sprintf("Instance status: %s", instance.Status),
 		})
-		_ = r.Status().Update(ctx, claim)
+		if err := r.Status().Update(ctx, claim); err != nil {
+			log.Error(err, "Failed to update claim status to Terminated")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 		if r.WorkerStore != nil {
 			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 		}
