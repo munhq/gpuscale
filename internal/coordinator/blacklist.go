@@ -35,6 +35,14 @@ func (b *OfferBlacklist) Add(providerName, offerID string) {
 	b.entries[blacklistKey(providerName, offerID)] = time.Now().Add(b.ttl)
 }
 
+// AddWithTTL blacklists an offer with a custom TTL. Use for post-creation
+// failures (CDI errors, etc.) that indicate persistent host problems.
+func (b *OfferBlacklist) AddWithTTL(providerName, offerID string, ttl time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.entries[blacklistKey(providerName, offerID)] = time.Now().Add(ttl)
+}
+
 // Filter returns offers that are not currently blacklisted.
 // Performs lazy cleanup of expired entries.
 func (b *OfferBlacklist) Filter(offers []provider.Offer) []provider.Offer {

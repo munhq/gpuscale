@@ -334,6 +334,21 @@ func (c *Coordinator) sleep(ctx context.Context, attempt int) {
 	}
 }
 
+// BlacklistOffer blacklists a specific offer so it won't be selected again.
+// Uses a 30-minute TTL since post-creation failures (CDI errors, broken GPU
+// drivers) indicate persistent host problems that won't self-heal quickly.
+func (c *Coordinator) BlacklistOffer(providerName, offerID string) {
+	if providerName == "" || offerID == "" {
+		return
+	}
+	c.blacklist.AddWithTTL(providerName, offerID, 30*time.Minute)
+	c.log.Info("Offer blacklisted (post-creation failure)",
+		"provider", providerName,
+		"offerID", offerID,
+		"ttl", "30m",
+	)
+}
+
 // BlacklistSize returns the number of currently blacklisted offers.
 func (c *Coordinator) BlacklistSize() int {
 	return c.blacklist.Size()

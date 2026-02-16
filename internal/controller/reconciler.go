@@ -301,6 +301,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		}
 		claim.Annotations["gpuscale.io/instance-id"] = instanceID
 		claim.Annotations["gpuscale.io/provider"] = providerName
+		claim.Annotations["gpuscale.io/offer-id"] = result.Offer.OfferID
 		if err := r.Patch(ctx, claim, patch); err != nil {
 			log.Error(err, "Failed to persist instance annotation — instance may be orphaned",
 				"instanceID", instanceID, "provider", providerName)
@@ -455,6 +456,10 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 		log.Info("Instance failed during bootstrap, destroying", "status", instance.Status, "statusMsg", instance.StatusMsg)
 		if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
 			log.Error(err, "Failed to destroy failed instance", "instanceID", claim.Status.InstanceID)
+		}
+		// Blacklist the offer so the coordinator won't pick it again.
+		if offerID := claim.Annotations["gpuscale.io/offer-id"]; offerID != "" && r.Coordinator != nil {
+			r.Coordinator.BlacklistOffer(providerName, offerID)
 		}
 		claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 		now := metav1.Now()
