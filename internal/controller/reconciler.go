@@ -447,7 +447,10 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 
-		log.Info("Instance failed during bootstrap", "status", instance.Status, "statusMsg", instance.StatusMsg)
+		log.Info("Instance failed during bootstrap, destroying", "status", instance.Status, "statusMsg", instance.StatusMsg)
+		if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+			log.Error(err, "Failed to destroy failed instance", "instanceID", claim.Status.InstanceID)
+		}
 		claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 		now := metav1.Now()
 		claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
