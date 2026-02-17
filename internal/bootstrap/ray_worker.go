@@ -82,9 +82,9 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	// the Docker bridge IP (172.17.0.2) which is unreachable from Hetzner,
 	// causing every worker to die after ~2 minutes due to missed heartbeats.
 	script.WriteString("echo '[gpuscale] Resolving public IP...'\n")
-	script.WriteString("PUBLIC_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null \\\n")
-	script.WriteString("  || curl -s --connect-timeout 5 icanhazip.com 2>/dev/null \\\n")
-	script.WriteString("  || curl -s --connect-timeout 5 api.ipify.org 2>/dev/null \\\n")
+	script.WriteString("PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null \\\n")
+	script.WriteString("  || curl -s --max-time 5 icanhazip.com 2>/dev/null \\\n")
+	script.WriteString("  || curl -s --max-time 5 api.ipify.org 2>/dev/null \\\n")
 	script.WriteString("  || ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}')\n")
 	script.WriteString("echo \"[gpuscale] Public IP: $PUBLIC_IP\"\n\n")
 
