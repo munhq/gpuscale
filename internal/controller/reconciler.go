@@ -1020,14 +1020,19 @@ func (r *ClaimReconciler) retriggerIfDemandExists(ctx context.Context, claim *v1
 	if claim.Spec.ModelID == "" || r.DemandStore == nil {
 		return
 	}
-	depth, err := r.DemandStore.GetQueueDepth(ctx, claim.Spec.ModelID)
+	queueDepth, err := r.DemandStore.GetQueueDepth(ctx, claim.Spec.ModelID)
 	if err != nil {
 		log.Error(err, "Failed to check queue depth for re-trigger")
 		return
 	}
-	if depth > 0 {
+	activeDemand, err := r.DemandStore.GetDemand(ctx, claim.Spec.ModelID)
+	if err != nil {
+		log.Error(err, "Failed to check active demand for re-trigger")
+		return
+	}
+	if queueDepth > 0 || activeDemand > 0 {
 		log.Info("Demand exists after claim termination, re-triggering provisioning",
-			"model", claim.Spec.ModelID, "queueDepth", depth)
+			"model", claim.Spec.ModelID, "queueDepth", queueDepth, "activeDemand", activeDemand)
 		if err := r.DemandStore.PublishProvisionTrigger(ctx, claim.Spec.ModelID); err != nil {
 			log.Error(err, "Failed to publish re-trigger")
 		}
