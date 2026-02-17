@@ -723,6 +723,45 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		return ctrl.Result{}, nil
 	}
 
+	// Verify Ray worker is still connected to the cluster.
+	// Provider instance may be "running" but Ray process inside could have crashed.
+	var pool v1alpha1.GPUNodePool
+	if err := r.Get(ctx, types.NamespacedName{Name: claim.Spec.PoolRef}, &pool); err != nil {
+		log.Error(err, "Failed to get pool for Ray health check")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	rayDashURL := r.buildRayDashboardURL(ctx, &pool, claim.Namespace)
+	if rayDashURL != "" {
+		workerAlive := r.checkRayWorkerJoined(ctx, rayDashURL, claim.Status.InstanceID, log)
+		if !workerAlive {
+			log.Info("Ray worker disconnected from cluster, terminating claim",
+				"instanceID", claim.Status.InstanceID, "rayDash", rayDashURL)
+			if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+				log.Error(err, "Failed to destroy instance with dead Ray worker", "instanceID", claim.Status.InstanceID)
+			}
+			claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+			now := metav1.Now()
+			claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+				Type:               "WorkerLost",
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "RayWorkerDisconnected",
+				Message:            "Ray worker no longer connected to cluster",
+			})
+			_ = r.Status().Update(ctx, claim)
+			if r.WorkerStore != nil {
+				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+			}
+			if claim.Spec.ModelID != "" && r.DemandStore != nil {
+				if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
+					_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+				}
+			}
+			r.retriggerIfDemandExists(ctx, claim, log)
+			return ctrl.Result{}, nil
+		}
+	}
+
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
