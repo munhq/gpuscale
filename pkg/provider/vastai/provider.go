@@ -166,7 +166,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	// heartbeats.
 	openPorts := ""
 	if config.NodeType == "ray-worker" {
-		openPorts = "10001/tcp"
+		openPorts = "20001/tcp"
 	}
 
 	createReq := InstanceCreateRequest{

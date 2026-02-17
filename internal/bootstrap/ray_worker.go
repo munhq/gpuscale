@@ -103,7 +103,7 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	// --node-ip-address: advertise the public IP so GCS health checks work.
 	// --node-manager-port: fixed port that Vast.ai exposes (open_ports=10001/tcp).
 	script.WriteString("  --node-ip-address=$PUBLIC_IP \\\n")
-	script.WriteString("  --node-manager-port=10001 \\\n")
+	script.WriteString("  --node-manager-port=20001 \\\n")
 	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"'\"$GPUSCALE_INSTANCE_ID\"'\"}' \\\n",
 		config.ProviderName, config.GPUType))
 	script.WriteString("  --block\n")
