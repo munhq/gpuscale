@@ -77,6 +77,17 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("  sleep 5\n")
 	script.WriteString("done\n\n")
 
+	// Resolve the public IP of this machine so the Ray head's GCS health checks
+	// can reach the raylet. Without --node-ip-address, ray start auto-detects
+	// the Docker bridge IP (172.17.0.2) which is unreachable from Hetzner,
+	// causing every worker to die after ~2 minutes due to missed heartbeats.
+	script.WriteString("echo '[gpuscale] Resolving public IP...'\n")
+	script.WriteString("PUBLIC_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null \\\n")
+	script.WriteString("  || curl -s --connect-timeout 5 icanhazip.com 2>/dev/null \\\n")
+	script.WriteString("  || curl -s --connect-timeout 5 api.ipify.org 2>/dev/null \\\n")
+	script.WriteString("  || ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}')\n")
+	script.WriteString("echo \"[gpuscale] Public IP: $PUBLIC_IP\"\n\n")
+
 	// Join the Ray cluster as a worker node.
 	// CONTAINER_ID is injected by Vast.ai at runtime. We use it as instance-id
 	// label so the health check can find this specific worker in the Ray dashboard.
@@ -89,6 +100,10 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("echo \"[gpuscale] Instance ID: $GPUSCALE_INSTANCE_ID\"\n")
 	script.WriteString(fmt.Sprintf("ray start --address='%s' \\\n", rayAddr))
 	script.WriteString(fmt.Sprintf("  --num-gpus=%d \\\n", numGPUs))
+	// --node-ip-address: advertise the public IP so GCS health checks work.
+	// --node-manager-port: fixed port that Vast.ai exposes (open_ports=10001/tcp).
+	script.WriteString("  --node-ip-address=$PUBLIC_IP \\\n")
+	script.WriteString("  --node-manager-port=10001 \\\n")
 	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"'\"$GPUSCALE_INSTANCE_ID\"'\"}' \\\n",
 		config.ProviderName, config.GPUType))
 	script.WriteString("  --block\n")

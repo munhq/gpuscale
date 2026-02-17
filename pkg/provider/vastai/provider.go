@@ -159,12 +159,23 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	// content to be treated as a file path (exec error).
 	runType := "ssh_proxy"
 
+	// Ray-worker instances need the raylet port (10001) reachable from the
+	// Ray head for GCS health checks. Without this, the head registers the
+	// worker at 172.17.0.2 (Docker bridge IP) which is unreachable from
+	// Hetzner, causing every worker to die after ~2 minutes due to missed
+	// heartbeats.
+	openPorts := ""
+	if config.NodeType == "ray-worker" {
+		openPorts = "10001/tcp"
+	}
+
 	createReq := InstanceCreateRequest{
-		Image:   image,
-		Disk:    50,
-		RunType: runType,
-		Env:     env,
-		Onstart: onstart,
+		Image:     image,
+		Disk:      50,
+		RunType:   runType,
+		Env:       env,
+		Onstart:   onstart,
+		OpenPorts: openPorts,
 	}
 
 	resp, err := p.client.CreateInstance(ctx, offerID, createReq)

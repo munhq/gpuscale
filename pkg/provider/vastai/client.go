@@ -61,11 +61,12 @@ type BundleOffer struct {
 // RunType should be "ssh_proxy" or "ssh_direc" when using Onstart scripts.
 // "args" mode uses the docker entrypoint and ignores Onstart.
 type InstanceCreateRequest struct {
-	Image   string            `json:"image"`
-	Disk    float64           `json:"disk"`
-	Onstart string            `json:"onstart,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	RunType string            `json:"runtype"`
+	Image     string            `json:"image"`
+	Disk      float64           `json:"disk"`
+	Onstart   string            `json:"onstart,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	RunType   string            `json:"runtype"`
+	OpenPorts string            `json:"open_ports,omitempty"`
 }
 
 // InstanceResponse represents an instance returned by the Vast.ai API.
