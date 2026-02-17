@@ -11,8 +11,11 @@ import (
 // an existing Ray cluster. The worker provides GPU capacity to the cluster, and
 // Ray Serve handles model placement and routing.
 //
-// This replaces the old standalone vLLM approach — workers no longer run their own
-// model. Instead, Ray Serve on the head node decides which models to load where.
+// Networking: Vast.ai containers are behind NAT with no inbound ports. We use a
+// chisel reverse tunnel to expose a block of 10 contiguous ports on the K8s control
+// plane that map back to the same ports on the worker. Ray needs multiple inbound
+// ports: node-manager (GCS health checks), object-manager (object transfers), and
+// worker ports (direct gRPC for Serve proxy → replica actor calls).
 func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	var script strings.Builder
 
@@ -41,13 +44,20 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 		}
 	}
 
+	// Tunnel server address defaults to the Ray head host on port 8443.
+	tunnelServer := config.ExtraEnv["TUNNEL_SERVER"]
+	if tunnelServer == "" {
+		tunnelServer = rayHost + ":8443"
+	}
+
 	script.WriteString("#!/bin/bash\n")
 	script.WriteString("set -euo pipefail\n\n")
 
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Starting Ray worker on %s'\n", config.ProviderName))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Instance ID: %s'\n", config.InstanceID))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] GPU Type: %s'\n", config.GPUType))
-	script.WriteString(fmt.Sprintf("echo '[gpuscale] Ray Head: %s'\n\n", rayAddr))
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Ray Head: %s'\n", rayAddr))
+	script.WriteString(fmt.Sprintf("echo '[gpuscale] Tunnel Server: %s'\n\n", tunnelServer))
 
 	// Pre-cache models if configured (Ray Serve may need them on this worker)
 	if config.ModelCacheURL != "" {
@@ -68,7 +78,7 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 
 	// Wait for Ray head to be reachable
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Waiting for Ray head at %s...'\n", rayAddr))
-	script.WriteString(fmt.Sprintf("for i in $(seq 1 60); do\n"))
+	script.WriteString("for i in $(seq 1 60); do\n")
 	script.WriteString(fmt.Sprintf("  if python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('%s', %s)); s.close()\" 2>/dev/null; then\n", rayHost, rayPort))
 	script.WriteString("    echo '[gpuscale] Ray head is reachable'\n")
 	script.WriteString("    break\n")
@@ -77,33 +87,79 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("  sleep 5\n")
 	script.WriteString("done\n\n")
 
-	// Resolve the public IP of this machine so the Ray head's GCS health checks
-	// can reach the raylet. Without --node-ip-address, ray start auto-detects
-	// the Docker bridge IP (172.17.0.2) which is unreachable from Hetzner,
-	// causing every worker to die after ~2 minutes due to missed heartbeats.
-	script.WriteString("echo '[gpuscale] Resolving public IP...'\n")
-	script.WriteString("PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null \\\n")
-	script.WriteString("  || curl -s --max-time 5 icanhazip.com 2>/dev/null \\\n")
-	script.WriteString("  || curl -s --max-time 5 api.ipify.org 2>/dev/null \\\n")
-	script.WriteString("  || ip route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}')\n")
-	script.WriteString("echo \"[gpuscale] Public IP: $PUBLIC_IP\"\n\n")
+	// --- Chisel reverse tunnel ---
+	// Ray needs multiple inbound ports on the worker: node-manager (health checks),
+	// object-manager (object transfers), and worker ports (Serve proxy → replica gRPC).
+	// We tunnel a contiguous block of 10 ports through a single chisel WebSocket.
+	// Port layout within the block:
+	//   base+0 = node-manager-port (raylet gRPC, GCS health checks)
+	//   base+1 = object-manager-port (object transfers between nodes)
+	//   base+2..base+9 = worker ports (actor/task gRPC servers)
+	script.WriteString("# --- Reverse tunnel for Ray worker ports ---\n")
+	script.WriteString("echo '[gpuscale] Setting up reverse tunnel...'\n")
+	script.WriteString("if ! command -v chisel &> /dev/null; then\n")
+	script.WriteString("  echo '[gpuscale] Downloading chisel...'\n")
+	script.WriteString("  curl -sL 'https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz' | gunzip > /usr/local/bin/chisel\n")
+	script.WriteString("  chmod +x /usr/local/bin/chisel\n")
+	script.WriteString("fi\n\n")
 
-	// Join the Ray cluster as a worker node.
-	// CONTAINER_ID is injected by Vast.ai at runtime. We use it as instance-id
-	// label so the health check can find this specific worker in the Ray dashboard.
-	// INSTANCE_ID may also be set by other providers.
+	// Pick a random base port. 2000 possible blocks of 10 in range 30000-49990.
+	// With 1-5 concurrent workers, collision is near-impossible.
+	script.WriteString(fmt.Sprintf("TUNNEL_SERVER='%s'\n", tunnelServer))
+	script.WriteString("BASE_PORT=$(( (RANDOM % 2000) * 10 + 30000 ))\n")
+	script.WriteString("NODE_MGR_PORT=$((BASE_PORT))\n")
+	script.WriteString("OBJ_MGR_PORT=$((BASE_PORT + 1))\n")
+	script.WriteString("MIN_WORKER_PORT=$((BASE_PORT + 2))\n")
+	script.WriteString("MAX_WORKER_PORT=$((BASE_PORT + 9))\n")
+	script.WriteString("echo \"[gpuscale] Tunnel port block: $BASE_PORT - $MAX_WORKER_PORT\"\n\n")
+
+	// Build chisel remotes — one R:port:localhost:port per port in the block.
+	script.WriteString("CHISEL_REMOTES=''\n")
+	script.WriteString("for p in $(seq $BASE_PORT $MAX_WORKER_PORT); do\n")
+	script.WriteString("  CHISEL_REMOTES=\"$CHISEL_REMOTES R:${p}:localhost:${p}\"\n")
+	script.WriteString("done\n\n")
+
+	script.WriteString("CHISEL_LOG=/tmp/chisel.log\n")
+	script.WriteString("chisel client \"http://$TUNNEL_SERVER\" $CHISEL_REMOTES > \"$CHISEL_LOG\" 2>&1 &\n")
+	script.WriteString("CHISEL_PID=$!\n")
+	script.WriteString("echo \"[gpuscale] Chisel client started (PID $CHISEL_PID)\"\n\n")
+
+	// Wait for chisel to connect.
+	script.WriteString("TUNNEL_OK=0\n")
+	script.WriteString("for i in $(seq 1 30); do\n")
+	script.WriteString("  sleep 2\n")
+	script.WriteString("  if ! kill -0 $CHISEL_PID 2>/dev/null; then\n")
+	script.WriteString("    echo '[gpuscale] ERROR: chisel client exited'\n")
+	script.WriteString("    cat \"$CHISEL_LOG\"\n")
+	script.WriteString("    exit 1\n")
+	script.WriteString("  fi\n")
+	script.WriteString("  if grep -q 'Connected' \"$CHISEL_LOG\"; then\n")
+	script.WriteString("    echo \"[gpuscale] Tunnel established for ports $BASE_PORT-$MAX_WORKER_PORT\"\n")
+	script.WriteString("    TUNNEL_OK=1\n")
+	script.WriteString("    break\n")
+	script.WriteString("  fi\n")
+	script.WriteString("  echo \"[gpuscale] Waiting for tunnel (attempt $i/30)...\"\n")
+	script.WriteString("done\n\n")
+
+	script.WriteString("if [ \"$TUNNEL_OK\" -ne 1 ]; then\n")
+	script.WriteString("  echo '[gpuscale] ERROR: Failed to establish reverse tunnel'\n")
+	script.WriteString("  cat \"$CHISEL_LOG\"\n")
+	script.WriteString("  exit 1\n")
+	script.WriteString("fi\n\n")
+
+	// node-ip-address = Hetzner IP (chisel server host). GCS/proxy connect to
+	// Hetzner:port → chisel → worker localhost:port for all tunneled ports.
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Joining Ray cluster as worker with %d GPUs...'\n", numGPUs))
-	// Resolve instance ID: INSTANCE_ID (set by us for other providers),
-	// VAST_CONTAINERLABEL (Vast.ai's unique instance name, same as API ID),
-	// CONTAINER_ID (Vast.ai Docker container ID — may differ from API ID).
 	script.WriteString("GPUSCALE_INSTANCE_ID=\"${INSTANCE_ID:-${VAST_CONTAINERLABEL:-${CONTAINER_ID:-unknown}}}\"\n")
 	script.WriteString("echo \"[gpuscale] Instance ID: $GPUSCALE_INSTANCE_ID\"\n")
+	script.WriteString(fmt.Sprintf("NODE_IP='%s'\n", rayHost))
 	script.WriteString(fmt.Sprintf("ray start --address='%s' \\\n", rayAddr))
 	script.WriteString(fmt.Sprintf("  --num-gpus=%d \\\n", numGPUs))
-	// --node-ip-address: advertise the public IP so GCS health checks work.
-	// --node-manager-port: fixed port that Vast.ai exposes (open_ports=10001/tcp).
-	script.WriteString("  --node-ip-address=$PUBLIC_IP \\\n")
-	script.WriteString("  --node-manager-port=20001 \\\n")
+	script.WriteString("  --node-ip-address=$NODE_IP \\\n")
+	script.WriteString("  --node-manager-port=$NODE_MGR_PORT \\\n")
+	script.WriteString("  --object-manager-port=$OBJ_MGR_PORT \\\n")
+	script.WriteString("  --min-worker-port=$MIN_WORKER_PORT \\\n")
+	script.WriteString("  --max-worker-port=$MAX_WORKER_PORT \\\n")
 	script.WriteString(fmt.Sprintf("  --labels='{\"gpuscale.io/provider\": \"%s\", \"gpuscale.io/gpu-type\": \"%s\", \"gpuscale.io/instance-id\": \"'\"$GPUSCALE_INSTANCE_ID\"'\"}' \\\n",
 		config.ProviderName, config.GPUType))
 	script.WriteString("  --block\n")
