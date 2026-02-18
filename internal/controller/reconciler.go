@@ -616,12 +616,15 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 	// Check if the worker has joined the Ray cluster via dashboard API.
 	// Match by instance ID label (set in bootstrap --labels), not by IP,
 	// since cloud instances report container-internal IPs.
-	joined := r.checkRayWorkerJoined(ctx, rayDashURL, instance.InstanceID, log)
+	// The bootstrap script sets gpuscale.io/instance-id label to config.InstanceID,
+	// which is claim.Name (not the provider instance ID). Match on that.
+	labelInstanceID := claim.Name
+	joined := r.checkRayWorkerJoined(ctx, rayDashURL, labelInstanceID, log)
 	if !joined {
 		if r.isBootstrapTimedOut(claim) {
 			return r.terminateTimedOut(ctx, claim, prov, log)
 		}
-		log.Info("Waiting for ray-worker to join cluster", "instanceID", instance.InstanceID, "rayDash", rayDashURL)
+		log.Info("Waiting for ray-worker to join cluster", "instanceID", instance.InstanceID, "labelID", labelInstanceID, "rayDash", rayDashURL)
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
@@ -757,7 +760,7 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		}
 		rayDashURL := r.buildRayDashboardURL(ctx, &pool, claim.Namespace)
 		if rayDashURL != "" {
-			workerAlive := r.checkRayWorkerJoined(ctx, rayDashURL, claim.Status.InstanceID, log)
+			workerAlive := r.checkRayWorkerJoined(ctx, rayDashURL, claim.Name, log)
 			if !workerAlive {
 				log.Info("Ray worker disconnected from cluster, terminating claim",
 					"instanceID", claim.Status.InstanceID, "rayDash", rayDashURL)
