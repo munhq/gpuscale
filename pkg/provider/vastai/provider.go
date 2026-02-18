@@ -128,14 +128,13 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		// This covers ray-worker (ray start), full-node (VPN+K3s), or any custom script.
 		onstart = config.OnStartScript
 		env = config.OnStartEnv
-		if image == "" {
-			if config.NodeType == "full-node" {
-				// Vast.ai KVM image: Ubuntu 22.04 with CUDA pre-installed.
-				// Drivers are already present — bootstrap installs Netbird + K3s.
-				image = "vastai/kvm:ubuntu_terminal"
-			} else {
-				image = "rayproject/ray-llm:2.53.0-py311-cu128"
-			}
+		if config.NodeType == "full-node" {
+			// Full-node MUST use Vast.ai KVM image — real VM with systemd,
+			// WireGuard support, and ability to install K3s.
+			// Docker images (like vllm/vllm-openai) don't have these capabilities.
+			image = "vastai/kvm:ubuntu_terminal"
+		} else if image == "" {
+			image = "rayproject/ray-llm:2.53.0-py311-cu128"
 		}
 	} else if config.NodeType == "ray-worker" {
 		// Fallback: no script provided, generate standalone vLLM bootstrap.
