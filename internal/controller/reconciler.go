@@ -446,7 +446,11 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 	// Detect fatal errors in StatusMsg even when status is still "starting".
 	// Vast.ai can report OCI runtime errors while ActualStatus is still "created".
 	instanceFailed := instance.Status == "stopped" || instance.Status == "error"
-	if !instanceFailed && instance.StatusMsg != "" && strings.Contains(instance.StatusMsg, "Error") {
+
+	// For containers, "Error" in StatusMsg while starting is suspicious.
+	// For KVM VMs, the boot process is much longer and transient errors are normal.
+	nodeType := resolveClaimNodeType(claim)
+	if !instanceFailed && instance.StatusMsg != "" && strings.Contains(instance.StatusMsg, "Error") && nodeType != "full-node" {
 		instanceFailed = true
 	}
 
@@ -456,10 +460,13 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 		fatalError := strings.Contains(instance.StatusMsg, "OCI runtime create failed") ||
 			strings.Contains(instance.StatusMsg, "CDI devices")
 
-		// Grace period: don't terminate on "error" in the first 2 minutes.
-		// Providers can report transient error states during instance initialization.
-		// But skip for fatal errors — retrying won't help.
-		if !fatalError && claim.Status.ProvisionedAt != nil && time.Since(claim.Status.ProvisionedAt.Time) < 2*time.Minute {
+		// Grace period: don't terminate during early bootstrap.
+		// KVM VMs need longer (5 min boot + package install). Containers need 2 min.
+		gracePeriod := 2 * time.Minute
+		if nodeType == "full-node" {
+			gracePeriod = 8 * time.Minute
+		}
+		if !fatalError && claim.Status.ProvisionedAt != nil && time.Since(claim.Status.ProvisionedAt.Time) < gracePeriod {
 			log.Info("Instance reports error but within grace period, retrying",
 				"status", instance.Status,
 				"statusMsg", instance.StatusMsg,
@@ -497,7 +504,7 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 	}
 
 	// Branch based on node type
-	nodeType := resolveClaimNodeType(claim)
+	nodeType = resolveClaimNodeType(claim)
 	if nodeType == "ray-worker" {
 		return r.handleBootstrappingRayWorker(ctx, claim, instance, prov, log)
 	}
