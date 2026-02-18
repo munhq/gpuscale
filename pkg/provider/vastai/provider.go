@@ -38,6 +38,12 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		"verified": "true",
 	}
 
+	// For full-node (VM) mode, filter to machines that support VMs.
+	// Container-only hosts reject vm:true create requests.
+	if req.NodeType == "full-node" {
+		params["vms_enabled"] = "true"
+	}
+
 	if req.GPUCount > 0 {
 		params["num_gpus"] = strconv.Itoa(req.GPUCount)
 	}
@@ -124,7 +130,9 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		env = config.OnStartEnv
 		if image == "" {
 			if config.NodeType == "full-node" {
-				image = "ghcr.io/munhq/gpuscale-node:latest"
+				// Vast.ai KVM image: Ubuntu 22.04 with CUDA pre-installed.
+				// Drivers are already present — bootstrap installs Netbird + K3s.
+				image = "vastai/kvm:ubuntu_terminal"
 			} else {
 				image = "rayproject/ray-llm:2.53.0-py311-cu128"
 			}
@@ -159,14 +167,18 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	// content to be treated as a file path (exec error).
 	runType := "ssh_proxy"
 
-	// Note: Vast.ai's open_ports field is silently ignored (tested 2026-02-17).
-	// Ray-worker connectivity is handled by chisel reverse tunnels instead.
+	// full-node uses Vast.ai VM mode: a real Ubuntu VM with systemd, root access,
+	// and the ability to install arbitrary software (Netbird, K3s, NVIDIA toolkit).
+	// VMs have outbound internet so Netbird VPN connects without any inbound port hacks.
+	isVM := config.NodeType == "full-node"
+
 	createReq := InstanceCreateRequest{
 		Image:   image,
 		Disk:    50,
 		RunType: runType,
 		Env:     env,
 		Onstart: onstart,
+		VM:      isVM,
 	}
 
 	resp, err := p.client.CreateInstance(ctx, offerID, createReq)

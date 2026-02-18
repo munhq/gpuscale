@@ -161,20 +161,34 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		GPUType:       claim.Status.GPUType,
 	}
 
-	// Full-node specific: read VPN and Kubernetes join secrets
+	// Full-node specific: read VPN and Kubernetes join secrets.
+	// Key names match what the Ansible argocd role writes into gpuscale-provider-credentials:
+	//   netbird-setup-key  → vault_gpu_netbird_setup_key
+	//   k8s-join-token     → /var/lib/rancher/k3s/server/node-token
+	//   k8s-join-url       → https://<wt0-ip>:6443 (Netbird VPN IP of utility-server)
 	if nodeType == "full-node" {
-		netbirdKey, err := r.SecretReader.GetSecretValue(ctx, pool.Spec.Bootstrap.VPNSetupKeySecret, "setup-key")
+		netbirdKey, err := r.SecretReader.GetSecretValue(ctx, pool.Spec.Bootstrap.VPNSetupKeySecret, "netbird-setup-key")
 		if err != nil {
 			log.Error(err, "Failed to read VPN setup key")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		k8sToken, err := r.SecretReader.GetSecretValue(ctx, pool.Spec.Bootstrap.K8sTokenSecret, "token")
+		k8sToken, err := r.SecretReader.GetSecretValue(ctx, pool.Spec.Bootstrap.K8sTokenSecret, "k8s-join-token")
 		if err != nil {
 			log.Error(err, "Failed to read Kubernetes join token")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		// K8sURL: prefer pool spec (explicit override) but fall back to the secret
+		// where Ansible stores it as k8s-join-url (same secret as the token).
+		k8sURL := pool.Spec.Bootstrap.K8sURL
+		if k8sURL == "" {
+			k8sURL, err = r.SecretReader.GetSecretValue(ctx, pool.Spec.Bootstrap.K8sTokenSecret, "k8s-join-url")
+			if err != nil {
+				log.Error(err, "Failed to read Kubernetes server URL from secret")
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+		}
 		config.NetbirdKey = netbirdKey
-		config.K8sURL = pool.Spec.Bootstrap.K8sURL
+		config.K8sURL = k8sURL
 		config.K8sToken = k8sToken
 	}
 
@@ -213,6 +227,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		GPUTypes:     claim.Spec.Requirements.GPUTypes,
 		MaxPrice:     claim.Spec.Requirements.MaxPrice,
 		CapacityType: "spot",
+		NodeType:     nodeType,
 	}
 
 	// Note: full-node bootstrap script is generated inside the coordinator
@@ -723,30 +738,65 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		return ctrl.Result{}, nil
 	}
 
-	// Verify Ray worker is still connected to the cluster.
-	// Provider instance may be "running" but Ray process inside could have crashed.
-	var pool v1alpha1.GPUNodePool
-	if err := r.Get(ctx, types.NamespacedName{Name: claim.Spec.PoolRef}, &pool); err != nil {
-		log.Error(err, "Failed to get pool for Ray health check")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	rayDashURL := r.buildRayDashboardURL(ctx, &pool, claim.Namespace)
-	if rayDashURL != "" {
-		workerAlive := r.checkRayWorkerJoined(ctx, rayDashURL, claim.Status.InstanceID, log)
-		if !workerAlive {
-			log.Info("Ray worker disconnected from cluster, terminating claim",
-				"instanceID", claim.Status.InstanceID, "rayDash", rayDashURL)
+	// Node-type-specific health check.
+	// For ray-worker: verify Ray process is still connected to the cluster.
+	// For full-node: verify the K8s node is still Ready (K8s itself tracks this).
+	nodeType := resolveClaimNodeType(claim)
+	if nodeType == "ray-worker" {
+		var pool v1alpha1.GPUNodePool
+		if err := r.Get(ctx, types.NamespacedName{Name: claim.Spec.PoolRef}, &pool); err != nil {
+			log.Error(err, "Failed to get pool for Ray health check")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		rayDashURL := r.buildRayDashboardURL(ctx, &pool, claim.Namespace)
+		if rayDashURL != "" {
+			workerAlive := r.checkRayWorkerJoined(ctx, rayDashURL, claim.Status.InstanceID, log)
+			if !workerAlive {
+				log.Info("Ray worker disconnected from cluster, terminating claim",
+					"instanceID", claim.Status.InstanceID, "rayDash", rayDashURL)
+				if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+					log.Error(err, "Failed to destroy instance with dead Ray worker", "instanceID", claim.Status.InstanceID)
+				}
+				claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+				now := metav1.Now()
+				claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+					Type:               "WorkerLost",
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: now,
+					Reason:             "RayWorkerDisconnected",
+					Message:            "Ray worker no longer connected to cluster",
+				})
+				_ = r.Status().Update(ctx, claim)
+				if r.WorkerStore != nil {
+					_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+				}
+				if claim.Spec.ModelID != "" && r.DemandStore != nil {
+					if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
+						_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+					}
+				}
+				r.retriggerIfDemandExists(ctx, claim, log)
+				return ctrl.Result{}, nil
+			}
+		}
+	} else if nodeType == "full-node" && claim.Status.NodeName != "" {
+		// For full-node: check that the K8s node is still Ready.
+		// If the VM died, the node will go NotReady which we catch here.
+		node, err := r.findNodeByInstanceID(ctx, claim.Name)
+		if err == nil && node != nil && !bootstrap.IsNodeReady(node) {
+			log.Info("Full-node K8s node is NotReady, terminating claim",
+				"node", claim.Status.NodeName, "instanceID", claim.Status.InstanceID)
 			if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
-				log.Error(err, "Failed to destroy instance with dead Ray worker", "instanceID", claim.Status.InstanceID)
+				log.Error(err, "Failed to destroy instance with NotReady node")
 			}
 			claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 			now := metav1.Now()
 			claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
-				Type:               "WorkerLost",
+				Type:               "NodeLost",
 				Status:             metav1.ConditionTrue,
 				LastTransitionTime: now,
-				Reason:             "RayWorkerDisconnected",
-				Message:            "Ray worker no longer connected to cluster",
+				Reason:             "NodeNotReady",
+				Message:            "K8s node is no longer Ready",
 			})
 			_ = r.Status().Update(ctx, claim)
 			if r.WorkerStore != nil {

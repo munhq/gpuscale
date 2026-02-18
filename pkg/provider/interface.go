@@ -23,6 +23,7 @@ type GPURequirements struct {
 	CapacityType string   // "spot" or "on-demand"
 	MinDisk      int      // GB
 	MinRAM       int      // GB
+	NodeType     string   // "full-node" or "ray-worker" — used by providers to filter VM vs container offers
 }
 
 // Offer represents an available GPU instance from a provider.

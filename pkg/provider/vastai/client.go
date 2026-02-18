@@ -60,6 +60,7 @@ type BundleOffer struct {
 // InstanceCreateRequest is the body for creating an instance on Vast.ai.
 // RunType should be "ssh_proxy" or "ssh_direc" when using Onstart scripts.
 // "args" mode uses the docker entrypoint and ignores Onstart.
+// Set VM to true to provision a full virtual machine instead of a Docker container.
 type InstanceCreateRequest struct {
 	Image     string            `json:"image"`
 	Disk      float64           `json:"disk"`
@@ -67,6 +68,7 @@ type InstanceCreateRequest struct {
 	Env       map[string]string `json:"env,omitempty"`
 	RunType   string            `json:"runtype"`
 	OpenPorts string            `json:"open_ports,omitempty"`
+	VM        bool              `json:"vm,omitempty"`
 }
 
 // InstanceResponse represents an instance returned by the Vast.ai API.
