@@ -120,6 +120,7 @@ func GenerateScript(config provider.BootstrapConfig) string {
 	sb.WriteString(fmt.Sprintf("  --node-label=gpuscale.io/provider=%s \\\n", SanitizeLabel(config.ProviderName)))
 	sb.WriteString("  --node-label=gpuscale.io/gpu-type=${GPU_LABEL} \\\n")
 	sb.WriteString(fmt.Sprintf("  --node-label=gpuscale.io/instance-id=%s \\\n", config.InstanceID))
+	sb.WriteString("  --node-label=nvidia.com/gpu.present=true \\\n")
 	sb.WriteString("  --node-taint=nvidia.com/gpu:NoSchedule\"\n\n")
 
 	sb.WriteString("INSTALL_K3S_VERSION=\"${K3S_VERSION:-}\" \\\n")
