@@ -78,7 +78,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 		offers = append(offers, provider.Offer{
 			ProviderName: p.Name(),
-			OfferID:      t.ID,
+			OfferID:      t.InstanceType,
 			GPUType:      gpuType,
 			GPUCount:     gpuCount,
 			VRAM:         vramGB,
