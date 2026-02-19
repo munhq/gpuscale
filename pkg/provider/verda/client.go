@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -382,13 +383,25 @@ func (c *Client) CreateStartupScript(ctx context.Context, name, script string) (
 		return nil, fmt.Errorf("verda create script returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Verda API may return data as an object {"data": {"id": "...", "name": "..."}}
-	// or as a raw value {"data": 12345}. Handle both.
+	// Verda API returns the script ID in various formats:
+	// 1. Plain text UUID: "7feed3e4-cba3-43a2-b7b2-15a18abb9add"
+	// 2. JSON wrapped: {"data": {"id": "...", "name": "..."}}
+	// 3. JSON raw value: {"data": "some-id"}
+	// Try plain text first (most common), then JSON variants.
+	bodyStr := strings.TrimSpace(string(body))
+
+	// Plain text UUID or ID — not valid JSON
+	if len(bodyStr) > 0 && bodyStr[0] != '{' && bodyStr[0] != '[' {
+		return &StartupScriptResponse{ID: bodyStr, Name: name}, nil
+	}
+
+	// JSON wrapped response
 	var raw struct {
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("decoding response: %w (body: %s)", err, string(body))
+		// Last resort: treat entire body as the ID
+		return &StartupScriptResponse{ID: bodyStr, Name: name}, nil
 	}
 
 	var result StartupScriptResponse
@@ -406,5 +419,5 @@ func (c *Client) CreateStartupScript(ctx context.Context, name, script string) (
 		return &StartupScriptResponse{ID: strID, Name: name}, nil
 	}
 
-	return nil, fmt.Errorf("unexpected data format in response: %s", string(body))
+	return nil, fmt.Errorf("unexpected data format in response: %s", bodyStr)
 }
