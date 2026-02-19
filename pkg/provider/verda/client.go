@@ -232,13 +232,14 @@ func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isS
 
 // CreateInstanceRequest is the body for creating a Verda instance.
 type CreateInstanceRequest struct {
-	InstanceType    string   `json:"instance_type"`
-	Image           string   `json:"image"`
+	InstanceType    string    `json:"instance_type"`
+	Image           string    `json:"image"`
+	Description     string    `json:"description"`
 	SSHKeyIDs       *[]string `json:"ssh_key_ids"` // must be null, not omitted — Verda rejects missing field
-	Hostname        string   `json:"hostname"`
-	StartupScriptID string   `json:"startup_script_id,omitempty"`
-	LocationCode    string   `json:"location_code,omitempty"`
-	IsSpot          bool     `json:"is_spot"`
+	Hostname        string    `json:"hostname"`
+	StartupScriptID string    `json:"startup_script_id,omitempty"`
+	LocationCode    string    `json:"location_code,omitempty"`
+	IsSpot          bool      `json:"is_spot"`
 }
 
 // InstanceResponse represents a Verda instance.

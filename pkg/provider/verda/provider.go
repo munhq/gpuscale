@@ -119,6 +119,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	createReq := CreateInstanceRequest{
 		InstanceType:    offer.OfferID,
 		Image:           verdaImage,
+		Description:     fmt.Sprintf("gpuscale %s", config.InstanceID),
 		Hostname:        fmt.Sprintf("gpuscale-%s", config.InstanceID),
 		StartupScriptID: scriptResp.ID,
 		IsSpot:          offer.CapacityType == "spot",
