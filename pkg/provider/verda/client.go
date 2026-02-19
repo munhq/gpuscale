@@ -234,7 +234,7 @@ func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isS
 type CreateInstanceRequest struct {
 	InstanceType    string   `json:"instance_type"`
 	Image           string   `json:"image"`
-	SSHKeyIDs       []string `json:"ssh_key_ids,omitempty"`
+	SSHKeyIDs       *[]string `json:"ssh_key_ids"` // must be null, not omitted — Verda rejects missing field
 	Hostname        string   `json:"hostname"`
 	StartupScriptID string   `json:"startup_script_id,omitempty"`
 	LocationCode    string   `json:"location_code,omitempty"`
