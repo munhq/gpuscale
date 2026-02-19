@@ -36,6 +36,11 @@ func (r *ProvisionTrigger) Start(ctx context.Context) error {
 	log := r.Log
 	log.Info("Starting provision trigger subscriber")
 
+	// Reconcile on startup: check Redis queues for requests that were
+	// orphaned by a controller restart (pub/sub is fire-and-forget).
+	time.Sleep(5 * time.Second) // let claims populate first
+	r.reconcileQueues(ctx)
+
 	ch := r.DemandStore.SubscribeProvisionTrigger(ctx)
 
 	// Debounce: track recently handled models to avoid duplicate claims
@@ -195,6 +200,31 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		"minVRAM", cfg.VRAMRequired,
 	)
 	return nil
+}
+
+// reconcileQueues checks all model queues in Redis for orphaned requests
+// that have no active claim. This catches requests lost during controller restarts.
+func (r *ProvisionTrigger) reconcileQueues(ctx context.Context) {
+	log := r.Log
+	demands, err := r.DemandStore.GetAllDemands(ctx)
+	if err != nil {
+		log.Error(err, "Startup reconcile: failed to get demands")
+		return
+	}
+
+	for _, d := range demands {
+		if d.QueueDepth == 0 && d.ActiveDemand == 0 {
+			continue
+		}
+		log.Info("Startup reconcile: found queued demand",
+			"model", d.Model,
+			"queue", d.QueueDepth,
+			"active", d.ActiveDemand,
+		)
+		if err := r.handleTrigger(ctx, d.Model); err != nil {
+			log.Error(err, "Startup reconcile: failed to trigger", "model", d.Model)
+		}
+	}
 }
 
 // findPoolByNodeType returns the pool whose provider nodeType matches the
