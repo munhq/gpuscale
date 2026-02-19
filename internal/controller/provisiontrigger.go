@@ -142,6 +142,9 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	if cfg.VRAMRequired > 24 {
 		gpuCount = (cfg.VRAMRequired + 23) / 24 // ceil(vram/24)
 	}
+	if cfg.MaxGPUCount > 0 && gpuCount > cfg.MaxGPUCount {
+		gpuCount = cfg.MaxGPUCount
+	}
 
 	maxPrice := 0.0
 	if cfg.MaxPricePerGPU > 0 {
