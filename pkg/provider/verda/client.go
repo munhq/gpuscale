@@ -320,13 +320,24 @@ func (c *Client) ListInstances(ctx context.Context) ([]InstanceResponse, error) 
 		return nil, fmt.Errorf("verda list instances returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result struct {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	// Try raw array first (current API format), fall back to wrapped object.
+	var instances []InstanceResponse
+	if err := json.Unmarshal(body, &instances); err == nil {
+		return instances, nil
+	}
+
+	var wrapped struct {
 		Data []InstanceResponse `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &wrapped); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
-	return result.Data, nil
+	return wrapped.Data, nil
 }
 
 // InstanceActionRequest represents an action to perform on instances.
@@ -352,6 +363,45 @@ func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
 		return fmt.Errorf("verda delete returned %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// SSHKeyResponse represents an SSH key in the Verda account.
+type SSHKeyResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ListSSHKeys returns all SSH keys in the account.
+func (c *Client) ListSSHKeys(ctx context.Context) ([]SSHKeyResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/ssh-keys", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda ssh-keys returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	// Try raw array first, fall back to wrapped object.
+	var keys []SSHKeyResponse
+	if err := json.Unmarshal(body, &keys); err == nil {
+		return keys, nil
+	}
+
+	var wrapped struct {
+		Data []SSHKeyResponse `json:"data"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("decoding ssh-keys response: %w", err)
+	}
+	return wrapped.Data, nil
 }
 
 // CreateStartupScriptRequest is the body for creating a startup script.

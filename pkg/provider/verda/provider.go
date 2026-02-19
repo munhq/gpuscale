@@ -116,10 +116,25 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		verdaImage = "ubuntu-24.04-cuda-12.8-open-docker"
 	}
 
+	// Fetch SSH keys from account — required for non-OS-volume images.
+	sshKeys, err := p.client.ListSSHKeys(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing ssh keys: %w", err)
+	}
+	var sshKeyIDs []string
+	for _, k := range sshKeys {
+		sshKeyIDs = append(sshKeyIDs, k.ID)
+	}
+	var sshKeyIDsPtr *[]string
+	if len(sshKeyIDs) > 0 {
+		sshKeyIDsPtr = &sshKeyIDs
+	}
+
 	createReq := CreateInstanceRequest{
 		InstanceType:    offer.OfferID,
 		Image:           verdaImage,
 		Description:     fmt.Sprintf("gpuscale %s", config.InstanceID),
+		SSHKeyIDs:       sshKeyIDsPtr,
 		Hostname:        fmt.Sprintf("gpuscale-%s", config.InstanceID),
 		StartupScriptID: scriptResp.ID,
 		IsSpot:          offer.CapacityType == "spot",
