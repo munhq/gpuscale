@@ -202,6 +202,19 @@ func main() {
 		setupLog.Info("Provision trigger subscriber enabled (cold-start via pub/sub)")
 	}
 
+	// Instance garbage collector — destroys orphaned provider instances
+	// that don't have a matching GPUNodeClaim (catches restarts, failed finalizers).
+	instanceGC := gpucontroller.NewInstanceGC(
+		mgr.GetClient(),
+		ctrl.Log.WithName("instance-gc"),
+		registry,
+		5*time.Minute,
+	)
+	if err := instanceGC.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create instance GC")
+		os.Exit(1)
+	}
+
 	// Health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Unable to set up health check")
