@@ -269,17 +269,30 @@ func (c *Client) CreateInstance(ctx context.Context, createReq CreateInstanceReq
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
 		return nil, fmt.Errorf("verda create returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result struct {
+	bodyStr := strings.TrimSpace(string(body))
+
+	// Verda may return just the instance ID as plain text (common with 202).
+	if len(bodyStr) > 0 && bodyStr[0] != '{' && bodyStr[0] != '[' {
+		return &InstanceResponse{ID: bodyStr, Status: "starting"}, nil
+	}
+
+	// Try {"data": {...}} wrapper first, then raw object.
+	var wrapped struct {
 		Data InstanceResponse `json:"data"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w (body: %s)", err, string(body))
+	if err := json.Unmarshal(body, &wrapped); err == nil && wrapped.Data.ID != "" {
+		return &wrapped.Data, nil
 	}
-	return &result.Data, nil
+
+	var result InstanceResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding response: %w (body: %s)", err, bodyStr)
+	}
+	return &result, nil
 }
 
 // GetInstance returns details for a specific instance.
@@ -358,7 +371,7 @@ func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("verda delete returned %d: %s", resp.StatusCode, string(body))
 	}
