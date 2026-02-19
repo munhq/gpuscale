@@ -224,6 +224,22 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		}
 	}
 
+	// Determine model from demand data — needed for pool selection and dedup.
+	modelID := ""
+	if r.DemandStore != nil {
+		demands, err := r.DemandStore.GetAllDemands(ctx)
+		if err == nil {
+			var maxDemand int64
+			for _, d := range demands {
+				total := d.QueueDepth + d.ActiveDemand
+				if total > maxDemand || d.AlwaysActive {
+					maxDemand = total
+					modelID = d.Model
+				}
+			}
+		}
+	}
+
 	// Find the matching GPUNodePool
 	var pools v1alpha1.GPUNodePoolList
 	if err := r.List(ctx, &pools); err != nil {
@@ -238,8 +254,14 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		return
 	}
 
-	// Use first matching pool (future: match based on requirements)
-	pool := &pools.Items[0]
+	// Match pool by nodeType from model config (full-node → Verda pool, ray-worker → default pool)
+	modelNodeType := "ray-worker"
+	if r.DemandStore != nil && modelID != "" {
+		if mcfg, err := r.DemandStore.GetModelConfig(ctx, modelID); err == nil && mcfg != nil && mcfg.NodeType != "" {
+			modelNodeType = mcfg.NodeType
+		}
+	}
+	pool := findPoolByNodeType(pools.Items, modelNodeType)
 
 	// Check pool limits
 	if err := r.checkPoolLimits(ctx, pool); err != nil {
@@ -287,21 +309,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		nodeType = pool.Spec.Providers[0].NodeType
 	}
 
-	// Determine model from demand data for dedup in ProvisionTrigger
-	modelID := ""
-	if r.DemandStore != nil {
-		demands, err := r.DemandStore.GetAllDemands(ctx)
-		if err == nil {
-			var maxDemand int64
-			for _, d := range demands {
-				total := d.QueueDepth + d.ActiveDemand
-				if total > maxDemand || d.AlwaysActive {
-					maxDemand = total
-					modelID = d.Model
-				}
-			}
-		}
-	}
+	// modelID already determined above for pool selection
 
 	claim := &v1alpha1.GPUNodeClaim{
 		ObjectMeta: metav1.ObjectMeta{

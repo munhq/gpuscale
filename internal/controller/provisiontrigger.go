@@ -108,7 +108,7 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		return fmt.Errorf("model %q not found in config", model)
 	}
 
-	// Find a pool
+	// Find a pool matching this model's nodeType
 	var pools v1alpha1.GPUNodePoolList
 	if err := r.List(ctx, &pools); err != nil {
 		return fmt.Errorf("listing pools: %w", err)
@@ -116,7 +116,7 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	if len(pools.Items) == 0 {
 		return fmt.Errorf("no GPUNodePools configured")
 	}
-	pool := &pools.Items[0]
+	pool := findPoolByNodeType(pools.Items, cfg.NodeType)
 
 	// Check pool limits
 	activeCount := 0
@@ -192,6 +192,22 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		"minVRAM", cfg.VRAMRequired,
 	)
 	return nil
+}
+
+// findPoolByNodeType returns the pool whose provider nodeType matches the
+// requested nodeType. Falls back to the first pool if no match is found.
+func findPoolByNodeType(pools []v1alpha1.GPUNodePool, nodeType string) *v1alpha1.GPUNodePool {
+	if nodeType == "" {
+		nodeType = "ray-worker"
+	}
+	for i := range pools {
+		for _, p := range pools[i].Spec.Providers {
+			if p.NodeType == nodeType {
+				return &pools[i]
+			}
+		}
+	}
+	return &pools[0]
 }
 
 // SetupWithManager registers this controller as a Runnable.
