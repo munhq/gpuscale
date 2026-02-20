@@ -378,6 +378,62 @@ func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
 	return nil
 }
 
+// VolumeResponse represents a storage volume in the Verda account.
+type VolumeResponse struct {
+	ID         string `json:"id"`
+	InstanceID string `json:"instance_id"`
+	Name       string `json:"name"`
+	Status     string `json:"status"` // "attached", "detached"
+	IsOSVolume bool   `json:"is_os_volume"`
+}
+
+// ListVolumes returns all volumes in the account.
+func (c *Client) ListVolumes(ctx context.Context) ([]VolumeResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/volumes", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda volumes returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	var vols []VolumeResponse
+	if err := json.Unmarshal(body, &vols); err == nil {
+		return vols, nil
+	}
+
+	var wrapped struct {
+		Data []VolumeResponse `json:"data"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("decoding volumes response: %w", err)
+	}
+	return wrapped.Data, nil
+}
+
+// DeleteVolume deletes a storage volume.
+func (c *Client) DeleteVolume(ctx context.Context, volumeID string) error {
+	resp, err := c.doRequest(ctx, http.MethodDelete, "/volumes/"+volumeID, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verda delete volume returned %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // SSHKeyResponse represents an SSH key in the Verda account.
 type SSHKeyResponse struct {
 	ID   string `json:"id"`

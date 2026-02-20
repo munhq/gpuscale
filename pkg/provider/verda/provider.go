@@ -110,13 +110,20 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating startup script: %w", err)
 	}
 
-	// Use image from pool bootstrap spec if provided, else fall back to Verda's default.
+	// Try to reuse a detached OS volume — boots faster since packages are
+	// already installed (Netbird, K3s, NVIDIA toolkit, etc.).
+	// Pass the volume UUID as the "image" field; Verda boots from it directly.
 	verdaImage := config.Image
 	if verdaImage == "" {
 		verdaImage = "ubuntu-24.04-cuda-12.8-open-docker"
 	}
+	if vol := p.findReusableVolume(ctx); vol != "" {
+		verdaImage = vol
+	}
 
 	// Fetch SSH keys from account — required for non-OS-volume images.
+	// When booting from a reused volume, SSH keys are already baked in,
+	// but Verda still requires the field.
 	sshKeys, err := p.client.ListSSHKeys(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing ssh keys: %w", err)
@@ -171,7 +178,41 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 }
 
 func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error {
-	return p.client.DeleteInstance(ctx, instanceID)
+	if err := p.client.DeleteInstance(ctx, instanceID); err != nil {
+		return err
+	}
+	// Delete all detached OS volumes to stop $10/mo charges.
+	// Verda allows restoring deleted volumes within 96h, so if a new
+	// request comes in we can recover one and boot from it.
+	p.cleanupDetachedVolumes(ctx)
+	return nil
+}
+
+func (p *Provider) cleanupDetachedVolumes(ctx context.Context) {
+	vols, err := p.client.ListVolumes(ctx)
+	if err != nil {
+		return
+	}
+	for _, v := range vols {
+		if v.Status == "detached" && v.IsOSVolume {
+			_ = p.client.DeleteVolume(ctx, v.ID)
+		}
+	}
+}
+
+// findReusableVolume returns the ID of a detached OS volume that can be
+// reused as the boot image for a new instance, or "" if none available.
+func (p *Provider) findReusableVolume(ctx context.Context) string {
+	vols, err := p.client.ListVolumes(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, v := range vols {
+		if v.Status == "detached" && v.IsOSVolume {
+			return v.ID
+		}
+	}
+	return ""
 }
 
 func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provider.Instance, error) {
