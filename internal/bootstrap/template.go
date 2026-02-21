@@ -56,7 +56,7 @@ SystemdCgroup = true
 C
 curl -sfL https://get.k3s.io -o /tmp/k3s.sh && chmod +x /tmp/k3s.sh
 GL=$(echo '%s'|tr ' ' '-'|tr '[:upper:]' '[:lower:]')
-INSTALL_K3S_EXEC="agent --node-name=%s --node-ip=$NB_IP --node-external-ip=$NB_IP --flannel-iface=wt0 --node-label=gpuscale.io/managed=true --node-label=gpuscale.io/provider=%s --node-label=gpuscale.io/gpu-type=$GL --node-label=gpuscale.io/instance-id=%s --node-label=nvidia.com/gpu.present=true --node-taint=nvidia.com/gpu:NoSchedule --kubelet-arg=eviction-hard=imagefs.available<0%,nodefs.available<1%"
+INSTALL_K3S_EXEC="agent --node-name=%s --node-ip=$NB_IP --node-external-ip=$NB_IP --flannel-iface=wt0 --node-label=gpuscale.io/managed=true --node-label=gpuscale.io/provider=%s --node-label=gpuscale.io/gpu-type=$GL --node-label=gpuscale.io/instance-id=%s --node-label=nvidia.com/gpu.present=true --node-taint=nvidia.com/gpu:NoSchedule --kubelet-arg=eviction-hard=imagefs.available<0%%,nodefs.available<1%%"
 K3S_URL='%s' K3S_TOKEN='%s' INSTALL_K3S_EXEC="$INSTALL_K3S_EXEC" /tmp/k3s.sh
 echo '[gpuscale] done'
 `, config.NetbirdKey,
