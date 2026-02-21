@@ -44,7 +44,7 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&healthProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.DurationVar(&batchWindow, "batch-window", 10*time.Second, "Duration to batch pending pods before provisioning.")
-	flag.DurationVar(&cooldownPeriod, "cooldown-period", 10*time.Minute, "Duration to wait before destroying idle nodes.")
+	flag.DurationVar(&cooldownPeriod, "cooldown-period", 5*time.Minute, "Duration to wait before destroying idle nodes.")
 	flag.DurationVar(&interruptionInterval, "interruption-poll-interval", 30*time.Second, "Interval for polling provider APIs for interruptions.")
 	flag.DurationVar(&workerMetricsInterval, "worker-metrics-interval", 1*time.Minute, "Interval for scraping vLLM metrics from workers.")
 
@@ -77,8 +77,10 @@ func main() {
 		registry.Register(vastai.New(key))
 		setupLog.Info("Registered provider: vast.ai")
 	}
+	var verdaProvider *verda.Provider
 	if clientID, clientSecret := os.Getenv("VERDA_CLIENT_ID"), os.Getenv("VERDA_CLIENT_SECRET"); clientID != "" && clientSecret != "" {
-		registry.Register(verda.New(clientID, clientSecret))
+		verdaProvider = verda.New(clientID, clientSecret)
+		registry.Register(verdaProvider)
 		setupLog.Info("Registered provider: verda")
 	}
 	if key := os.Getenv("RUNPOD_API_KEY"); key != "" {
@@ -107,6 +109,12 @@ func main() {
 		setupLog.Info("Demand store disabled (no REDIS_URL or connection failed)")
 	}
 
+	// Wire volume store to Verda provider for model-aware volume reuse.
+	if verdaProvider != nil && demandStore != nil {
+		verdaProvider.SetVolumeStore(demandStore)
+		setupLog.Info("Verda volume store enabled (model-aware volume reuse)")
+	}
+
 	// Ray capacity store — queries Ray cluster for GPU capacity
 	namespace := os.Getenv("POD_NAMESPACE")
 	if namespace == "" {
@@ -133,7 +141,7 @@ func main() {
 	})
 
 	// Set up controllers
-	// ProvisioningController watches pending GPU pods (created by KEDA) and creates claims
+	// ProvisioningController watches pending GPU pods (from Ray autoscaler or KEDA) and creates claims
 	provisioningCtrl := gpucontroller.NewProvisioningController(
 		mgr.GetClient(),
 		ctrl.Log.WithName("provisioner"),
@@ -167,6 +175,7 @@ func main() {
 	claimReconciler.Coordinator = coord
 	claimReconciler.WorkerStore = workerStore
 	claimReconciler.DemandStore = demandStore
+	claimReconciler.RayCapacityStore = rayCapacityStore
 	if rayHead := os.Getenv("RAY_HEAD_ADDRESS"); rayHead != "" {
 		claimReconciler.RayHeadAddress = rayHead
 		setupLog.Info("Ray head address configured from env", "address", rayHead)

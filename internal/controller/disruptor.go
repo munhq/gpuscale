@@ -69,6 +69,17 @@ func (r *DisruptionController) Reconcile(ctx context.Context, req ctrl.Request) 
 // --- Full-node path: pod-based idle detection on Kubernetes nodes ---
 
 func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	modelID := claim.Spec.ModelID
+
+	// Always-active models are never destroyed, regardless of pod state.
+	if r.isModelAlwaysActive(ctx, modelID) {
+		if claim.Status.IdleSince != nil {
+			claim.Status.IdleSince = nil
+			_ = r.Status().Update(ctx, claim)
+		}
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+
 	nodeName := claim.Status.NodeName
 	if nodeName == "" {
 		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
@@ -98,6 +109,10 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
+	// Node is idle (no GPU pods). Enter cooldown → destroy.
+	// If requests are still queued, ProvisionTrigger will provision a new node.
+	// Request TTL (REQUEST_QUEUE_TTL_SECONDS) handles giving users a failure
+	// response if no capacity appears in time.
 	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
 		return r.drainAndDestroy(ctx, &node, claim, log)
 	})

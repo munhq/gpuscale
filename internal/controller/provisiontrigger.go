@@ -15,7 +15,8 @@ import (
 
 // ProvisionTrigger subscribes to the gpuscale:provision pub/sub channel
 // and creates GPUNodeClaims instantly when a cold-start request arrives.
-// This bypasses the KEDA → demand pods → provisioner pipeline entirely.
+// It also runs periodic queue reconciliation (every 60s) as a safety net
+// to catch orphaned requests from controller restarts or broken autoscalers.
 type ProvisionTrigger struct {
 	client.Client
 	Log         logr.Logger
@@ -47,11 +48,18 @@ func (r *ProvisionTrigger) Start(ctx context.Context) error {
 	// from rapid-fire requests for the same model.
 	recentlyHandled := make(map[string]time.Time)
 
+	// Safety net: periodic queue reconciliation catches orphaned requests
+	// from controller restarts, lost pub/sub messages, or broken Ray autoscaler.
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("Provision trigger shutting down")
 			return nil
+		case <-ticker.C:
+			r.reconcileQueues(ctx)
 		case model, ok := <-ch:
 			if !ok {
 				log.Info("Provision trigger channel closed")
@@ -203,12 +211,13 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 }
 
 // reconcileQueues checks all model queues in Redis for orphaned requests
-// that have no active claim. This catches requests lost during controller restarts.
+// that have no active claim. Runs on startup and every 60s as a safety net
+// for controller restarts, lost pub/sub messages, or broken Ray autoscaler.
 func (r *ProvisionTrigger) reconcileQueues(ctx context.Context) {
 	log := r.Log
 	demands, err := r.DemandStore.GetAllDemands(ctx)
 	if err != nil {
-		log.Error(err, "Startup reconcile: failed to get demands")
+		log.Error(err, "Queue reconcile: failed to get demands")
 		return
 	}
 
@@ -216,13 +225,13 @@ func (r *ProvisionTrigger) reconcileQueues(ctx context.Context) {
 		if d.QueueDepth == 0 && d.ActiveDemand == 0 {
 			continue
 		}
-		log.Info("Startup reconcile: found queued demand",
+		log.Info("Queue reconcile: found queued demand",
 			"model", d.Model,
 			"queue", d.QueueDepth,
 			"active", d.ActiveDemand,
 		)
 		if err := r.handleTrigger(ctx, d.Model); err != nil {
-			log.Error(err, "Startup reconcile: failed to trigger", "model", d.Model)
+			log.Error(err, "Queue reconcile: failed to trigger", "model", d.Model)
 		}
 	}
 }

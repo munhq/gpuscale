@@ -12,7 +12,8 @@ import (
 
 // Provider implements the provider.Provider interface for Verda.
 type Provider struct {
-	client *Client
+	client      *Client
+	volumeStore provider.VolumeStore
 }
 
 // New creates a new Verda provider.
@@ -20,6 +21,12 @@ func New(clientID, clientSecret string) *Provider {
 	return &Provider{
 		client: NewClient(clientID, clientSecret),
 	}
+}
+
+// SetVolumeStore configures the external volume→model tracking store.
+// Required for model-aware volume reuse since Verda has no native volume tags.
+func (p *Provider) SetVolumeStore(vs provider.VolumeStore) {
+	p.volumeStore = vs
 }
 
 func (p *Provider) Name() string {
@@ -117,7 +124,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	if verdaImage == "" {
 		verdaImage = "ubuntu-24.04-cuda-12.8-open-docker"
 	}
-	if vol := p.findReusableVolume(ctx); vol != "" {
+	if vol := p.findReusableVolume(ctx, config.ModelID); vol != "" {
 		verdaImage = vol
 	}
 
@@ -140,7 +147,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	createReq := CreateInstanceRequest{
 		InstanceType:    offer.OfferID,
 		Image:           verdaImage,
-		Description:     fmt.Sprintf("gpuscale %s", config.InstanceID),
+		Description:     fmt.Sprintf("gpuscale %s model=%s", config.InstanceID, config.ModelID),
 		SSHKeyIDs:       sshKeyIDsPtr,
 		Hostname:        fmt.Sprintf("gpuscale-%s", config.InstanceID),
 		StartupScriptID: scriptResp.ID,
@@ -150,6 +157,11 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	resp, err := p.client.CreateInstance(ctx, createReq)
 	if err != nil {
 		return nil, fmt.Errorf("creating verda instance: %w", err)
+	}
+
+	// Track instance→model so we can tag its volume at destroy time.
+	if p.volumeStore != nil && config.ModelID != "" {
+		_ = p.volumeStore.RegisterInstanceModel(ctx, resp.ID, config.ModelID)
 	}
 
 	// Build endpoint for ray-worker type
@@ -178,10 +190,24 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 }
 
 func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error {
+	// Before destroying, discover the attached volume and register it for
+	// model-aware reuse. Verda has no volume tags, so we track this in Redis.
+	if p.volumeStore != nil {
+		if modelID := p.volumeStore.GetInstanceModel(ctx, instanceID); modelID != "" {
+			if vols, err := p.client.ListVolumes(ctx); err == nil {
+				for _, v := range vols {
+					if v.InstanceID == instanceID && v.IsOSVolume {
+						_ = p.volumeStore.RegisterVolume(ctx, v.ID, modelID, instanceID)
+					}
+				}
+			}
+		}
+	}
+
 	if err := p.client.DeleteInstance(ctx, instanceID); err != nil {
 		return err
 	}
-	// Delete all detached OS volumes to stop $10/mo charges.
+	// Delete detached OS volumes to stop $10/mo charges.
 	// Verda allows restoring deleted volumes within 96h, so if a new
 	// request comes in we can recover one and boot from it.
 	p.cleanupDetachedVolumes(ctx)
@@ -200,18 +226,62 @@ func (p *Provider) cleanupDetachedVolumes(ctx context.Context) {
 	}
 }
 
-// findReusableVolume returns the ID of a detached OS volume that can be
-// reused as the boot image for a new instance, or "" if none available.
-func (p *Provider) findReusableVolume(ctx context.Context) string {
+// findReusableVolume returns the ID of a detached or recently deleted (trash)
+// OS volume that can be reused as the boot image for a new instance.
+// Prioritizes volumes tracked in Redis as serving the same model.
+// Falls back to any detached OS volume (still has CUDA/deps installed).
+func (p *Provider) findReusableVolume(ctx context.Context, modelID string) string {
+	// Look up the best volume for this model from Redis registry.
+	var trackedVolumeID string
+	if p.volumeStore != nil && modelID != "" {
+		trackedVolumeID = p.volumeStore.FindVolumeForModel(ctx, modelID)
+	}
+
+	// 1. Check for already detached volumes
 	vols, err := p.client.ListVolumes(ctx)
+	if err == nil {
+		// First: exact model match from Redis registry
+		if trackedVolumeID != "" {
+			for _, v := range vols {
+				if v.ID == trackedVolumeID && v.Status == "detached" && v.IsOSVolume {
+					return v.ID
+				}
+			}
+		}
+		// Second: any detached OS volume (still has CUDA/K3s/deps)
+		for _, v := range vols {
+			if v.Status == "detached" && v.IsOSVolume {
+				return v.ID
+			}
+		}
+	}
+
+	// 2. Check the trash for recoverable volumes (96h window)
+	trashVols, err := p.client.ListDeletedVolumes(ctx)
 	if err != nil {
 		return ""
 	}
-	for _, v := range vols {
-		if v.Status == "detached" && v.IsOSVolume {
-			return v.ID
+
+	// First: exact model match in trash via Redis registry
+	if trackedVolumeID != "" {
+		for _, v := range trashVols {
+			if v.ID == trackedVolumeID && v.IsOSVolume {
+				if err := p.client.RestoreVolume(ctx, v.ID); err == nil {
+					return v.ID
+				}
+			}
 		}
 	}
+
+	// Second: any OS volume in trash
+	for _, v := range trashVols {
+		if v.IsOSVolume {
+			if err := p.client.RestoreVolume(ctx, v.ID); err == nil {
+				return v.ID
+			}
+		}
+	}
+
 	return ""
 }
 

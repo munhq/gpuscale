@@ -52,6 +52,10 @@ type ClaimReconciler struct {
 	// used when the pool's rayConfig.headAddress is empty.
 	// Set from RAY_HEAD_ADDRESS env var.
 	RayHeadAddress string
+
+	// RayCapacityStore queries Ray Serve app status to confirm model readiness.
+	// Used in handleReady to gate SetModelLoaded until the model is actually RUNNING.
+	RayCapacityStore *RayCapacityStore
 }
 
 // SecretReader fetches secret values needed for bootstrap.
@@ -554,21 +558,14 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 		log.Error(err, "Failed to publish worker to Dragonfly")
 	}
 
-	// Mark model as loaded in Dragonfly — GPU API reads this instantly
+	// Node is Ready but the model is NOT loaded yet — KubeRay still needs to
+	// create a worker pod and Ray Serve needs to deploy the model.
+	// Publish a "try drain" event so GPU API's queue processor sends a request
+	// to Ray Serve, which triggers autoscaling. The actual loaded_models key
+	// is set in handleReady once we confirm the Ray Serve app is RUNNING.
 	if claim.Spec.ModelID != "" && r.DemandStore != nil {
-		info := LoadedModelInfo{
-			ClaimName:  claim.Name,
-			Provider:   claim.Status.Provider,
-			GPUType:    claim.Status.GPUType,
-			GPUCount:   claim.Status.GPUCount,
-			InstanceID: claim.Status.InstanceID,
-			ReadyAt:    now.Time.Format(time.RFC3339),
-		}
-		if err := r.DemandStore.SetModelLoaded(ctx, claim.Spec.ModelID, info); err != nil {
-			log.Error(err, "Failed to set loaded_models", "model", claim.Spec.ModelID)
-		} else {
-			log.Info("Model marked as loaded", "model", claim.Spec.ModelID)
-		}
+		r.DemandStore.PublishModelAvailable(ctx, claim.Spec.ModelID)
+		log.Info("Published model available (triggering queue drain attempt)", "model", claim.Spec.ModelID)
 	}
 
 	if claim.Status.ProvisionedAt != nil {
@@ -649,21 +646,12 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 		log.Error(err, "Failed to publish worker to Dragonfly")
 	}
 
-	// Mark model as loaded in Dragonfly — GPU API reads this instantly
+	// Worker joined Ray but the model may not be deployed yet.
+	// Publish "try drain" event; actual loaded_models set in handleReady
+	// once Ray Serve confirms RUNNING.
 	if claim.Spec.ModelID != "" && r.DemandStore != nil {
-		info := LoadedModelInfo{
-			ClaimName:  claim.Name,
-			Provider:   claim.Status.Provider,
-			GPUType:    claim.Status.GPUType,
-			GPUCount:   claim.Status.GPUCount,
-			InstanceID: claim.Status.InstanceID,
-			ReadyAt:    now.Time.Format(time.RFC3339),
-		}
-		if err := r.DemandStore.SetModelLoaded(ctx, claim.Spec.ModelID, info); err != nil {
-			log.Error(err, "Failed to set loaded_models", "model", claim.Spec.ModelID)
-		} else {
-			log.Info("Model marked as loaded", "model", claim.Spec.ModelID)
-		}
+		r.DemandStore.PublishModelAvailable(ctx, claim.Spec.ModelID)
+		log.Info("Published model available (triggering queue drain attempt)", "model", claim.Spec.ModelID)
 	}
 
 	if claim.Status.ProvisionedAt != nil {
@@ -819,6 +807,40 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 			}
 			r.retriggerIfDemandExists(ctx, claim, log)
 			return ctrl.Result{}, nil
+		}
+	}
+
+	// Check if the model is actually serving in Ray Serve.
+	// SetModelLoaded is NOT called at transition-to-Ready (it was premature there).
+	// Instead, we check here on every 60s tick until the model is confirmed RUNNING.
+	if claim.Spec.ModelID != "" && r.DemandStore != nil && r.RayCapacityStore != nil {
+		if !r.DemandStore.IsModelLoaded(ctx, claim.Spec.ModelID) {
+			statuses, err := r.RayCapacityStore.GetServeAppStatus(ctx)
+			if err == nil {
+				for _, app := range statuses {
+					if app.Name == claim.Spec.ModelID && app.Status == "RUNNING" {
+						info := LoadedModelInfo{
+							ClaimName:  claim.Name,
+							Provider:   claim.Status.Provider,
+							GPUType:    claim.Status.GPUType,
+							GPUCount:   claim.Status.GPUCount,
+							InstanceID: claim.Status.InstanceID,
+							ReadyAt:    time.Now().Format(time.RFC3339),
+						}
+						if err := r.DemandStore.SetModelLoaded(ctx, claim.Spec.ModelID, info); err != nil {
+							log.Error(err, "Failed to set model as loaded", "model", claim.Spec.ModelID)
+						} else {
+							log.Info("Model confirmed RUNNING in Ray Serve, marked as loaded",
+								"model", claim.Spec.ModelID)
+						}
+						break
+					}
+				}
+			}
+			// Model not RUNNING yet — re-publish availability so queue processor retries
+			if !r.DemandStore.IsModelLoaded(ctx, claim.Spec.ModelID) {
+				r.DemandStore.PublishModelAvailable(ctx, claim.Spec.ModelID)
+			}
 		}
 	}
 

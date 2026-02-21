@@ -113,6 +113,27 @@ type Provider interface {
 	ListInstances(ctx context.Context) ([]*Instance, error)
 }
 
+// VolumeStore tracks volume→model mappings for cloud providers that don't
+// support native volume tags. Providers use this to find model-specific
+// volumes when reusing boot images.
+type VolumeStore interface {
+	// RegisterInstanceModel records which model an instance is serving.
+	// Called at CreateInstance time so we can later tag its volume.
+	RegisterInstanceModel(ctx context.Context, instanceID, modelID string) error
+
+	// GetInstanceModel returns the model ID for a given instance.
+	GetInstanceModel(ctx context.Context, instanceID string) string
+
+	// RegisterVolume records a volume→model mapping for later reuse.
+	RegisterVolume(ctx context.Context, volumeID, modelID, instanceID string) error
+
+	// FindVolumeForModel returns the ID of a tracked volume for the given model.
+	FindVolumeForModel(ctx context.Context, modelID string) string
+
+	// UnregisterVolume removes a volume tracking entry.
+	UnregisterVolume(ctx context.Context, volumeID string) error
+}
+
 // Registry holds all configured providers.
 type Registry struct {
 	providers map[string]Provider

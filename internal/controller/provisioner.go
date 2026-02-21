@@ -58,8 +58,9 @@ func NewProvisioningController(c client.Client, log logr.Logger, batchWindow tim
 
 // Reconcile processes pending GPU pods.
 // Dedup is demand-level: we count active (non-Terminated) claims and only
-// provision if there are more pending demand pods than active claims.
-// This prevents duplicate claims when pods get recreated (rolling updates).
+// provision if there are more pending GPU pods than active claims.
+// This counts ALL pending unschedulable GPU pods (Ray worker pods from the
+// in-tree autoscaler, or demand-signal pods from KEDA if enabled).
 func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pod", req.NamespacedName)
 
@@ -80,15 +81,15 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Demand-level dedup: count active claims vs pending demand pods.
+	// Demand-level dedup: count active claims vs pending GPU pods.
 	// If we already have enough claims in flight, don't create more.
 	activeClaims := r.countActiveClaims(ctx)
-	pendingDemandPods := r.countPendingDemandPods(ctx)
+	pendingGPUPods := r.countPendingGPUPods(ctx)
 
-	if activeClaims >= pendingDemandPods {
+	if activeClaims >= pendingGPUPods {
 		log.V(1).Info("Sufficient claims already exist",
 			"activeClaims", activeClaims,
-			"pendingDemandPods", pendingDemandPods,
+			"pendingGPUPods", pendingGPUPods,
 		)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -112,7 +113,7 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 
 	log.Info("Pod added to provisioning batch",
 		"activeClaims", activeClaims,
-		"pendingDemandPods", pendingDemandPods,
+		"pendingGPUPods", pendingGPUPods,
 	)
 	return ctrl.Result{}, nil
 }
@@ -134,15 +135,36 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	// Re-check dedup at batch processing time — the reconcile-time check
 	// may be stale because multiple pods can queue between check and batch fire.
 	activeClaims := r.countActiveClaims(ctx)
-	pendingDemandPods := r.countPendingDemandPods(ctx)
+	pendingGPUPods := r.countPendingGPUPods(ctx)
 	log.Info("Processing pending pod batch",
 		"activeClaims", activeClaims,
-		"pendingDemandPods", pendingDemandPods,
+		"pendingGPUPods", pendingGPUPods,
 	)
-	if activeClaims >= pendingDemandPods {
+	if activeClaims >= pendingGPUPods {
 		log.Info("Skipping batch: sufficient claims already exist")
 		r.releaseProvisioningLocks(batch)
 		return
+	}
+
+	// Health gate: don't provision if Ray Serve has DEPLOY_FAILED apps.
+	// Instead, attempt recovery by re-submitting the serve config.
+	if r.RayCapacityStore != nil {
+		statuses, err := r.RayCapacityStore.GetServeAppStatus(ctx)
+		if err == nil {
+			for _, app := range statuses {
+				if app.Status == "DEPLOY_FAILED" {
+					log.Error(nil, "Ray Serve DEPLOY_FAILED — attempting recovery instead of provisioning",
+						"app", app.Name)
+					if recoverErr := r.RayCapacityStore.ResubmitServeConfig(ctx); recoverErr != nil {
+						log.Error(recoverErr, "Failed to resubmit serve config")
+					} else {
+						log.Info("Resubmitted serve config to reset DEPLOY_FAILED")
+					}
+					r.releaseProvisioningLocks(batch)
+					return
+				}
+			}
+		}
 	}
 
 	// Query demand data from Dragonfly (Task #1: API queue metrics)
@@ -399,18 +421,20 @@ func (r *ProvisioningController) countActiveClaims(ctx context.Context) int {
 	return count
 }
 
-// countPendingDemandPods returns the number of pending GPU demand-signal pods.
-func (r *ProvisioningController) countPendingDemandPods(ctx context.Context) int {
+// countPendingGPUPods returns the number of pending, unschedulable GPU pods.
+// This counts ALL pending GPU pods — Ray worker pods from the in-tree
+// autoscaler as well as demand-signal pods from KEDA (if enabled).
+func (r *ProvisioningController) countPendingGPUPods(ctx context.Context) int {
 	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.MatchingLabels{
-		"app": "gpu-demand",
-	}); err != nil {
-		r.Log.Error(err, "Failed to list demand pods for dedup")
+	if err := r.List(ctx, &pods); err != nil {
+		r.Log.Error(err, "Failed to list pods for dedup")
 		return 0
 	}
 	count := 0
 	for _, p := range pods.Items {
-		if p.Status.Phase == corev1.PodPending {
+		if p.Status.Phase == corev1.PodPending &&
+			scheduler.IsGPUPod(&p) &&
+			scheduler.IsUnschedulable(&p) {
 			count++
 		}
 	}

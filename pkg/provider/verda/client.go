@@ -419,6 +419,53 @@ func (c *Client) ListVolumes(ctx context.Context) ([]VolumeResponse, error) {
 	return wrapped.Data, nil
 }
 
+// ListDeletedVolumes returns all volumes in the account's trash.
+func (c *Client) ListDeletedVolumes(ctx context.Context) ([]VolumeResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/volumes/trash", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("verda volumes trash returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	var vols []VolumeResponse
+	if err := json.Unmarshal(body, &vols); err == nil {
+		return vols, nil
+	}
+
+	var wrapped struct {
+		Data []VolumeResponse `json:"data"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("decoding volumes trash response: %w", err)
+	}
+	return wrapped.Data, nil
+}
+
+// RestoreVolume restores a deleted volume from the trash.
+func (c *Client) RestoreVolume(ctx context.Context, volumeID string) error {
+	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/volumes/%s/restore", volumeID), nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verda restore volume returned %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // DeleteVolume deletes a storage volume.
 func (c *Client) DeleteVolume(ctx context.Context, volumeID string) error {
 	resp, err := c.doRequest(ctx, http.MethodDelete, "/volumes/"+volumeID, nil)

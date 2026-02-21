@@ -246,6 +246,113 @@ func (r *RayCapacityStore) queryLoadedModels(ctx context.Context, serveURL strin
 	return models, nil
 }
 
+// ServeAppStatus represents the status of a Ray Serve application.
+type ServeAppStatus struct {
+	Name   string // application name (e.g., "qwen3-coder-next")
+	Status string // "RUNNING", "DEPLOY_FAILED", "DEPLOYING", "NOT_STARTED", "DELETING"
+}
+
+// serveApplicationsResponse is the response from Ray Dashboard GET /api/serve/applications/
+type serveApplicationsResponse struct {
+	Applications []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	} `json:"applications"`
+}
+
+// GetServeAppStatus queries Ray Dashboard for the status of all Serve applications.
+// Returns nil, nil if the dashboard is unreachable (non-fatal).
+func (r *RayCapacityStore) GetServeAppStatus(ctx context.Context) ([]ServeAppStatus, error) {
+	dashboardURL, _, err := r.discoverRayHead(ctx)
+	if err != nil {
+		return nil, nil // dashboard not available, not an error
+	}
+
+	url := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, nil // connection error is non-fatal
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Ray Serve status returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var serveResp serveApplicationsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&serveResp); err != nil {
+		return nil, fmt.Errorf("parsing Serve applications response: %w", err)
+	}
+
+	statuses := make([]ServeAppStatus, 0, len(serveResp.Applications))
+	for _, app := range serveResp.Applications {
+		statuses = append(statuses, ServeAppStatus{
+			Name:   app.Name,
+			Status: app.Status,
+		})
+	}
+	return statuses, nil
+}
+
+// ResubmitServeConfig re-submits the current Serve configuration to reset
+// DEPLOY_FAILED state. Reads current config, then PUTs it back.
+func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
+	dashboardURL, _, err := r.discoverRayHead(ctx)
+	if err != nil {
+		return fmt.Errorf("discovering Ray head: %w", err)
+	}
+
+	// GET current serve config
+	getURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
+	if err != nil {
+		return err
+	}
+
+	getResp, err := r.httpClient.Do(getReq)
+	if err != nil {
+		return fmt.Errorf("GET serve config: %w", err)
+	}
+	defer getResp.Body.Close()
+
+	if getResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getResp.Body)
+		return fmt.Errorf("GET serve config returned %d: %s", getResp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		return fmt.Errorf("reading serve config: %w", err)
+	}
+
+	// PUT the same config back to reset DEPLOY_FAILED
+	putURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+
+	putResp, err := r.httpClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("PUT serve config: %w", err)
+	}
+	defer putResp.Body.Close()
+
+	if putResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("PUT serve config returned %d: %s", putResp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
 // queryGPUUsage queries Prometheus for actual GPU memory usage and updates nodes.
 func (r *RayCapacityStore) queryGPUUsage(ctx context.Context, nodes []GPUNode) error {
 	// Query Prometheus for GPU memory usage

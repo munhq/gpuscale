@@ -352,12 +352,172 @@ func (s *DemandStore) SubscribeProvisionTrigger(ctx context.Context) <-chan stri
 	return ch
 }
 
+// PublishModelAvailable publishes a "try drain" event to the model_loaded channel
+// WITHOUT setting the loaded_models registry key. This triggers GPU API's queue
+// processor to attempt forwarding queued requests to Ray Serve, which in turn
+// triggers Ray Serve autoscaling. The actual loaded_models key is set later
+// when we confirm the Ray Serve application is RUNNING.
+func (s *DemandStore) PublishModelAvailable(ctx context.Context, model string) {
+	if s == nil || s.rdb == nil || model == "" {
+		return
+	}
+	s.rdb.Publish(ctx, modelLoadedChannel, model)
+}
+
 // PublishProvisionTrigger publishes a provision request (used by InterruptionController for auto-replace).
 func (s *DemandStore) PublishProvisionTrigger(ctx context.Context, model string) error {
 	if s == nil || s.rdb == nil {
 		return nil
 	}
 	return s.rdb.Publish(ctx, provisionChannel, model).Err()
+}
+
+// SyncLoadedModels force-syncs the loaded_models keys in Redis to match the
+// provided map of model -> info. It deletes any keys not in the map.
+func (s *DemandStore) SyncLoadedModels(ctx context.Context, clusterTruth map[string]LoadedModelInfo) error {
+	if s == nil || s.rdb == nil {
+		return nil
+	}
+
+	// 1. Get all current keys from Redis
+	existing, err := s.rdb.Keys(ctx, loadedModelPrefix+"*").Result()
+	if err != nil {
+		return fmt.Errorf("listing existing loaded models: %w", err)
+	}
+
+	// 2. Delete stale keys (not in clusterTruth)
+	for _, key := range existing {
+		model := key[len(loadedModelPrefix):]
+		if _, ok := clusterTruth[model]; !ok {
+			if err := s.rdb.Del(ctx, key).Err(); err != nil {
+				return fmt.Errorf("deleting stale loaded model %s: %w", model, err)
+			}
+		}
+	}
+
+	// 3. Upsert current keys (ensure data is correct)
+	for model, info := range clusterTruth {
+		if err := s.SetModelLoaded(ctx, model, info); err != nil {
+			return fmt.Errorf("updating loaded model %s: %w", model, err)
+		}
+	}
+
+	return nil
+}
+
+// --- Volume Registry (gpuscale:volume:{id} + gpuscale:instance_model:{id}) ---
+// Implements provider.VolumeStore so cloud providers can track volume→model
+// mappings for reuse (e.g., Verda volumes don't have native tags).
+
+const (
+	volumePrefix        = "gpuscale:volume:"
+	instanceModelPrefix = "gpuscale:instance_model:"
+)
+
+// VolumeInfo tracks a cloud provider volume for model-aware reuse.
+type VolumeInfo struct {
+	VolumeID   string `json:"volumeId"`
+	ModelID    string `json:"modelId"`
+	InstanceID string `json:"instanceId"`
+	Provider   string `json:"provider"`
+	CreatedAt  string `json:"createdAt"`
+}
+
+// RegisterInstanceModel records which model an instance serves.
+// Called at CreateInstance time so we can later tag its volume.
+func (s *DemandStore) RegisterInstanceModel(ctx context.Context, instanceID, modelID string) error {
+	if s == nil || s.rdb == nil || instanceID == "" {
+		return nil
+	}
+	return s.rdb.Set(ctx, instanceModelPrefix+instanceID, modelID, 24*time.Hour).Err()
+}
+
+// GetInstanceModel returns the model ID for a given instance.
+func (s *DemandStore) GetInstanceModel(ctx context.Context, instanceID string) string {
+	if s == nil || s.rdb == nil || instanceID == "" {
+		return ""
+	}
+	val, err := s.rdb.Get(ctx, instanceModelPrefix+instanceID).Result()
+	if err != nil {
+		return ""
+	}
+	return val
+}
+
+// RegisterVolume records a volume→model mapping for later reuse.
+func (s *DemandStore) RegisterVolume(ctx context.Context, volumeID, modelID, instanceID string) error {
+	if s == nil || s.rdb == nil || volumeID == "" {
+		return nil
+	}
+	info := VolumeInfo{
+		VolumeID:   volumeID,
+		ModelID:    modelID,
+		InstanceID: instanceID,
+		CreatedAt:  time.Now().Format(time.RFC3339),
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return fmt.Errorf("marshaling volume info: %w", err)
+	}
+	return s.rdb.Set(ctx, volumePrefix+volumeID, data, 0).Err()
+}
+
+// FindVolumeForModel returns the volume ID of a tracked volume for the given model.
+// Returns "" if no matching volume is tracked.
+func (s *DemandStore) FindVolumeForModel(ctx context.Context, modelID string) string {
+	if s == nil || s.rdb == nil || modelID == "" {
+		return ""
+	}
+	keys, err := s.rdb.Keys(ctx, volumePrefix+"*").Result()
+	if err != nil {
+		return ""
+	}
+	for _, key := range keys {
+		data, err := s.rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+		var info VolumeInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+		if info.ModelID == modelID {
+			return info.VolumeID
+		}
+	}
+	return ""
+}
+
+// UnregisterVolume removes a volume tracking entry.
+func (s *DemandStore) UnregisterVolume(ctx context.Context, volumeID string) error {
+	if s == nil || s.rdb == nil || volumeID == "" {
+		return nil
+	}
+	return s.rdb.Del(ctx, volumePrefix+volumeID).Err()
+}
+
+// ListTrackedVolumes returns all tracked volume entries.
+func (s *DemandStore) ListTrackedVolumes(ctx context.Context) []VolumeInfo {
+	if s == nil || s.rdb == nil {
+		return nil
+	}
+	keys, err := s.rdb.Keys(ctx, volumePrefix+"*").Result()
+	if err != nil {
+		return nil
+	}
+	var volumes []VolumeInfo
+	for _, key := range keys {
+		data, err := s.rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+		var info VolumeInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+		volumes = append(volumes, info)
+	}
+	return volumes
 }
 
 // Client returns the underlying Redis client (for ProvisionTrigger to reuse).
