@@ -131,7 +131,8 @@ func (r *DisruptionController) isNodeIdle(ctx context.Context, node *corev1.Node
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		if scheduler.IsGPUPod(&pod) && pod.Status.Phase == corev1.PodRunning {
+		if scheduler.IsGPUPod(&pod) {
+			// Any non-terminal GPU pod (Pending, Init, Running) means the node is not idle.
 			return false, nil
 		}
 	}
