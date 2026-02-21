@@ -59,8 +59,10 @@ func NewProvisioningController(c client.Client, log logr.Logger, batchWindow tim
 // Reconcile processes pending GPU pods.
 // Dedup is demand-level: we count active (non-Terminated) claims and only
 // provision if there are more pending GPU pods than active claims.
-// This counts ALL pending unschedulable GPU pods (Ray worker pods from the
-// in-tree autoscaler, or demand-signal pods from KEDA if enabled).
+// Only GPUScale demand-signal pods (gpuscale.io/demand-signal=true) trigger
+// provisioning. KubeRay worker pods are explicitly excluded — they are
+// managed by Ray's in-tree autoscaler and must not drive GPUScale provisioning,
+// since they carry no model requirements and would use wrong defaults.
 func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pod", req.NamespacedName)
 
@@ -79,6 +81,14 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if !scheduler.IsUnschedulable(&pod) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Skip KubeRay worker pods — they are created by Ray's in-tree autoscaler
+	// and do not carry model requirements. Picking them up would use wrong
+	// defaults (nodeType=ray-worker, minVRAM=10). Cold-start provisioning is
+	// handled by the provision_trigger pub/sub path (ProvisionTriggerSubscriber).
+	if pod.Labels["app.kubernetes.io/created-by"] == "kuberay-operator" {
+		return ctrl.Result{}, nil
 	}
 
 	// Demand-level dedup: count active claims vs pending GPU pods.
@@ -421,9 +431,9 @@ func (r *ProvisioningController) countActiveClaims(ctx context.Context) int {
 	return count
 }
 
-// countPendingGPUPods returns the number of pending, unschedulable GPU pods.
-// This counts ALL pending GPU pods — Ray worker pods from the in-tree
-// autoscaler as well as demand-signal pods from KEDA (if enabled).
+// countPendingGPUPods returns the number of pending, unschedulable GPU pods
+// that GPUScale manages (demand-signal pods only). KubeRay worker pods are
+// excluded — they are not GPUScale demand signals.
 func (r *ProvisioningController) countPendingGPUPods(ctx context.Context) int {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods); err != nil {
@@ -432,6 +442,9 @@ func (r *ProvisioningController) countPendingGPUPods(ctx context.Context) int {
 	}
 	count := 0
 	for _, p := range pods.Items {
+		if p.Labels["app.kubernetes.io/created-by"] == "kuberay-operator" {
+			continue
+		}
 		if p.Status.Phase == corev1.PodPending &&
 			scheduler.IsGPUPod(&p) &&
 			scheduler.IsUnschedulable(&p) {

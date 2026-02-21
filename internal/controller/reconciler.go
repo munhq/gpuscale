@@ -540,6 +540,7 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 	now := metav1.Now()
 	claim.Status.Phase = v1alpha1.ClaimPhaseReady
 	claim.Status.NodeName = node.Name
+	claim.Status.NodeType = claim.Spec.NodeType
 	claim.Status.ReadyAt = &now
 	claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
 		Type:               "NodeJoined",
