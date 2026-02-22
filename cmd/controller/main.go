@@ -39,6 +39,7 @@ func main() {
 		cooldownPeriod         time.Duration
 		interruptionInterval   time.Duration
 		workerMetricsInterval  time.Duration
+		instanceGCInterval     time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
@@ -47,6 +48,7 @@ func main() {
 	flag.DurationVar(&cooldownPeriod, "cooldown-period", 5*time.Minute, "Duration to wait before destroying idle nodes.")
 	flag.DurationVar(&interruptionInterval, "interruption-poll-interval", 30*time.Second, "Interval for polling provider APIs for interruptions.")
 	flag.DurationVar(&workerMetricsInterval, "worker-metrics-interval", 1*time.Minute, "Interval for scraping vLLM metrics from workers.")
+	flag.DurationVar(&instanceGCInterval, "instance-gc-interval", 1*time.Minute, "Interval for the instance garbage collector sweep.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -217,7 +219,7 @@ func main() {
 		mgr.GetClient(),
 		ctrl.Log.WithName("instance-gc"),
 		registry,
-		5*time.Minute,
+		instanceGCInterval,
 	)
 	if err := instanceGC.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create instance GC")
