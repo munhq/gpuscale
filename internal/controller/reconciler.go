@@ -163,6 +163,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		ModelCacheURL: pool.Spec.Bootstrap.ModelCacheURL,
 		InstanceID:    claim.Name,
 		GPUType:       claim.Status.GPUType,
+		MinDisk:       claim.Spec.Requirements.MinDisk,
 	}
 
 	// Full-node specific: read VPN and Kubernetes join secrets.

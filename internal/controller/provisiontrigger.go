@@ -193,6 +193,7 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 				MaxVRAM:  maxVRAM,
 				GPUTypes: cfg.PreferredGPUs,
 				MaxPrice: maxPrice,
+				MinDisk:  cfg.MinDisk,
 			},
 		},
 	}

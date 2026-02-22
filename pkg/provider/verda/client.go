@@ -240,6 +240,7 @@ type CreateInstanceRequest struct {
 	StartupScriptID string    `json:"startup_script_id,omitempty"`
 	LocationCode    string    `json:"location_code,omitempty"`
 	IsSpot          bool      `json:"is_spot"`
+	OsVolumeSizeGB  *int      `json:"os_volume_size_gb,omitempty"` // override OS disk size (GB); nil = use Verda default
 }
 
 // InstanceResponse represents a Verda instance.

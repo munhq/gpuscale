@@ -273,6 +273,10 @@ type ClaimRequirements struct {
 
 	// MaxPrice is the maximum $/hr.
 	MaxPrice float64 `json:"maxPrice,omitempty"`
+
+	// MinDisk is the minimum OS volume size in GB (model weights + image + OS overhead).
+	// Used by VM providers (Verda) to size the OS volume at creation time.
+	MinDisk int `json:"minDisk,omitempty"`
 }
 
 type PodReference struct {

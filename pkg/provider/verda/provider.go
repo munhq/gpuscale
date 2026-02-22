@@ -153,6 +153,14 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		StartupScriptID: scriptResp.ID,
 		IsSpot:          offer.CapacityType == "spot",
 	}
+	// Set OS volume size from the model's disk requirement.
+	// MinDisk = VRAMRequired + 50GB overhead (image + OS/K3s), computed by GPU API and
+	// threaded through Dragonfly → ClaimRequirements → BootstrapConfig.
+	// Only set for full-node instances (VMs with OS volumes); containers don't use this field.
+	if config.NodeType == "full-node" && config.MinDisk > 0 {
+		diskGB := config.MinDisk
+		createReq.OsVolumeSizeGB = &diskGB
+	}
 
 	resp, err := p.client.CreateInstance(ctx, createReq)
 	if err != nil {

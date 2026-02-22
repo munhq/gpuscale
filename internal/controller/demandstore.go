@@ -90,6 +90,7 @@ type ModelConfig struct {
 	MaxPricePerGPU float64  `json:"maxPricePerGPU"`
 	MaxVRAMPerGPU  int      `json:"maxVramPerGpu"`   // max VRAM per GPU in GB (0 = no limit)
 	PreferredGPUs  []string `json:"preferredGpus"`   // preferred GPU types (tried first)
+	MinDisk        int      `json:"minDisk"`         // GB disk needed: model weights + image + OS overhead
 }
 
 // GetModelConfig retrieves a model configuration from Dragonfly by config ID

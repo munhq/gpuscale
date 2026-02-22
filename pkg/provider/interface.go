@@ -68,6 +68,7 @@ type BootstrapConfig struct {
 	GPUType       string            // GPU type label
 	ProviderName  string            // provider name label
 	ExtraEnv      map[string]string // additional env vars
+	MinDisk       int               // GB, minimum OS volume/disk size (used by VM providers for os_volume_size_gb)
 
 	// Pre-generated bootstrap script and env vars for full-node mode.
 	// Callers set these when they have the bootstrap package available.
