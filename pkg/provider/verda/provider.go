@@ -414,6 +414,19 @@ func matchesGPUType(gpuType string, wanted []string) bool {
 	return false
 }
 
+// StopInstance implements provider.HibernatingProvider.
+// Stops the VM without destroying its OS volume so model weights are preserved on disk.
+// On next demand, WakeInstance restarts it — the HuggingFace cache hit is instant.
+func (p *Provider) StopInstance(ctx context.Context, instanceID string) error {
+	return p.client.StopInstance(ctx, instanceID)
+}
+
+// WakeInstance implements provider.HibernatingProvider.
+// Restarts a previously stopped instance. K3s agent reconnects automatically on boot.
+func (p *Provider) WakeInstance(ctx context.Context, instanceID string) error {
+	return p.client.StartInstance(ctx, instanceID)
+}
+
 func normalizeStatus(status string) string {
 	switch strings.ToLower(status) {
 	case "running", "active":

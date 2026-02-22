@@ -360,10 +360,10 @@ type InstanceActionRequest struct {
 	IDs    []string `json:"id"`
 }
 
-// DeleteInstance deletes an instance.
-func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
+// instanceAction performs a lifecycle action on an instance.
+func (c *Client) instanceAction(ctx context.Context, action, instanceID string) error {
 	actionReq := InstanceActionRequest{
-		Action: "delete",
+		Action: action,
 		IDs:    []string{instanceID},
 	}
 	resp, err := c.doRequest(ctx, http.MethodPut, "/instances", actionReq)
@@ -374,9 +374,25 @@ func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("verda delete returned %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("verda instance action %q returned %d: %s", action, resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// DeleteInstance deletes an instance.
+func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
+	return c.instanceAction(ctx, "delete", instanceID)
+}
+
+// StopInstance stops a running instance without destroying its disk.
+// The instance can be restarted later via StartInstance with model weights intact.
+func (c *Client) StopInstance(ctx context.Context, instanceID string) error {
+	return c.instanceAction(ctx, "shutdown", instanceID)
+}
+
+// StartInstance restarts a previously stopped instance.
+func (c *Client) StartInstance(ctx context.Context, instanceID string) error {
+	return c.instanceAction(ctx, "start", instanceID)
 }
 
 // VolumeResponse represents a storage volume in the Verda account.

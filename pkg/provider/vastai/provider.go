@@ -278,6 +278,29 @@ exec python -m vllm.entrypoints.openai.api_server \
 		hfRepo, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 }
 
+// StopInstance implements HibernatingProvider.
+// Sends the instance to "stopped" state — disk is preserved, no compute charge.
+// The K3s agent will disconnect from the cluster; the node object stays in K8s.
+func (p *Provider) StopInstance(ctx context.Context, instanceID string) error {
+	id, err := strconv.Atoi(instanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance ID %q: %w", instanceID, err)
+	}
+	return p.client.SetInstanceState(ctx, id, "stopped")
+}
+
+// WakeInstance implements HibernatingProvider.
+// Transitions the instance from "stopped" back to "running".
+// K3s agent will reconnect automatically (it is a systemd service).
+// Model files are already on disk — no HuggingFace download needed.
+func (p *Provider) WakeInstance(ctx context.Context, instanceID string) error {
+	id, err := strconv.Atoi(instanceID)
+	if err != nil {
+		return fmt.Errorf("invalid instance ID %q: %w", instanceID, err)
+	}
+	return p.client.SetInstanceState(ctx, id, "running")
+}
+
 func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error {
 	id, err := strconv.Atoi(instanceID)
 	if err != nil {
@@ -352,8 +375,10 @@ func normalizeStatus(vastStatus string) string {
 		return "running"
 	case "loading", "creating", "pulling", "created", "scheduled", "":
 		return "starting"
-	case "exited", "stopped", "offline":
+	case "exited", "offline":
 		return "stopped"
+	case "stopped":
+		return "hibernated"
 	default:
 		return "error"
 	}

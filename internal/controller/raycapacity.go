@@ -353,6 +353,115 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 	return nil
 }
 
+// PatchServeModelFractions updates gpu_memory_utilization for named models in the
+// live Ray Serve config. Used when multiple models share a single GPU node so each
+// vLLM process gets the correct fraction of GPU memory rather than the default 0.90.
+//
+// fractions maps model-name → gpu_memory_utilization (e.g., {"glm-4-7-flash": 0.175}).
+// This is a GET+PUT operation against the Ray Dashboard. It runs on every 60s tick
+// so that ArgoCD resets (which re-apply Helm values) are corrected within a minute.
+func (r *RayCapacityStore) PatchServeModelFractions(ctx context.Context, fractions map[string]float64) error {
+	if len(fractions) == 0 {
+		return nil
+	}
+
+	dashboardURL, _, err := r.discoverRayHead(ctx)
+	if err != nil {
+		return nil // dashboard not available, non-fatal
+	}
+
+	// GET the current live serve config
+	getURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
+	if err != nil {
+		return err
+	}
+	getResp, err := r.httpClient.Do(getReq)
+	if err != nil {
+		return nil // connection error is non-fatal; will retry next tick
+	}
+	defer getResp.Body.Close()
+	body, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		return fmt.Errorf("reading serve config: %w", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET serve config returned %d", getResp.StatusCode)
+	}
+
+	// Unmarshal as generic map so we can patch nested fields without knowing
+	// the full schema (Ray adds many runtime fields on top of the base config).
+	var config map[string]interface{}
+	if err := json.Unmarshal(body, &config); err != nil {
+		return fmt.Errorf("parsing serve config: %w", err)
+	}
+
+	apps, ok := config["applications"].([]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected serve config format: applications is not an array")
+	}
+
+	patched := false
+	for _, raw := range apps {
+		app, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := app["name"].(string)
+		util, ok := fractions[name]
+		if !ok {
+			continue // this model is not in our fractions map
+		}
+		// Path: app.args.llm_configs[0].engine_kwargs.gpu_memory_utilization
+		args, ok := app["args"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		llmCfgs, ok := args["llm_configs"].([]interface{})
+		if !ok || len(llmCfgs) == 0 {
+			continue
+		}
+		llmCfg, ok := llmCfgs[0].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		engineKwargs, ok := llmCfg["engine_kwargs"].(map[string]interface{})
+		if !ok {
+			// engine_kwargs missing — create it
+			engineKwargs = make(map[string]interface{})
+			llmCfg["engine_kwargs"] = engineKwargs
+		}
+		engineKwargs["gpu_memory_utilization"] = util
+		patched = true
+	}
+
+	if !patched {
+		return nil // none of the target models found in live config, nothing to do
+	}
+
+	// PUT the patched config back
+	putBody, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshaling patched config: %w", err)
+	}
+	putURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, strings.NewReader(string(putBody)))
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp, err := r.httpClient.Do(putReq)
+	if err != nil {
+		return nil // connection error is non-fatal
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("PUT serve config returned %d: %s", putResp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // queryGPUUsage queries Prometheus for actual GPU memory usage and updates nodes.
 func (r *RayCapacityStore) queryGPUUsage(ctx context.Context, nodes []GPUNode) error {
 	// Query Prometheus for GPU memory usage

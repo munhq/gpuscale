@@ -275,6 +275,36 @@ func (c *Client) ListInstances(ctx context.Context) ([]InstanceResponse, error) 
 	return result.Instances, nil
 }
 
+// SetInstanceState transitions an instance to the given state.
+// Vast.ai accepts "stopped" (halt without deleting disk) or "running" (restart).
+// PUT /instances/{id}/ with {"state": "<state>"}
+func (c *Client) SetInstanceState(ctx context.Context, instanceID int, state string) error {
+	body, err := json.Marshal(map[string]string{"state": state})
+	if err != nil {
+		return fmt.Errorf("marshaling state request: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/instances/%d/", c.baseURL, instanceID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("vast.ai set state %q returned %d: %s", state, resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // DestroyInstance deletes an instance.
 func (c *Client) DestroyInstance(ctx context.Context, instanceID int) error {
 	reqURL := fmt.Sprintf("%s/instances/%d/", c.baseURL, instanceID)

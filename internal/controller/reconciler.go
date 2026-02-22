@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -122,6 +123,8 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return r.handleBootstrapping(ctx, &claim, log)
 	case v1alpha1.ClaimPhaseReady:
 		return r.handleReady(ctx, &claim, log)
+	case v1alpha1.ClaimPhaseHibernated:
+		return r.handleHibernated(ctx, &claim, log)
 	case v1alpha1.ClaimPhaseDraining, v1alpha1.ClaimPhaseTerminated:
 		return ctrl.Result{}, nil
 	default:
@@ -166,7 +169,8 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		MinDisk:       claim.Spec.Requirements.MinDisk,
 	}
 
-	// Full-node specific: read VPN and Kubernetes join secrets.
+	// Full-node specific: read VPN and Kubernetes join secrets, and populate model sources
+	// for background pre-download during bootstrap.
 	// Key names match what the Ansible argocd role writes into gpuscale-provider-credentials:
 	//   netbird-setup-key  → vault_gpu_netbird_setup_key
 	//   k8s-join-token     → /var/lib/rancher/k3s/server/node-token
@@ -195,6 +199,18 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		config.NetbirdKey = netbirdKey
 		config.K8sURL = k8sURL
 		config.K8sToken = k8sToken
+
+		// Populate model sources for background pre-download during bootstrap.
+		// Fetching from DemandStore ensures we get all co-located models for
+		// bin-packed claims (which have multiple models in ModelIDs).
+		if r.DemandStore != nil {
+			for _, modelID := range claimModelIDs(claim) {
+				cfg, err := r.DemandStore.GetModelConfig(ctx, modelID)
+				if err == nil && cfg != nil && cfg.Source != "" {
+					config.ModelSources = append(config.ModelSources, cfg.Source)
+				}
+			}
+		}
 	}
 
 	// Ray-worker specific: populate model and ray config
@@ -575,9 +591,13 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 	// Publish a "try drain" event so GPU API's queue processor sends a request
 	// to Ray Serve, which triggers autoscaling. The actual loaded_models key
 	// is set in handleReady once we confirm the Ray Serve app is RUNNING.
-	if claim.Spec.ModelID != "" && r.DemandStore != nil {
-		r.DemandStore.PublishModelAvailable(ctx, claim.Spec.ModelID)
-		log.Info("Published model available (triggering queue drain attempt)", "model", claim.Spec.ModelID)
+	// Notify all co-located models (multi-model bin-packed claims).
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			r.DemandStore.PublishModelAvailable(ctx, modelID)
+		}
+		log.Info("Published model available for all co-located models (triggering queue drain attempt)",
+			"models", claimModelIDs(claim))
 	}
 
 	if claim.Status.ProvisionedAt != nil {
@@ -661,9 +681,13 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 	// Worker joined Ray but the model may not be deployed yet.
 	// Publish "try drain" event; actual loaded_models set in handleReady
 	// once Ray Serve confirms RUNNING.
-	if claim.Spec.ModelID != "" && r.DemandStore != nil {
-		r.DemandStore.PublishModelAvailable(ctx, claim.Spec.ModelID)
-		log.Info("Published model available (triggering queue drain attempt)", "model", claim.Spec.ModelID)
+	// Notify all co-located models (multi-model bin-packed claims).
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			r.DemandStore.PublishModelAvailable(ctx, modelID)
+		}
+		log.Info("Published model available for all co-located models (triggering queue drain attempt)",
+			"models", claimModelIDs(claim))
 	}
 
 	if claim.Status.ProvisionedAt != nil {
@@ -676,6 +700,79 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+}
+
+// hibernatedTTL is the maximum time a claim may stay in Hibernated phase before
+// the underlying instance is destroyed. This prevents zombie Verda VMs from
+// accruing storage charges indefinitely when a model is no longer requested.
+const hibernatedTTL = 7 * 24 * time.Hour
+
+// handleHibernated handles a claim in the Hibernated phase.
+// It waits for the annotationWakeRequested annotation set by ProvisionTrigger when
+// demand returns for one of the co-located models.
+// On wake: calls WakeInstance on the provider, then transitions back to Bootstrapping
+// so the normal K3s-node-join flow takes over.
+// TTL: if the claim has been hibernated for longer than hibernatedTTL, the instance
+// is destroyed and the claim terminated to avoid indefinite storage charges.
+func (r *ClaimReconciler) handleHibernated(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	// TTL check: destroy hibernated instances that have been idle too long.
+	// IdleSince is set by the DisruptionController when the node first went idle
+	// (just before the cooldown + hibernation sequence). It is a close approximation
+	// of when hibernation started.
+	if claim.Status.IdleSince != nil && time.Since(claim.Status.IdleSince.Time) > hibernatedTTL {
+		log.Info("Hibernated claim exceeded TTL, destroying instance",
+			"instanceID", claim.Status.InstanceID,
+			"idleSince", claim.Status.IdleSince.Time.Format(time.RFC3339),
+			"ttl", hibernatedTTL.String(),
+		)
+		return r.destroyHibernatedClaim(ctx, claim, log)
+	}
+
+	if claim.Annotations[annotationWakeRequested] != "true" {
+		// No wake requested — check again in 60s (low-frequency poll).
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+
+	log.Info("Wake-up requested for hibernated claim", "instanceID", claim.Status.InstanceID, "models", claimModelIDs(claim))
+
+	prov, ok := r.Registry.Get(claim.Status.Provider)
+	if !ok {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, fmt.Errorf("provider %q not in registry", claim.Status.Provider)
+	}
+
+	hibernator, canWake := prov.(provider.HibernatingProvider)
+	if !canWake {
+		// Provider doesn't support wake — re-provision from scratch.
+		log.Info("Provider does not support wake; re-provisioning from scratch")
+		delete(claim.Annotations, annotationWakeRequested)
+		if err := r.Update(ctx, claim); err != nil {
+			return ctrl.Result{}, err
+		}
+		claim.Status.Phase = v1alpha1.ClaimPhasePending
+		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, claim)
+	}
+
+	if err := hibernator.WakeInstance(ctx, claim.Status.InstanceID); err != nil {
+		log.Error(err, "Failed to wake instance; retrying in 30s")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Remove wake annotation and transition to Bootstrapping.
+	// The normal full-node Bootstrapping path polls until the K3s node re-appears.
+	delete(claim.Annotations, annotationWakeRequested)
+	if err := r.Update(ctx, claim); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	now := metav1.Now()
+	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
+	claim.Status.ProvisionedAt = &now
+	if err := r.Status().Update(ctx, claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("transitioning claim to Bootstrapping: %w", err)
+	}
+
+	log.Info("Instance woken, transitioned to Bootstrapping", "claim", claim.Name)
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // handleReady periodically checks that the provider instance backing a Ready claim
@@ -706,9 +803,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 			if r.WorkerStore != nil {
 				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 			}
-			if claim.Spec.ModelID != "" && r.DemandStore != nil {
-				if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
-					_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+			if r.DemandStore != nil {
+				for _, modelID := range claimModelIDs(claim) {
+					if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+						_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+					}
 				}
 			}
 			r.retriggerIfDemandExists(ctx, claim, log)
@@ -739,9 +838,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		if r.WorkerStore != nil {
 			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 		}
-		if claim.Spec.ModelID != "" && r.DemandStore != nil {
-			if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
-				_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+		if r.DemandStore != nil {
+			for _, modelID := range claimModelIDs(claim) {
+				if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+					_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+				}
 			}
 		}
 		r.retriggerIfDemandExists(ctx, claim, log)
@@ -780,9 +881,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 				if r.WorkerStore != nil {
 					_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 				}
-				if claim.Spec.ModelID != "" && r.DemandStore != nil {
-					if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
-						_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+				if r.DemandStore != nil {
+					for _, modelID := range claimModelIDs(claim) {
+						if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+							_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+						}
 					}
 				}
 				r.retriggerIfDemandExists(ctx, claim, log)
@@ -812,9 +915,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 			if r.WorkerStore != nil {
 				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 			}
-			if claim.Spec.ModelID != "" && r.DemandStore != nil {
-				if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
-					_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+			if r.DemandStore != nil {
+				for _, modelID := range claimModelIDs(claim) {
+					if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+						_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+					}
 				}
 			}
 			r.retriggerIfDemandExists(ctx, claim, log)
@@ -822,15 +927,19 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		}
 	}
 
-	// Check if the model is actually serving in Ray Serve.
+	// Check if the models are actually serving in Ray Serve.
 	// SetModelLoaded is NOT called at transition-to-Ready (it was premature there).
-	// Instead, we check here on every 60s tick until the model is confirmed RUNNING.
-	if claim.Spec.ModelID != "" && r.DemandStore != nil && r.RayCapacityStore != nil {
-		if !r.DemandStore.IsModelLoaded(ctx, claim.Spec.ModelID) {
-			statuses, err := r.RayCapacityStore.GetServeAppStatus(ctx)
-			if err == nil {
+	// Instead, we check here on every 60s tick until each model is confirmed RUNNING.
+	// For multi-model bin-packed claims we check all co-located models.
+	if r.DemandStore != nil && r.RayCapacityStore != nil {
+		statuses, serveErr := r.RayCapacityStore.GetServeAppStatus(ctx)
+		for _, modelID := range claimModelIDs(claim) {
+			if r.DemandStore.IsModelLoaded(ctx, modelID) {
+				continue
+			}
+			if serveErr == nil {
 				for _, app := range statuses {
-					if app.Name == claim.Spec.ModelID && app.Status == "RUNNING" {
+					if app.Name == modelID && app.Status == "RUNNING" {
 						info := LoadedModelInfo{
 							ClaimName:  claim.Name,
 							Provider:   claim.Status.Provider,
@@ -839,24 +948,152 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 							InstanceID: claim.Status.InstanceID,
 							ReadyAt:    time.Now().Format(time.RFC3339),
 						}
-						if err := r.DemandStore.SetModelLoaded(ctx, claim.Spec.ModelID, info); err != nil {
-							log.Error(err, "Failed to set model as loaded", "model", claim.Spec.ModelID)
+						if err := r.DemandStore.SetModelLoaded(ctx, modelID, info); err != nil {
+							log.Error(err, "Failed to set model as loaded", "model", modelID)
 						} else {
 							log.Info("Model confirmed RUNNING in Ray Serve, marked as loaded",
-								"model", claim.Spec.ModelID)
+								"model", modelID)
 						}
 						break
 					}
 				}
 			}
 			// Model not RUNNING yet — re-publish availability so queue processor retries
-			if !r.DemandStore.IsModelLoaded(ctx, claim.Spec.ModelID) {
-				r.DemandStore.PublishModelAvailable(ctx, claim.Spec.ModelID)
+			if !r.DemandStore.IsModelLoaded(ctx, modelID) {
+				r.DemandStore.PublishModelAvailable(ctx, modelID)
 			}
+		}
+		if len(claimModelIDs(claim)) > 0 {
+			log.Info("Published model available for co-located models", "models", claimModelIDs(claim))
 		}
 	}
 
+	// --- Fractional GPU allocation for multi-model bin-packed claims ---
+	// When multiple models share a single GPU node, each vLLM process must use only
+	// its proportional share of GPU memory. We compute fractions from the actual GPU
+	// VRAM reported by nvidia-device-plugin (nvidia.com/gpu.memory label, in MiB)
+	// and patch Ray Serve's live config on every tick.
+	// This corrects any resets caused by ArgoCD re-syncing the Helm chart values.
+	if len(claimModelIDs(claim)) > 1 && r.RayCapacityStore != nil && r.DemandStore != nil && claim.Status.NodeName != "" {
+		r.patchFractionalGPUAllocation(ctx, claim, log)
+	}
+
+	// --- Consolidation drain ---
+	// If this is a bin-packed claim that now has all co-located models loaded,
+	// annotate any older single-model claims for those models so DisruptionController
+	// drains them immediately (they are being replaced by this more efficient node).
+	if len(claimModelIDs(claim)) > 1 && r.DemandStore != nil {
+		r.triggerConsolidationDrain(ctx, claim, log)
+	}
+
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+}
+
+// patchFractionalGPUAllocation reads the actual GPU VRAM from the K8s node labels
+// and calls PatchServeModelFractions so each vLLM replica uses its correct share.
+// Safe to call on every 60s tick — it is idempotent and non-fatal on failure.
+func (r *ClaimReconciler) patchFractionalGPUAllocation(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: claim.Status.NodeName}, &node); err != nil {
+		return // node not found yet, try again next tick
+	}
+
+	memMiBStr, ok := node.Labels["nvidia.com/gpu.memory"]
+	if !ok || memMiBStr == "" {
+		return // nvidia-device-plugin label not yet set
+	}
+
+	memMiB := 0
+	if _, err := fmt.Sscanf(memMiBStr, "%d", &memMiB); err != nil || memMiB == 0 {
+		log.Error(err, "Failed to parse nvidia.com/gpu.memory label", "value", memMiBStr)
+		return
+	}
+	totalGPUVRAM := memMiB / 1024 // MiB → GB (integer division is fine; 81920 → 80, 98304 → 96)
+	if totalGPUVRAM == 0 {
+		return
+	}
+
+	fractions := make(map[string]float64)
+	for _, modelID := range claimModelIDs(claim) {
+		cfg, err := r.DemandStore.GetModelConfig(ctx, modelID)
+		if err != nil || cfg == nil || cfg.VRAMRequired == 0 {
+			continue
+		}
+		frac := float64(cfg.VRAMRequired) / float64(totalGPUVRAM)
+		if frac > 0.95 {
+			frac = 0.95 // safety cap — leave 5% for system overhead
+		}
+		fractions[modelID] = frac
+	}
+
+	if len(fractions) == 0 {
+		return
+	}
+
+	if err := r.RayCapacityStore.PatchServeModelFractions(ctx, fractions); err != nil {
+		log.Error(err, "Failed to patch Ray Serve GPU fractions")
+		return
+	}
+	log.Info("Patched Ray Serve GPU memory fractions for co-located models",
+		"node", claim.Status.NodeName, "gpuVRAM", totalGPUVRAM, "fractions", fractions)
+}
+
+// triggerConsolidationDrain checks if this bin-packed claim now has all co-located
+// models loaded in Ray Serve. If so, it annotates any older single-model claims
+// for those same models with annotationConsolidationDrain so the DisruptionController
+// drains them immediately — they are being replaced by this more efficient shared node.
+func (r *ClaimReconciler) triggerConsolidationDrain(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
+	allLoaded := true
+	for _, modelID := range claimModelIDs(claim) {
+		if !r.DemandStore.IsModelLoaded(ctx, modelID) {
+			allLoaded = false
+			break
+		}
+	}
+	if !allLoaded {
+		return // bin-packed claim not fully loaded yet; don't drain old nodes
+	}
+
+	// Find single-model claims that serve any of our co-located models.
+	var claimList v1alpha1.GPUNodeClaimList
+	if err := r.List(ctx, &claimList, client.InNamespace(claimNamespace())); err != nil {
+		return
+	}
+
+	for i := range claimList.Items {
+		c := &claimList.Items[i]
+		if c.Name == claim.Name {
+			continue // don't drain ourselves
+		}
+		if c.Status.Phase == v1alpha1.ClaimPhaseTerminated ||
+			c.Status.Phase == v1alpha1.ClaimPhaseDraining ||
+			c.Status.Phase == v1alpha1.ClaimPhaseHibernated {
+			continue
+		}
+		// Only drain single-model claims (len == 1 means it's not already bin-packed).
+		if len(claimModelIDs(c)) != 1 {
+			continue
+		}
+		// Check if this single-model claim serves a model we now cover.
+		for _, modelID := range claimModelIDs(claim) {
+			if c.Spec.ModelID != modelID && !slices.Contains(c.Spec.ModelIDs, modelID) {
+				continue
+			}
+			if c.Annotations[annotationConsolidationDrain] == "true" {
+				break // already annotated
+			}
+			log.Info("Annotating single-model claim for consolidation drain",
+				"claim", c.Name, "model", modelID, "replacedBy", claim.Name)
+			if c.Annotations == nil {
+				c.Annotations = make(map[string]string)
+			}
+			c.Annotations[annotationConsolidationDrain] = "true"
+			if err := r.Update(ctx, c); err != nil {
+				log.Error(err, "Failed to annotate claim for consolidation drain", "claim", c.Name)
+			}
+			break
+		}
+	}
 }
 
 // resolveRayHeadAddress returns the Ray head address from the pool spec,
@@ -1017,14 +1254,58 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 		}
 	}
 
-	// Remove loaded_models entry if this was the last claim for this model.
-	if claim.Spec.ModelID != "" && r.DemandStore != nil {
-		if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
-			_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+	// Remove loaded_models entry for all co-located models if this was the last claim.
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+				_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+			}
 		}
 	}
 
 	r.retriggerIfDemandExists(ctx, claim, log)
+	return ctrl.Result{}, nil
+}
+
+// destroyHibernatedClaim destroys the provider instance for an expired Hibernated claim
+// and transitions it to Terminated. Called when the hibernation TTL is exceeded.
+func (r *ClaimReconciler) destroyHibernatedClaim(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	if claim.Status.InstanceID != "" && claim.Status.Provider != "" {
+		prov, ok := r.Registry.Get(claim.Status.Provider)
+		if ok {
+			if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+				log.Error(err, "Failed to destroy expired hibernated instance", "instanceID", claim.Status.InstanceID)
+				// Don't block termination — log and fall through.
+			} else {
+				log.Info("Destroyed expired hibernated instance", "instanceID", claim.Status.InstanceID)
+			}
+		}
+	}
+
+	if r.WorkerStore != nil {
+		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+	}
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+				_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+			}
+		}
+	}
+
+	now := metav1.Now()
+	claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+	claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+		Type:               "HibernatedExpired",
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: now,
+		Reason:             "TTLExceeded",
+		Message:            fmt.Sprintf("Hibernated claim exceeded TTL of %s", hibernatedTTL),
+	})
+	if err := r.Status().Update(ctx, claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("terminating expired hibernated claim: %w", err)
+	}
+	log.Info("Hibernated claim expired and terminated", "claim", claim.Name, "models", claimModelIDs(claim))
 	return ctrl.Result{}, nil
 }
 
@@ -1056,10 +1337,12 @@ func (r *ClaimReconciler) handleDeletion(ctx context.Context, claim *v1alpha1.GP
 		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 	}
 
-	// Remove loaded_models entry if this was the last claim for this model.
-	if claim.Spec.ModelID != "" && r.DemandStore != nil {
-		if !r.hasOtherReadyClaims(ctx, claim.Spec.ModelID, claim.Name) {
-			_ = r.DemandStore.RemoveModelLoaded(ctx, claim.Spec.ModelID)
+	// Remove loaded_models entry for all co-located models if this was the last claim.
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+				_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+			}
 		}
 	}
 
@@ -1090,7 +1373,8 @@ func resolveClaimNodeType(claim *v1alpha1.GPUNodeClaim) string {
 	return claim.Status.NodeType
 }
 
-// hasOtherReadyClaims returns true if there are other Ready claims for the same model.
+// hasOtherReadyClaims returns true if there are other Ready claims serving the given modelID.
+// It checks both ModelID (primary) and ModelIDs (co-located) fields.
 func (r *ClaimReconciler) hasOtherReadyClaims(ctx context.Context, modelID string, excludeClaim string) bool {
 	var claims v1alpha1.GPUNodeClaimList
 	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
@@ -1100,37 +1384,65 @@ func (r *ClaimReconciler) hasOtherReadyClaims(ctx context.Context, modelID strin
 		if c.Name == excludeClaim {
 			continue
 		}
-		if c.Spec.ModelID == modelID && c.Status.Phase == v1alpha1.ClaimPhaseReady {
+		if c.Status.Phase != v1alpha1.ClaimPhaseReady {
+			continue
+		}
+		if c.Spec.ModelID == modelID {
 			return true
+		}
+		for _, mid := range c.Spec.ModelIDs {
+			if mid == modelID {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 // retriggerIfDemandExists re-publishes a provision trigger when a claim terminates
-// but there are still queued requests for the model. Without this, requests would
-// sit in the queue forever because the ProvisionTrigger only fires on new pub/sub events.
+// but there are still queued requests for any co-located model. Without this, requests
+// would sit in the queue forever because the ProvisionTrigger only fires on new pub/sub events.
+// For multi-model bin-packed claims, re-triggering on the primary model is sufficient:
+// ProvisionTrigger will re-bundle co-located models when it creates a new claim.
 func (r *ClaimReconciler) retriggerIfDemandExists(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
-	if claim.Spec.ModelID == "" || r.DemandStore == nil {
+	if r.DemandStore == nil {
 		return
 	}
-	queueDepth, err := r.DemandStore.GetQueueDepth(ctx, claim.Spec.ModelID)
-	if err != nil {
-		log.Error(err, "Failed to check queue depth for re-trigger")
-		return
-	}
-	activeDemand, err := r.DemandStore.GetDemand(ctx, claim.Spec.ModelID)
-	if err != nil {
-		log.Error(err, "Failed to check active demand for re-trigger")
-		return
-	}
-	if queueDepth > 0 || activeDemand > 0 {
-		log.Info("Demand exists after claim termination, re-triggering provisioning",
-			"model", claim.Spec.ModelID, "queueDepth", queueDepth, "activeDemand", activeDemand)
-		if err := r.DemandStore.PublishProvisionTrigger(ctx, claim.Spec.ModelID); err != nil {
-			log.Error(err, "Failed to publish re-trigger")
+	for _, modelID := range claimModelIDs(claim) {
+		queueDepth, err := r.DemandStore.GetQueueDepth(ctx, modelID)
+		if err != nil {
+			log.Error(err, "Failed to check queue depth for re-trigger", "model", modelID)
+			continue
+		}
+		activeDemand, err := r.DemandStore.GetDemand(ctx, modelID)
+		if err != nil {
+			log.Error(err, "Failed to check active demand for re-trigger", "model", modelID)
+			continue
+		}
+		if queueDepth > 0 || activeDemand > 0 {
+			log.Info("Demand exists after claim termination, re-triggering provisioning",
+				"model", modelID, "queueDepth", queueDepth, "activeDemand", activeDemand)
+			if err := r.DemandStore.PublishProvisionTrigger(ctx, modelID); err != nil {
+				log.Error(err, "Failed to publish re-trigger", "model", modelID)
+			}
+			// Re-triggering on the first model with demand is sufficient; ProvisionTrigger
+			// will bundle all co-located models into a new shared claim.
+			return
 		}
 	}
+}
+
+// claimModelIDs returns the canonical list of all model IDs served by a claim.
+// For multi-model bin-packed claims, ModelIDs contains the full set.
+// For single-model claims (ModelIDs empty), falls back to ModelID for backward compatibility.
+func claimModelIDs(claim *v1alpha1.GPUNodeClaim) []string {
+	if len(claim.Spec.ModelIDs) > 0 {
+		return claim.Spec.ModelIDs
+	}
+	if claim.Spec.ModelID != "" {
+		return []string{claim.Spec.ModelID}
+	}
+	return nil
 }
 
 // backoffDuration returns an exponential backoff duration based on retry count.

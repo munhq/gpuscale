@@ -248,7 +248,13 @@ type GPUNodeClaimSpec struct {
 
 	// ModelID is the model this claim was provisioned for (API name, e.g., "glm-4-7").
 	// Used by the disruptor to check demand and always-active status.
+	// For multi-model bin-packed claims this holds the primary (triggering) model
+	// for backward compatibility. See ModelIDs for the full set.
 	ModelID string `json:"modelId,omitempty"`
+
+	// ModelIDs contains all model IDs co-located on this node (multi-model bin-packing).
+	// ModelID holds the primary/triggering model for backward compatibility.
+	ModelIDs []string `json:"modelIds,omitempty"`
 
 	// ModelSource is the HuggingFace source for the model (e.g., "hf:zai-org/GLM-4.7-Flash").
 	// Set by ProvisionTrigger from Dragonfly config. Used by bootstrap to download the correct weights.
@@ -294,12 +300,16 @@ type PodReference struct {
 type GPUNodeClaimPhase string
 
 const (
-	ClaimPhasePending      GPUNodeClaimPhase = "Pending"
-	ClaimPhaseProvisioning GPUNodeClaimPhase = "Provisioning"
+	ClaimPhasePending       GPUNodeClaimPhase = "Pending"
+	ClaimPhaseProvisioning  GPUNodeClaimPhase = "Provisioning"
 	ClaimPhaseBootstrapping GPUNodeClaimPhase = "Bootstrapping"
-	ClaimPhaseReady        GPUNodeClaimPhase = "Ready"
-	ClaimPhaseDraining     GPUNodeClaimPhase = "Draining"
-	ClaimPhaseTerminated   GPUNodeClaimPhase = "Terminated"
+	ClaimPhaseReady         GPUNodeClaimPhase = "Ready"
+	ClaimPhaseDraining      GPUNodeClaimPhase = "Draining"
+	ClaimPhaseTerminated    GPUNodeClaimPhase = "Terminated"
+	// ClaimPhaseHibernated means the provider instance has been stopped (disk preserved).
+	// The claim stays alive so it can be woken on next demand without re-provisioning.
+	// Supported only for providers that implement HibernatingProvider (currently Vast.ai full-node).
+	ClaimPhaseHibernated GPUNodeClaimPhase = "Hibernated"
 )
 
 type GPUNodeClaimStatus struct {

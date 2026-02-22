@@ -71,6 +71,15 @@ type BootstrapConfig struct {
 	ExtraEnv      map[string]string // additional env vars
 	MinDisk       int               // GB, minimum OS volume/disk size (used by VM providers for os_volume_size_gb)
 
+	// ModelSources is a list of HuggingFace model sources to pre-download during
+	// full-node bootstrap. Downloads run in the background after K3s starts so the
+	// cache is warm by the time Ray Serve tries to load the model.
+	// Format: "hf:org/model" or plain "org/model" (hf: prefix is stripped).
+	// Empty = no pre-download (model is fetched on first Ray Serve deploy).
+	ModelSources []string
+	// HFToken is an optional HuggingFace access token for gated models.
+	HFToken string
+
 	// Pre-generated bootstrap script and env vars for full-node mode.
 	// Callers set these when they have the bootstrap package available.
 	// If empty for ray-worker mode, providers generate their own vLLM script.
@@ -113,6 +122,21 @@ type Provider interface {
 
 	// ListInstances returns all instances managed by this provider.
 	ListInstances(ctx context.Context) ([]*Instance, error)
+}
+
+// HibernatingProvider is an optional interface for providers that support
+// stopping an instance without destroying it (disk preserved) and waking it later.
+// This enables fast cold-start: on demand, wake the stopped VM instead of provisioning
+// a fresh one — model files are already on disk, skipping the HuggingFace download.
+// Currently implemented by Vast.ai full-node VMs.
+type HibernatingProvider interface {
+	// StopInstance halts the instance without destroying its disk.
+	// The instance transitions to a stopped state; storage costs may still apply.
+	StopInstance(ctx context.Context, instanceID string) error
+
+	// WakeInstance restarts a previously stopped instance.
+	// On success the instance is running again; K3s agent will rejoin the cluster.
+	WakeInstance(ctx context.Context, instanceID string) error
 }
 
 // VolumeStore tracks volume→model mappings for cloud providers that don't

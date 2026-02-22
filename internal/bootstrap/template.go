@@ -9,11 +9,14 @@ import (
 
 // GenerateScript generates the full-node bootstrap script inline.
 // Installs Netbird VPN, NVIDIA Container Toolkit, and K3s agent.
-// Must stay under ~4KB (Vast.ai onstart field limit).
+// If config.ModelSources is set, also starts a background huggingface-cli download
+// after K3s so the model cache is warm before Ray Serve deploys.
 func GenerateScript(config provider.BootstrapConfig) string {
 	nodeName := fmt.Sprintf("gpuscale-%s", config.InstanceID)
 	gpuLabel := SanitizeLabel(config.GPUType)
 	provLabel := SanitizeLabel(config.ProviderName)
+
+	downloadSection := buildModelDownloadSection(config.ModelSources, config.HFToken)
 
 	return fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
@@ -58,10 +61,33 @@ curl -sfL https://get.k3s.io -o /tmp/k3s.sh && chmod +x /tmp/k3s.sh
 GL=$(echo '%s'|tr ' ' '-'|tr '[:upper:]' '[:lower:]')
 INSTALL_K3S_EXEC="agent --node-name=%s --node-ip=$NB_IP --node-external-ip=$NB_IP --flannel-iface=wt0 --node-label=gpuscale.io/managed=true --node-label=gpuscale.io/provider=%s --node-label=gpuscale.io/gpu-type=$GL --node-label=gpuscale.io/instance-id=%s --node-label=nvidia.com/gpu.present=true --node-taint=nvidia.com/gpu:NoSchedule --kubelet-arg=eviction-hard=imagefs.available<0%%,nodefs.available<0%%"
 INSTALL_K3S_VERSION='v1.35.0+k3s3' K3S_URL='%s' K3S_TOKEN='%s' INSTALL_K3S_EXEC="$INSTALL_K3S_EXEC" /tmp/k3s.sh
-echo '[gpuscale] done'
+%secho '[gpuscale] done'
 `, config.NetbirdKey,
 		gpuLabel, nodeName, provLabel, config.InstanceID,
-		config.K8sURL, config.K8sToken)
+		config.K8sURL, config.K8sToken,
+		downloadSection)
+}
+
+// buildModelDownloadSection returns a bash snippet that pre-downloads the given
+// HuggingFace model repos in the background. The snippet is empty if sources is empty.
+// Downloads run concurrently with K3s agent registration so cold-start latency is reduced.
+func buildModelDownloadSection(sources []string, hfToken string) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# Pre-download model weights (background, runs while K3s agent registers)\n")
+	b.WriteString("(\n")
+	if hfToken != "" {
+		fmt.Fprintf(&b, "  export HF_TOKEN='%s'\n", hfToken)
+	}
+	b.WriteString("  command -v huggingface-cli || pip3 install --quiet 'huggingface_hub[cli]'\n")
+	for _, src := range sources {
+		repo := strings.TrimPrefix(src, "hf:")
+		fmt.Fprintf(&b, "  huggingface-cli download '%s'\n", repo)
+	}
+	b.WriteString(") >> /tmp/hf-download.log 2>&1 &\n")
+	return b.String()
 }
 
 // GenerateEnvVars returns the environment variables map for a node instance.
