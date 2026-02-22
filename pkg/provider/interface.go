@@ -24,6 +24,7 @@ type GPURequirements struct {
 	MinDisk      int      // GB
 	MinRAM       int      // GB
 	NodeType     string   // "full-node" or "ray-worker" — used by providers to filter VM vs container offers
+	MinPCIeGen   int      // minimum PCIe generation (e.g., 4 for PCIe 4.0); 0 = no restriction
 }
 
 // Offer represents an available GPU instance from a provider.

@@ -49,6 +49,7 @@ type BundleOffer struct {
 	DPHTotal    float64 `json:"dph_total"`     // dollars per hour total
 	DPHBase     float64 `json:"dph_base"`      // base price
 	Reliability float64 `json:"reliability2"`  // reliability score 0-1
+	PcieBW      float64 `json:"pcie_bw"`       // PCIe bandwidth GB/s (e.g., 32.0 for PCIe 4.0 x16)
 	DiskSpace   float64 `json:"disk_space"`    // available disk in GB
 	RAMTotal    float64 `json:"cpu_ram"`       // system RAM in MB
 	CUDAVersion float64 `json:"cuda_max_good"` // max CUDA version

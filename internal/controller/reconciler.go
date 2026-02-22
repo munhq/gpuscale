@@ -233,6 +233,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		MaxPrice:     claim.Spec.Requirements.MaxPrice,
 		CapacityType: "spot",
 		NodeType:     nodeType,
+		MinPCIeGen:   pool.Spec.Requirements.MinPCIeGen,
 	}
 
 	// Note: full-node bootstrap script is generated inside the coordinator

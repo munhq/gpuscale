@@ -81,6 +81,13 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			continue
 		}
 
+		// Filter by minimum PCIe generation.
+		// PCIe 4.0 x16 = 32 GB/s; use 24 GB/s as threshold to allow x8 slots.
+		// PCIe 3.0 x16 = 16 GB/s, so any gen-4 machine will exceed 24 GB/s.
+		if req.MinPCIeGen >= 4 && o.PcieBW > 0 && o.PcieBW < 24.0 {
+			continue
+		}
+
 		vramGB := int(o.GPURAMTotal / 1024) // convert MB to GB
 		if vramGB == 0 && o.GPURAMTotal > 0 {
 			vramGB = 1

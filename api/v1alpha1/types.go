@@ -81,6 +81,10 @@ type GPURequirementsSpec struct {
 
 	// MinRAM is the minimum system RAM in GB.
 	MinRAM int `json:"minRAM,omitempty"`
+
+	// MinPCIeGen is the minimum PCIe generation required (e.g., 4 for PCIe 4.0).
+	// 0 means no restriction.
+	MinPCIeGen int `json:"minPCIeGen,omitempty"`
 }
 
 type ScalingSpec struct {
