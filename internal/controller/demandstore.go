@@ -411,17 +411,20 @@ func (s *DemandStore) SyncLoadedModels(ctx context.Context, clusterTruth map[str
 // mappings for reuse (e.g., Verda volumes don't have native tags).
 
 const (
-	volumePrefix        = "gpuscale:volume:"
-	instanceModelPrefix = "gpuscale:instance_model:"
+	volumePrefix         = "gpuscale:volume:"
+	instanceModelPrefix  = "gpuscale:instance_model:"
+	instanceDiskPrefix   = "gpuscale:instance_disk:"
 )
 
 // VolumeInfo tracks a cloud provider volume for model-aware reuse.
 type VolumeInfo struct {
-	VolumeID   string `json:"volumeId"`
-	ModelID    string `json:"modelId"`
-	InstanceID string `json:"instanceId"`
-	Provider   string `json:"provider"`
-	CreatedAt  string `json:"createdAt"`
+	VolumeID            string `json:"volumeId"`
+	ModelID             string `json:"modelId"`
+	InstanceID          string `json:"instanceId"`
+	Provider            string `json:"provider"`
+	CreatedAt           string `json:"createdAt"`
+	SizeGB              int    `json:"sizeGb"`              // disk size at provisioning time; 0 = unknown
+	BootstrapSucceeded  bool   `json:"bootstrapSucceeded"`  // true only if node reached Ready state
 }
 
 // RegisterInstanceModel records which model an instance serves.
@@ -445,8 +448,29 @@ func (s *DemandStore) GetInstanceModel(ctx context.Context, instanceID string) s
 	return val
 }
 
+// SetInstanceDiskSize records the allocated disk size for an instance at create time.
+func (s *DemandStore) SetInstanceDiskSize(ctx context.Context, instanceID string, sizeGB int) error {
+	if s == nil || s.rdb == nil || instanceID == "" {
+		return nil
+	}
+	return s.rdb.Set(ctx, instanceDiskPrefix+instanceID, sizeGB, 24*time.Hour).Err()
+}
+
+// GetInstanceDiskSize returns the disk size recorded for an instance. Returns 0 if unknown.
+func (s *DemandStore) GetInstanceDiskSize(ctx context.Context, instanceID string) int {
+	if s == nil || s.rdb == nil || instanceID == "" {
+		return 0
+	}
+	val, err := s.rdb.Get(ctx, instanceDiskPrefix+instanceID).Int()
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
 // RegisterVolume records a volume→model mapping for later reuse.
-func (s *DemandStore) RegisterVolume(ctx context.Context, volumeID, modelID, instanceID string) error {
+// sizeGB is the disk size at provisioning time (0 if unknown).
+func (s *DemandStore) RegisterVolume(ctx context.Context, volumeID, modelID, instanceID string, sizeGB int) error {
 	if s == nil || s.rdb == nil || volumeID == "" {
 		return nil
 	}
@@ -455,6 +479,8 @@ func (s *DemandStore) RegisterVolume(ctx context.Context, volumeID, modelID, ins
 		ModelID:    modelID,
 		InstanceID: instanceID,
 		CreatedAt:  time.Now().Format(time.RFC3339),
+		SizeGB:     sizeGB,
+		// BootstrapSucceeded stays false until MarkVolumeReady is called.
 	}
 	data, err := json.Marshal(info)
 	if err != nil {
@@ -463,9 +489,41 @@ func (s *DemandStore) RegisterVolume(ctx context.Context, volumeID, modelID, ins
 	return s.rdb.Set(ctx, volumePrefix+volumeID, data, 0).Err()
 }
 
-// FindVolumeForModel returns the volume ID of a tracked volume for the given model.
-// Returns "" if no matching volume is tracked.
-func (s *DemandStore) FindVolumeForModel(ctx context.Context, modelID string) string {
+// MarkVolumeReady marks the volume for an instance as successfully bootstrapped.
+// Called from the reconciler when the node reaches Ready state.
+func (s *DemandStore) MarkVolumeReady(ctx context.Context, instanceID string) error {
+	if s == nil || s.rdb == nil || instanceID == "" {
+		return nil
+	}
+	keys, err := s.rdb.Keys(ctx, volumePrefix+"*").Result()
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		data, err := s.rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+		var info VolumeInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+		if info.InstanceID == instanceID && !info.BootstrapSucceeded {
+			info.BootstrapSucceeded = true
+			updated, err := json.Marshal(info)
+			if err != nil {
+				continue
+			}
+			_ = s.rdb.Set(ctx, key, updated, 0).Err()
+		}
+	}
+	return nil
+}
+
+// FindVolumeForModel returns the volume ID of a tracked volume for the given model
+// that was successfully bootstrapped and has at least minDisk GB of storage.
+// minDisk=0 skips the size check. Returns "" if no suitable volume is found.
+func (s *DemandStore) FindVolumeForModel(ctx context.Context, modelID string, minDisk int) string {
 	if s == nil || s.rdb == nil || modelID == "" {
 		return ""
 	}
@@ -482,9 +540,16 @@ func (s *DemandStore) FindVolumeForModel(ctx context.Context, modelID string) st
 		if err := json.Unmarshal(data, &info); err != nil {
 			continue
 		}
-		if info.ModelID == modelID {
-			return info.VolumeID
+		if info.ModelID != modelID {
+			continue
 		}
+		if !info.BootstrapSucceeded {
+			continue
+		}
+		if minDisk > 0 && info.SizeGB > 0 && info.SizeGB < minDisk {
+			continue
+		}
+		return info.VolumeID
 	}
 	return ""
 }

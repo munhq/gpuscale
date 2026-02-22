@@ -124,7 +124,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 	if verdaImage == "" {
 		verdaImage = "ubuntu-24.04-cuda-12.8-open-docker"
 	}
-	if vol := p.findReusableVolume(ctx, config.ModelID); vol != "" {
+	if vol := p.findReusableVolume(ctx, config.ModelID, config.MinDisk); vol != "" {
 		verdaImage = vol
 	}
 
@@ -167,9 +167,12 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating verda instance: %w", err)
 	}
 
-	// Track instance→model so we can tag its volume at destroy time.
+	// Track instance→model and disk size so DestroyInstance can tag the volume correctly.
 	if p.volumeStore != nil && config.ModelID != "" {
 		_ = p.volumeStore.RegisterInstanceModel(ctx, resp.ID, config.ModelID)
+		if config.MinDisk > 0 {
+			_ = p.volumeStore.SetInstanceDiskSize(ctx, resp.ID, config.MinDisk)
+		}
 	}
 
 	// Build endpoint for ray-worker type
@@ -202,10 +205,11 @@ func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error
 	// model-aware reuse. Verda has no volume tags, so we track this in Redis.
 	if p.volumeStore != nil {
 		if modelID := p.volumeStore.GetInstanceModel(ctx, instanceID); modelID != "" {
+			sizeGB := p.volumeStore.GetInstanceDiskSize(ctx, instanceID)
 			if vols, err := p.client.ListVolumes(ctx); err == nil {
 				for _, v := range vols {
 					if v.InstanceID == instanceID && v.IsOSVolume {
-						_ = p.volumeStore.RegisterVolume(ctx, v.ID, modelID, instanceID)
+						_ = p.volumeStore.RegisterVolume(ctx, v.ID, modelID, instanceID, sizeGB)
 					}
 				}
 			}
@@ -238,54 +242,41 @@ func (p *Provider) cleanupDetachedVolumes(ctx context.Context) {
 // OS volume that can be reused as the boot image for a new instance.
 // Prioritizes volumes tracked in Redis as serving the same model.
 // Falls back to any detached OS volume (still has CUDA/deps installed).
-func (p *Provider) findReusableVolume(ctx context.Context, modelID string) string {
-	// Look up the best volume for this model from Redis registry.
-	var trackedVolumeID string
-	if p.volumeStore != nil && modelID != "" {
-		trackedVolumeID = p.volumeStore.FindVolumeForModel(ctx, modelID)
+// findReusableVolume returns the ID of a successfully bootstrapped OS volume
+// that is suitable for reuse. Only volumes marked BootstrapSucceeded=true in
+// the volume store are considered; volumes with SizeGB < minDisk are rejected.
+// Falls back to trash volumes within the 96h recovery window.
+func (p *Provider) findReusableVolume(ctx context.Context, modelID string, minDisk int) string {
+	if p.volumeStore == nil {
+		return ""
 	}
 
-	// 1. Check for already detached volumes
+	// Look up a validated volume for this model from the registry.
+	// FindVolumeForModel already filters by BootstrapSucceeded and SizeGB.
+	trackedVolumeID := p.volumeStore.FindVolumeForModel(ctx, modelID, minDisk)
+
+	// 1. Check for already detached volumes — no restore needed.
 	vols, err := p.client.ListVolumes(ctx)
-	if err == nil {
-		// First: exact model match from Redis registry
-		if trackedVolumeID != "" {
-			for _, v := range vols {
-				if v.ID == trackedVolumeID && v.Status == "detached" && v.IsOSVolume {
-					return v.ID
-				}
-			}
-		}
-		// Second: any detached OS volume (still has CUDA/K3s/deps)
+	if err == nil && trackedVolumeID != "" {
 		for _, v := range vols {
-			if v.Status == "detached" && v.IsOSVolume {
+			if v.ID == trackedVolumeID && v.Status == "detached" && v.IsOSVolume {
 				return v.ID
 			}
 		}
 	}
 
-	// 2. Check the trash for recoverable volumes (96h window)
+	// 2. Check the trash for recoverable volumes (96h window).
 	trashVols, err := p.client.ListDeletedVolumes(ctx)
 	if err != nil {
 		return ""
 	}
 
-	// First: exact model match in trash via Redis registry
 	if trackedVolumeID != "" {
 		for _, v := range trashVols {
 			if v.ID == trackedVolumeID && v.IsOSVolume {
 				if err := p.client.RestoreVolume(ctx, v.ID); err == nil {
 					return v.ID
 				}
-			}
-		}
-	}
-
-	// Second: any OS volume in trash
-	for _, v := range trashVols {
-		if v.IsOSVolume {
-			if err := p.client.RestoreVolume(ctx, v.ID); err == nil {
-				return v.ID
 			}
 		}
 	}

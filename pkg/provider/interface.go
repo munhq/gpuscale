@@ -125,11 +125,23 @@ type VolumeStore interface {
 	// GetInstanceModel returns the model ID for a given instance.
 	GetInstanceModel(ctx context.Context, instanceID string) string
 
-	// RegisterVolume records a volume→model mapping for later reuse.
-	RegisterVolume(ctx context.Context, volumeID, modelID, instanceID string) error
+	// SetInstanceDiskSize records the allocated disk size for an instance.
+	// Called at CreateInstance time so DestroyInstance can include it in RegisterVolume.
+	SetInstanceDiskSize(ctx context.Context, instanceID string, sizeGB int) error
 
-	// FindVolumeForModel returns the ID of a tracked volume for the given model.
-	FindVolumeForModel(ctx context.Context, modelID string) string
+	// GetInstanceDiskSize returns the disk size recorded for an instance.
+	GetInstanceDiskSize(ctx context.Context, instanceID string) int
+
+	// RegisterVolume records a volume→model mapping for later reuse.
+	RegisterVolume(ctx context.Context, volumeID, modelID, instanceID string, sizeGB int) error
+
+	// MarkVolumeReady marks a volume's bootstrap as successfully completed.
+	// Only volumes marked ready are eligible for reuse.
+	MarkVolumeReady(ctx context.Context, instanceID string) error
+
+	// FindVolumeForModel returns the ID of a tracked volume for the given model
+	// that was successfully bootstrapped and meets the minimum disk size.
+	FindVolumeForModel(ctx context.Context, modelID string, minDisk int) string
 
 	// UnregisterVolume removes a volume tracking entry.
 	UnregisterVolume(ctx context.Context, volumeID string) error

@@ -560,6 +560,15 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 		log.Error(err, "Failed to publish worker to Dragonfly")
 	}
 
+	// Mark the volume for this instance as successfully bootstrapped so it is
+	// eligible for reuse on next cold start. Volumes from failed instances are
+	// never marked ready and will not be reused.
+	if r.DemandStore != nil && claim.Status.InstanceID != "" {
+		if err := r.DemandStore.MarkVolumeReady(ctx, claim.Status.InstanceID); err != nil {
+			log.Error(err, "Failed to mark volume ready")
+		}
+	}
+
 	// Node is Ready but the model is NOT loaded yet — KubeRay still needs to
 	// create a worker pod and Ray Serve needs to deploy the model.
 	// Publish a "try drain" event so GPU API's queue processor sends a request
