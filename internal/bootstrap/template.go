@@ -42,6 +42,7 @@ echo "deb [signed-by=/usr/share/keyrings/nvcr.gpg] https://nvidia.github.io/libn
 apt-get update -qq && apt-get install -y nvidia-container-toolkit
 fi
 nvidia-smi -pm 1||true
+mkdir -p /opt/gpu && chmod 777 /opt/gpu
 mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
 cat>/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl<<'C'
 version = 3
