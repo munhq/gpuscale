@@ -87,21 +87,22 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		// Check real-time availability — ListInstanceTypes returns the catalog,
 		// not live capacity. Without this check we get 503 on create for offers
 		// that exist but have no available nodes in any location.
-		avail, err := p.client.CheckAvailability(ctx, t.InstanceType, isSpot)
-		if err != nil {
-			// If availability check fails, skip rather than attempt a doomed create.
-			continue
-		}
+		// If the availability check itself fails, include the offer anyway and
+		// let the create attempt surface the real error.
 		location := ""
-		for _, a := range avail {
-			if a.Available {
-				location = a.Location
-				break
+		avail, err := p.client.CheckAvailability(ctx, t.InstanceType, isSpot)
+		if err == nil {
+			for _, a := range avail {
+				if a.Available {
+					location = a.Location
+					break
+				}
+			}
+			if location == "" {
+				continue // availability confirmed: no capacity anywhere
 			}
 		}
-		if location == "" {
-			continue // no capacity anywhere
-		}
+		// err != nil: availability API failed — include offer with no pinned location
 
 		offers = append(offers, provider.Offer{
 			ProviderName: p.Name(),
