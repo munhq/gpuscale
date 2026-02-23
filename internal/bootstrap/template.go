@@ -77,15 +77,18 @@ func buildModelDownloadSection(sources []string, hfToken string) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("# Pre-download model weights (background, runs while K3s agent registers)\n")
+	b.WriteString("# Pre-download model weights into /opt/gpu (background, runs while K3s agent registers)\n")
 	b.WriteString("(\n")
+	b.WriteString("  export HF_HOME=/opt/gpu/huggingface\n")
 	if hfToken != "" {
 		fmt.Fprintf(&b, "  export HF_TOKEN='%s'\n", hfToken)
 	}
 	b.WriteString("  command -v huggingface-cli || pip3 install --quiet 'huggingface_hub[cli]'\n")
 	for _, src := range sources {
-		repo := strings.TrimPrefix(src, "hf:")
-		fmt.Fprintf(&b, "  huggingface-cli download '%s'\n", repo)
+		// Strip hf: or hf:// prefix — huggingface-cli takes bare repo IDs.
+		repo := strings.TrimPrefix(src, "hf://")
+		repo = strings.TrimPrefix(repo, "hf:")
+		fmt.Fprintf(&b, "  huggingface-cli download '%s' && echo '[gpuscale] downloaded %s'\n", repo, repo)
 	}
 	b.WriteString(") >> /tmp/hf-download.log 2>&1 &\n")
 	return b.String()
