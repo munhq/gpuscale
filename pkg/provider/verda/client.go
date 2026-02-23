@@ -216,11 +216,20 @@ func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isS
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
+	// API returns a bare boolean (true/false) indicating global availability.
+	var available bool
+	if err := json.Unmarshal(body, &available); err == nil {
+		if available {
+			return []AvailabilityResponse{{Available: true}}, nil
+		}
+		return []AvailabilityResponse{}, nil
+	}
+
+	// Legacy: try array or wrapped object format.
 	var avail []AvailabilityResponse
 	if err := json.Unmarshal(body, &avail); err == nil {
 		return avail, nil
 	}
-
 	var wrapped struct {
 		Data []AvailabilityResponse `json:"data"`
 	}
