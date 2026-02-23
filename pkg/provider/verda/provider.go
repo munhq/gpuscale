@@ -92,14 +92,16 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		location := ""
 		avail, err := p.client.CheckAvailability(ctx, t.InstanceType, isSpot)
 		if err == nil {
+			available := false
 			for _, a := range avail {
 				if a.Available {
-					location = a.Location
+					available = true
+					location = a.Location // may be empty if API returns global availability
 					break
 				}
 			}
-			if location == "" {
-				continue // availability confirmed: no capacity anywhere
+			if !available {
+				continue // confirmed: no capacity anywhere
 			}
 		}
 		// err != nil: availability API failed — include offer with no pinned location
