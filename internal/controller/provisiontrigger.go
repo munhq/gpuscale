@@ -119,19 +119,6 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		if c.Spec.ModelID != model && !slices.Contains(c.Spec.ModelIDs, model) {
 			continue
 		}
-		// Hibernated claim: wake it instead of creating a new one.
-		// This preserves the disk with pre-downloaded model files.
-		if c.Status.Phase == v1alpha1.ClaimPhaseHibernated {
-			log.Info("Hibernated claim found for model, requesting wake-up", "claim", c.Name, "model", model)
-			if c.Annotations == nil {
-				c.Annotations = make(map[string]string)
-			}
-			c.Annotations[annotationWakeRequested] = "true"
-			if err := r.Update(ctx, c); err != nil {
-				return fmt.Errorf("annotating hibernated claim for wake-up: %w", err)
-			}
-			return nil
-		}
 		log.Info("Model already covered by existing claim", "claim", c.Name, "phase", c.Status.Phase)
 		return nil
 	}
@@ -247,7 +234,7 @@ const maxBundleVRAMGB = 96
 // starting from primaryModel. It scans all demands and bundles models that:
 //   - share the same nodeType as the primary model
 //   - have pending demand (queue or active)
-//   - are not already covered by an active (non-Hibernated, non-Terminated) claim
+//   - are not already covered by an active (non-Terminated) claim
 //   - fit within maxBundleVRAMGB when added to the running total
 //
 // Returns (modelIDs, totalVRAM, maxDisk, gpuTypes).
@@ -304,8 +291,7 @@ func (r *ProvisionTrigger) aggregateModelsForClaim(
 			continue
 		}
 
-		// Skip if this model already has an active (non-Hibernated) claim.
-		// Hibernated claims are OK — they will be woken separately by handleTrigger.
+		// Skip if this model already has an active claim.
 		alreadyCovered := false
 		for _, c := range existingClaims {
 			if c.Status.Phase == v1alpha1.ClaimPhaseTerminated ||

@@ -713,77 +713,12 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
-// hibernatedTTL is the maximum time a claim may stay in Hibernated phase before
-// the underlying instance is destroyed. This prevents zombie Verda VMs from
-// accruing storage charges indefinitely when a model is no longer requested.
-const hibernatedTTL = 7 * 24 * time.Hour
-
-// handleHibernated handles a claim in the Hibernated phase.
-// It waits for the annotationWakeRequested annotation set by ProvisionTrigger when
-// demand returns for one of the co-located models.
-// On wake: calls WakeInstance on the provider, then transitions back to Bootstrapping
-// so the normal K3s-node-join flow takes over.
-// TTL: if the claim has been hibernated for longer than hibernatedTTL, the instance
-// is destroyed and the claim terminated to avoid indefinite storage charges.
+// handleHibernated destroys any claim left in the Hibernated phase.
+// Hibernation is no longer used — idle instances are always destroyed.
+// This handles cleanup of any claims that were hibernated before this policy change.
 func (r *ClaimReconciler) handleHibernated(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
-	// TTL check: destroy hibernated instances that have been idle too long.
-	// IdleSince is set by the DisruptionController when the node first went idle
-	// (just before the cooldown + hibernation sequence). It is a close approximation
-	// of when hibernation started.
-	if claim.Status.IdleSince != nil && time.Since(claim.Status.IdleSince.Time) > hibernatedTTL {
-		log.Info("Hibernated claim exceeded TTL, destroying instance",
-			"instanceID", claim.Status.InstanceID,
-			"idleSince", claim.Status.IdleSince.Time.Format(time.RFC3339),
-			"ttl", hibernatedTTL.String(),
-		)
-		return r.destroyHibernatedClaim(ctx, claim, log)
-	}
-
-	if claim.Annotations[annotationWakeRequested] != "true" {
-		// No wake requested — check again in 60s (low-frequency poll).
-		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-	}
-
-	log.Info("Wake-up requested for hibernated claim", "instanceID", claim.Status.InstanceID, "models", claimModelIDs(claim))
-
-	prov, ok := r.Registry.Get(claim.Status.Provider)
-	if !ok {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, fmt.Errorf("provider %q not in registry", claim.Status.Provider)
-	}
-
-	hibernator, canWake := prov.(provider.HibernatingProvider)
-	if !canWake {
-		// Provider doesn't support wake — re-provision from scratch.
-		log.Info("Provider does not support wake; re-provisioning from scratch")
-		delete(claim.Annotations, annotationWakeRequested)
-		if err := r.Update(ctx, claim); err != nil {
-			return ctrl.Result{}, err
-		}
-		claim.Status.Phase = v1alpha1.ClaimPhasePending
-		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, claim)
-	}
-
-	if err := hibernator.WakeInstance(ctx, claim.Status.InstanceID); err != nil {
-		log.Error(err, "Failed to wake instance; retrying in 30s")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// Remove wake annotation and transition to Bootstrapping.
-	// The normal full-node Bootstrapping path polls until the K3s node re-appears.
-	delete(claim.Annotations, annotationWakeRequested)
-	if err := r.Update(ctx, claim); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	now := metav1.Now()
-	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
-	claim.Status.ProvisionedAt = &now
-	if err := r.Status().Update(ctx, claim); err != nil {
-		return ctrl.Result{}, fmt.Errorf("transitioning claim to Bootstrapping: %w", err)
-	}
-
-	log.Info("Instance woken, transitioned to Bootstrapping", "claim", claim.Name)
-	return ctrl.Result{Requeue: true}, nil
+	log.Info("Destroying hibernated claim (hibernation no longer used)", "claim", claim.Name, "instanceID", claim.Status.InstanceID)
+	return r.destroyHibernatedClaim(ctx, claim, log)
 }
 
 // handleReady periodically checks that the provider instance backing a Ready claim
@@ -1311,7 +1246,7 @@ func (r *ClaimReconciler) destroyHibernatedClaim(ctx context.Context, claim *v1a
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: now,
 		Reason:             "TTLExceeded",
-		Message:            fmt.Sprintf("Hibernated claim exceeded TTL of %s", hibernatedTTL),
+		Message:            "Hibernated claim destroyed (hibernation no longer used)",
 	})
 	if err := r.Status().Update(ctx, claim); err != nil {
 		return ctrl.Result{}, fmt.Errorf("terminating expired hibernated claim: %w", err)

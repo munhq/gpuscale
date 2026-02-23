@@ -23,10 +23,6 @@ import (
 // the normal cooldown and drains the claim immediately.
 const annotationConsolidationDrain = "gpuscale.io/consolidation-drain"
 
-// annotationWakeRequested is set by ProvisionTrigger when demand arrives for a model
-// whose claim is in ClaimPhaseHibernated. The ClaimReconciler wakes the VM on seeing this.
-const annotationWakeRequested = "gpuscale.io/wake-requested"
-
 // DisruptionController watches managed nodes and GPUNodeClaims, destroying idle ones after cooldown.
 // Supports two modes:
 //   - full-node: watches Kubernetes Node objects, pod-based idle detection, drain-and-destroy
@@ -68,8 +64,7 @@ func (r *DisruptionController) Reconcile(ctx context.Context, req ctrl.Request) 
 	case v1alpha1.ClaimPhaseReady:
 		// normal path below
 	case v1alpha1.ClaimPhaseHibernated:
-		// Hibernated claims are woken by the ClaimReconciler, not the DisruptionController.
-		// Nothing to do here.
+		// Hibernated claims (legacy) are cleaned up by the ClaimReconciler.
 		return ctrl.Result{}, nil
 	default:
 		return ctrl.Result{}, nil
@@ -129,7 +124,7 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 		if r.isNodeStuck(ctx, modelIDs) {
 			log.Info("Node is stuck: models DEPLOY_FAILED/UNHEALTHY with no demand, draining after cooldown", "models", modelIDs)
 			return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
-				return r.hibernateOrDestroy(ctx, &node, claim, log)
+				return r.drainAndDestroy(ctx, &node, claim, log)
 			})
 		}
 		// Genuinely busy — clear any stale idle timer and wait.
@@ -142,11 +137,9 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 	}
 
-	// Node is idle (no GPU pods). Enter cooldown.
-	// For Vast.ai full-node: hibernate (stop VM, preserve disk) instead of destroy.
-	// The model files stay on disk so the next wake-up skips the HuggingFace download.
+	// Node is idle (no GPU pods). Enter cooldown then destroy.
 	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
-		return r.hibernateOrDestroy(ctx, &node, claim, log)
+		return r.drainAndDestroy(ctx, &node, claim, log)
 	})
 }
 
@@ -363,72 +356,6 @@ func (r *DisruptionController) isAnyModelAlwaysActive(ctx context.Context, model
 		}
 	}
 	return false
-}
-
-// hibernateOrDestroy checks if the provider supports hibernation (stop without disk loss).
-// For Vast.ai full-node VMs: stops the instance and sets claim phase to Hibernated.
-//   - The K8s node is drained and deleted so the cluster is clean.
-//   - The Vast.ai VM retains its disk (model files stay cached).
-//   - On next demand, ProvisionTrigger annotates the claim and ClaimReconciler wakes it.
-//
-// For providers without hibernation support: falls back to full destroy.
-func (r *DisruptionController) hibernateOrDestroy(ctx context.Context, node *corev1.Node, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
-	prov, ok := r.Registry.Get(claim.Status.Provider)
-	if !ok {
-		return ctrl.Result{}, fmt.Errorf("provider %q not found in registry", claim.Status.Provider)
-	}
-
-	hibernator, canHibernate := prov.(provider.HibernatingProvider)
-	if !canHibernate {
-		// Provider doesn't support hibernation — do a normal full destroy.
-		return r.drainAndDestroy(ctx, node, claim, log)
-	}
-
-	// Cordon + drain pods so the node is clean before stopping the VM.
-	claim.Status.Phase = v1alpha1.ClaimPhaseDraining
-	if err := r.Status().Update(ctx, claim); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating claim phase to Draining: %w", err)
-	}
-	if !node.Spec.Unschedulable {
-		node.Spec.Unschedulable = true
-		if err := r.Update(ctx, node); err != nil {
-			return ctrl.Result{}, fmt.Errorf("cordoning node: %w", err)
-		}
-	}
-	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err == nil {
-		for _, pod := range podList.Items {
-			if isDaemonSetPod(&pod) {
-				continue
-			}
-			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-				continue
-			}
-			_ = r.Delete(ctx, &pod, client.GracePeriodSeconds(30))
-		}
-	}
-
-	// Stop the VM — disk is preserved.
-	if err := hibernator.StopInstance(ctx, claim.Status.InstanceID); err != nil {
-		log.Error(err, "Failed to stop instance for hibernation; falling back to destroy")
-		return r.drainAndDestroy(ctx, node, claim, log)
-	}
-	log.Info("Instance hibernated (stopped, disk preserved)", "instanceID", claim.Status.InstanceID)
-
-	// Delete the K8s node object — it will re-appear when the VM restarts.
-	if err := r.Delete(ctx, node); err != nil {
-		log.Error(err, "Failed to delete K8s node object after hibernation")
-	}
-
-	// Mark claim as Hibernated — keep it alive so ProvisionTrigger can wake it.
-	claim.Status.Phase = v1alpha1.ClaimPhaseHibernated
-	claim.Status.NodeName = ""
-	if err := r.Status().Update(ctx, claim); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating claim phase to Hibernated: %w", err)
-	}
-
-	log.Info("Claim hibernated", "claim", claim.Name, "models", claimModelIDs(claim))
-	return ctrl.Result{}, nil
 }
 
 func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
