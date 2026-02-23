@@ -191,18 +191,12 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 		maxPrice = cfg.MaxPricePerGPU * float64(gpuCount)
 	}
 
-	// For multi-model claims: no MaxVRAM upper bound — MinVRAM drives selection.
-	// For single-model claims: keep the auto-computed cap to avoid over-provisioning.
+	// MaxVRAM: use explicit per-model config if set, otherwise no upper bound.
+	// The coordinator finds the cheapest GPU where VRAM >= MinVRAM naturally.
+	// For multi-model claims: always 0 (no cap) — MinVRAM = sum of all models drives selection.
 	maxVRAM := 0
 	if len(modelIDs) == 1 {
-		maxVRAM = cfg.MaxVRAMPerGPU
-		if maxVRAM == 0 && cfg.VRAMRequired > 0 {
-			perGPUNeed := (cfg.VRAMRequired + gpuCount - 1) / gpuCount
-			maxVRAM = perGPUNeed * 3
-			if maxVRAM > 48 {
-				maxVRAM = 48
-			}
-		}
+		maxVRAM = cfg.MaxVRAMPerGPU // 0 if not explicitly set = no upper bound
 	}
 
 	// Create the claim
@@ -271,7 +265,6 @@ func (r *ProvisionTrigger) aggregateModelsForClaim(
 	// Start with the primary model.
 	modelIDs = []string{primaryModel}
 	totalVRAM = primaryCfg.VRAMRequired
-	maxDisk = primaryCfg.MinDisk
 	gpuTypes = primaryCfg.PreferredGPUs
 
 	// Fetch all model demands.
@@ -332,10 +325,13 @@ func (r *ProvisionTrigger) aggregateModelsForClaim(
 		// Bundle the model into this claim.
 		modelIDs = append(modelIDs, d.Model)
 		totalVRAM += otherCfg.VRAMRequired
-		if otherCfg.MinDisk > maxDisk {
-			maxDisk = otherCfg.MinDisk
-		}
 	}
+
+	// Disk = sum of all model weights + single overhead for OS/tools/buffer.
+	// Each model needs ~vramRequired GB on disk (HF safetensors ≈ VRAM size).
+	// Overhead (50GB) is added once regardless of model count.
+	const diskOverheadGB = 50
+	maxDisk = totalVRAM + diskOverheadGB
 
 	// For multi-model bin-packed claims: clear gpuTypes.
 	// Different models have conflicting preferred GPUs (e.g., V100 vs A100).
@@ -436,18 +432,17 @@ func (r *ProvisionTrigger) createBinPackedClaim(ctx context.Context, candidates 
 	// Collect all model IDs and aggregate requirements.
 	modelIDs := make([]string, 0, len(candidates))
 	totalVRAM := 0
-	maxDisk := 0
 	maxPricePerGPU := 0.0
 	for _, c := range candidates {
 		modelIDs = append(modelIDs, c.claim.Spec.ModelID)
 		totalVRAM += c.cfg.VRAMRequired
-		if c.cfg.MinDisk > maxDisk {
-			maxDisk = c.cfg.MinDisk
-		}
 		if c.cfg.MaxPricePerGPU > maxPricePerGPU {
 			maxPricePerGPU = c.cfg.MaxPricePerGPU
 		}
 	}
+	// Disk = sum of all model weights + overhead once.
+	const diskOverheadGB = 50
+	maxDisk := totalVRAM + diskOverheadGB
 	// MaxPrice: use the highest per-GPU price among co-located models.
 	// A bin-packed node replaces multiple single-model nodes; the highest
 	// individual per-GPU price is a safe ceiling for the combined node.

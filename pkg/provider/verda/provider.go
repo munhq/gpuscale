@@ -152,13 +152,18 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		StartupScriptID: scriptResp.ID,
 		IsSpot:          offer.CapacityType == "spot",
 	}
-	// Set OS volume size from the model's disk requirement.
-	// MinDisk = VRAMRequired + 50GB overhead (image + OS/K3s), computed by GPU API and
-	// threaded through Dragonfly → ClaimRequirements → BootstrapConfig.
-	// Only set for full-node instances (VMs with OS volumes); containers don't use this field.
+	// Set OS volume name and size from the model's disk requirement.
+	// MinDisk = VRAMRequired + 50GB overhead (model weights + OS/K3s/CUDA tools).
+	// Verda API requires an os_volume object with {name, size}; plain os_volume_size_gb doesn't exist.
+	// on_spot_discontinue=keep_detached means the volume survives spot eviction as a detached
+	// volume, which our volume-reuse logic can then recover from trash for the next cold start.
+	// Only applicable when image is an OS image type (not a volume UUID reuse).
 	if config.NodeType == "full-node" && config.MinDisk > 0 {
-		diskGB := config.MinDisk
-		createReq.OsVolumeSizeGB = &diskGB
+		createReq.OsVolume = &OsVolumeRequest{
+			Name:              fmt.Sprintf("gpuscale-%s-os", config.InstanceID),
+			Size:              config.MinDisk,
+			OnSpotDiscontinue: "keep_detached",
+		}
 	}
 
 	resp, err := p.client.CreateInstance(ctx, createReq)

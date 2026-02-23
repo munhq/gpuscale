@@ -230,17 +230,25 @@ func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isS
 	return wrapped.Data, nil
 }
 
+// OsVolumeRequest configures the OS volume for a new Verda instance.
+// Use when image is an OS image type (not a volume UUID).
+type OsVolumeRequest struct {
+	Name               string `json:"name"`
+	Size               int    `json:"size"` // GB
+	OnSpotDiscontinue  string `json:"on_spot_discontinue,omitempty"` // "keep_detached" (default), "move_to_trash", "delete_permanently"
+}
+
 // CreateInstanceRequest is the body for creating a Verda instance.
 type CreateInstanceRequest struct {
-	InstanceType    string    `json:"instance_type"`
-	Image           string    `json:"image"`
-	Description     string    `json:"description"`
-	SSHKeyIDs       *[]string `json:"ssh_key_ids"` // must be null, not omitted — Verda rejects missing field
-	Hostname        string    `json:"hostname"`
-	StartupScriptID string    `json:"startup_script_id,omitempty"`
-	LocationCode    string    `json:"location_code,omitempty"`
-	IsSpot          bool      `json:"is_spot"`
-	OsVolumeSizeGB  *int      `json:"os_volume_size_gb,omitempty"` // override OS disk size (GB); nil = use Verda default
+	InstanceType    string           `json:"instance_type"`
+	Image           string           `json:"image"`
+	Description     string           `json:"description"`
+	SSHKeyIDs       *[]string        `json:"ssh_key_ids"` // must be null, not omitted — Verda rejects missing field
+	Hostname        string           `json:"hostname"`
+	StartupScriptID string           `json:"startup_script_id,omitempty"`
+	LocationCode    string           `json:"location_code,omitempty"`
+	IsSpot          bool             `json:"is_spot"`
+	OsVolume        *OsVolumeRequest `json:"os_volume,omitempty"` // sets OS disk name+size; nil = use Verda default (50GB)
 }
 
 // InstanceResponse represents a Verda instance.
