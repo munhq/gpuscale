@@ -51,7 +51,12 @@ func matchesAnyGPUType(gpuType string, wanted []string) bool {
 	gpuLower := strings.ToLower(gpuType)
 	for _, w := range wanted {
 		wLower := strings.ToLower(w)
-		if gpuLower == wLower || strings.Contains(gpuLower, wLower) {
+		// Bidirectional: "V100" matches "Tesla V100-SXM2-16GB" because the
+		// wanted string contains the short name. Also handles the reverse
+		// (full provider name contains the wanted substring).
+		if gpuLower == wLower ||
+			strings.Contains(gpuLower, wLower) ||
+			strings.Contains(wLower, gpuLower) {
 			return true
 		}
 	}

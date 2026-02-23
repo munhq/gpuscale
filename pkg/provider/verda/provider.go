@@ -59,10 +59,9 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		if req.MinRAM > 0 && ramGB < req.MinRAM {
 			continue
 		}
-		// Filter by GPU type
-		if len(req.GPUTypes) > 0 && !matchesGPUType(gpuType, req.GPUTypes) {
-			continue
-		}
+		// GPUTypes is a soft preference handled by the coordinator's sort order.
+		// Verda should not hard-filter by GPU type — the coordinator picks the
+		// best matching GPU from whatever offers come back.
 
 		// Parse string prices to float64
 		onDemandPrice, err := parsePrice(t.PricePerHour)
@@ -404,15 +403,6 @@ func parsePrice(priceStr string) (float64, error) {
 	return strconv.ParseFloat(strings.TrimSpace(priceStr), 64)
 }
 
-func matchesGPUType(gpuType string, wanted []string) bool {
-	gpuLower := strings.ToLower(gpuType)
-	for _, w := range wanted {
-		if strings.ToLower(w) == gpuLower || strings.Contains(gpuLower, strings.ToLower(w)) {
-			return true
-		}
-	}
-	return false
-}
 
 // StopInstance implements provider.HibernatingProvider.
 // Stops the VM without destroying its OS volume so model weights are preserved on disk.
