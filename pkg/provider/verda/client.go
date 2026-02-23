@@ -187,56 +187,69 @@ func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) 
 	return wrapped.Data, nil
 }
 
-// AvailabilityResponse wraps the availability check response.
-type AvailabilityResponse struct {
-	Available bool   `json:"available"`
-	Location  string `json:"location_code"`
+// Location represents a Verda datacenter.
+type Location struct {
+	Code        string `json:"code"`
+	Name        string `json:"name"`
+	CountryCode string `json:"country_code"`
 }
 
-// CheckAvailability checks if an instance type is available.
-func (c *Client) CheckAvailability(ctx context.Context, instanceType string, isSpot bool) ([]AvailabilityResponse, error) {
-	spotParam := "false"
-	if isSpot {
-		spotParam = "true"
-	}
-	path := fmt.Sprintf("/instance-availability/%s?is_spot=%s", instanceType, spotParam)
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+// ListLocations returns all available Verda datacenters.
+func (c *Client) ListLocations(ctx context.Context) ([]Location, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/locations", nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("verda availability returned %d: %s", resp.StatusCode, string(body))
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}
-
-	// API returns a bare boolean (true/false) indicating global availability.
-	var available bool
-	if err := json.Unmarshal(body, &available); err == nil {
-		if available {
-			return []AvailabilityResponse{{Available: true}}, nil
-		}
-		return []AvailabilityResponse{}, nil
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("verda locations returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Legacy: try array or wrapped object format.
-	var avail []AvailabilityResponse
-	if err := json.Unmarshal(body, &avail); err == nil {
-		return avail, nil
+	var locs []Location
+	if err := json.Unmarshal(body, &locs); err == nil {
+		return locs, nil
 	}
 	var wrapped struct {
-		Data []AvailabilityResponse `json:"data"`
+		Data []Location `json:"data"`
 	}
 	if err := json.Unmarshal(body, &wrapped); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		return nil, fmt.Errorf("decoding locations: %w", err)
 	}
 	return wrapped.Data, nil
+}
+
+// CheckAvailabilityInLocation checks if an instance type is available in a specific location.
+// The API returns a bare boolean.
+func (c *Client) CheckAvailabilityInLocation(ctx context.Context, instanceType string, isSpot bool, locationCode string) (bool, error) {
+	spotParam := "false"
+	if isSpot {
+		spotParam = "true"
+	}
+	path := fmt.Sprintf("/instance-availability/%s?is_spot=%s&location_code=%s", instanceType, spotParam, locationCode)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("reading response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("verda availability returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var available bool
+	if err := json.Unmarshal(body, &available); err != nil {
+		return false, fmt.Errorf("decoding availability: %w", err)
+	}
+	return available, nil
 }
 
 // OsVolumeRequest configures the OS volume for a new Verda instance.

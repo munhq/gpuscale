@@ -39,38 +39,38 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		return nil, fmt.Errorf("listing verda instance types: %w", err)
 	}
 
+	locations, err := p.client.ListLocations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing verda locations: %w", err)
+	}
+
 	isSpot := req.CapacityType == "spot"
 
 	var offers []provider.Offer
 	for _, t := range types {
-		// Extract nested fields
 		gpuCount := t.GPU.NumberOfGPUs
 		vramGB := t.GPUMemory.SizeInGigabytes
 		ramGB := t.Memory.SizeInGigabytes
 		gpuType := t.Model
 
-		// Filter by GPU count
-		if req.GPUCount > 0 && gpuCount < req.GPUCount {
+		// Single-GPU only when multiGpu is disabled.
+		if !req.MultiGpu && gpuCount > 1 {
 			continue
 		}
-		// Filter by VRAM
-		if req.MinVRAM > 0 && vramGB < req.MinVRAM {
+		// Total VRAM on this instance must cover the requirement.
+		totalVRAM := gpuCount * vramGB
+		if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
 			continue
 		}
-		// Filter by RAM
 		if req.MinRAM > 0 && ramGB < req.MinRAM {
 			continue
 		}
-		// GPUTypes is a soft preference handled by the coordinator's sort order.
-		// Verda should not hard-filter by GPU type — the coordinator picks the
-		// best matching GPU from whatever offers come back.
 
-		// Parse string prices to float64
 		onDemandPrice, err := parsePrice(t.PricePerHour)
 		if err != nil {
-			continue // Skip offers with invalid prices
+			continue
 		}
-		spotPrice, _ := parsePrice(t.SpotPrice) // Ignore error, spotPrice can be 0
+		spotPrice, _ := parsePrice(t.SpotPrice)
 
 		price := onDemandPrice
 		capacityType := "on-demand"
@@ -79,46 +79,32 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			capacityType = "spot"
 		}
 
-		// Filter by price
 		if req.MaxPrice > 0 && price > req.MaxPrice {
 			continue
 		}
 
-		// Check real-time availability — ListInstanceTypes returns the catalog,
-		// not live capacity. Without this check we get 503 on create for offers
-		// that exist but have no available nodes in any location.
-		// If the availability check itself fails, include the offer anyway and
-		// let the create attempt surface the real error.
-		location := ""
-		avail, err := p.client.CheckAvailability(ctx, t.InstanceType, isSpot)
-		if err == nil {
-			available := false
-			for _, a := range avail {
-				if a.Available {
-					available = true
-					location = a.Location // may be empty if API returns global availability
-					break
-				}
+		// Check per-location availability and emit one offer per available location.
+		// This tells CreateInstance exactly where to deploy instead of defaulting to
+		// the account's home datacenter which may not have the required GPU.
+		for _, loc := range locations {
+			avail, err := p.client.CheckAvailabilityInLocation(ctx, t.InstanceType, isSpot, loc.Code)
+			if err != nil || !avail {
+				continue
 			}
-			if !available {
-				continue // confirmed: no capacity anywhere
-			}
+			offers = append(offers, provider.Offer{
+				ProviderName: p.Name(),
+				OfferID:      t.InstanceType,
+				GPUType:      gpuType,
+				GPUCount:     gpuCount,
+				VRAM:         vramGB,
+				PricePerHour: price,
+				CapacityType: capacityType,
+				Region:       loc.Code,
+				Reliability:  0.95,
+				DiskGB:       0,
+				RAMGB:        ramGB,
+			})
 		}
-		// err != nil: availability API failed — include offer with no pinned location
-
-		offers = append(offers, provider.Offer{
-			ProviderName: p.Name(),
-			OfferID:      t.InstanceType,
-			GPUType:      gpuType,
-			GPUCount:     gpuCount,
-			VRAM:         vramGB,
-			PricePerHour: price,
-			CapacityType: capacityType,
-			Region:       location,
-			Reliability:  0.95,
-			DiskGB:       0,
-			RAMGB:        ramGB,
-		})
 	}
 
 	return offers, nil

@@ -165,12 +165,11 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	modelIDs, totalVRAM, maxDisk, gpuTypes := r.aggregateModelsForClaim(ctx, model, cfg, claims.Items, pool)
 
 	// Build GPU requirements from aggregated model requirements.
+	// If multiGpu is disabled, force single GPU — the coordinator must find
+	// a GPU with enough VRAM to fit the whole model on one card.
 	gpuCount := 1
-	if totalVRAM > 24 {
+	if cfg.MultiGpu && totalVRAM > 24 {
 		gpuCount = (totalVRAM + 23) / 24 // ceil(vram/24)
-	}
-	if cfg.MaxGPUCount > 0 && gpuCount > cfg.MaxGPUCount {
-		gpuCount = cfg.MaxGPUCount
 	}
 
 	maxPrice := 0.0
@@ -207,6 +206,7 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 				GPUTypes: gpuTypes,
 				MaxPrice: maxPrice,
 				MinDisk:  maxDisk,
+				MultiGpu: cfg.MultiGpu,
 			},
 		},
 	}

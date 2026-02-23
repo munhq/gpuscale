@@ -261,6 +261,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		CapacityType: "spot",
 		NodeType:     nodeType,
 		MinPCIeGen:   pool.Spec.Requirements.MinPCIeGen,
+		MultiGpu:     claim.Spec.Requirements.MultiGpu,
 	}
 
 	// Note: full-node bootstrap script is generated inside the coordinator

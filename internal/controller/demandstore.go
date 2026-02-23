@@ -82,7 +82,7 @@ type ModelConfig struct {
 	ID             string   `json:"id"`
 	Source         string   `json:"source"`          // HuggingFace source (e.g., "hf:zai-org/GLM-4.7-Flash")
 	VRAMRequired   int      `json:"vramRequired"`    // GB total VRAM needed
-	MaxGPUCount    int      `json:"maxGpuCount"`     // max GPU count (0 = no limit)
+	MultiGpu       bool     `json:"multiGpu"`        // allow multi-GPU instances (tensor parallel)
 	AlwaysActive   bool     `json:"alwaysActive"`
 	MinReplicas    int      `json:"minReplicas"`
 	MaxReplicas    int      `json:"maxReplicas"`

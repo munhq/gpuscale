@@ -25,6 +25,7 @@ type GPURequirements struct {
 	MinRAM       int      // GB
 	NodeType     string   // "full-node" or "ray-worker" — used by providers to filter VM vs container offers
 	MinPCIeGen   int      // minimum PCIe generation (e.g., 4 for PCIe 4.0); 0 = no restriction
+	MultiGpu     bool     // allow multi-GPU instances (tensor parallel); false = single GPU only
 }
 
 // Offer represents an available GPU instance from a provider.

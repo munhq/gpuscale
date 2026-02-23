@@ -287,6 +287,10 @@ type ClaimRequirements struct {
 	// MinDisk is the minimum OS volume size in GB (model weights + image + OS overhead).
 	// Used by VM providers (Verda) to size the OS volume at creation time.
 	MinDisk int `json:"minDisk,omitempty"`
+
+	// MultiGpu allows multi-GPU instances (tensor parallel). When false, only
+	// single-GPU instances are considered regardless of VRAM requirements.
+	MultiGpu bool `json:"multiGpu,omitempty"`
 }
 
 type PodReference struct {
