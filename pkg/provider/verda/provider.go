@@ -39,6 +39,8 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		return nil, fmt.Errorf("listing verda instance types: %w", err)
 	}
 
+	isSpot := req.CapacityType == "spot"
+
 	var offers []provider.Offer
 	for _, t := range types {
 		// Extract nested fields
@@ -72,7 +74,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 		price := onDemandPrice
 		capacityType := "on-demand"
-		if req.CapacityType == "spot" && spotPrice > 0 {
+		if isSpot && spotPrice > 0 {
 			price = spotPrice
 			capacityType = "spot"
 		}
@@ -80,6 +82,25 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		// Filter by price
 		if req.MaxPrice > 0 && price > req.MaxPrice {
 			continue
+		}
+
+		// Check real-time availability — ListInstanceTypes returns the catalog,
+		// not live capacity. Without this check we get 503 on create for offers
+		// that exist but have no available nodes in any location.
+		avail, err := p.client.CheckAvailability(ctx, t.InstanceType, isSpot)
+		if err != nil {
+			// If availability check fails, skip rather than attempt a doomed create.
+			continue
+		}
+		location := ""
+		for _, a := range avail {
+			if a.Available {
+				location = a.Location
+				break
+			}
+		}
+		if location == "" {
+			continue // no capacity anywhere
 		}
 
 		offers = append(offers, provider.Offer{
@@ -90,8 +111,9 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			VRAM:         vramGB,
 			PricePerHour: price,
 			CapacityType: capacityType,
-			Reliability:  0.95, // Verda doesn't expose reliability; use a reasonable default
-			DiskGB:       0,    // Verda API doesn't expose disk in this endpoint
+			Region:       location,
+			Reliability:  0.95,
+			DiskGB:       0,
 			RAMGB:        ramGB,
 		})
 	}
@@ -150,6 +172,7 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		SSHKeyIDs:       sshKeyIDsPtr,
 		Hostname:        fmt.Sprintf("gpuscale-%s", config.InstanceID),
 		StartupScriptID: scriptResp.ID,
+		LocationCode:    offer.Region,
 		IsSpot:          offer.CapacityType == "spot",
 	}
 	// Set OS volume name and size from the model's disk requirement.
