@@ -153,7 +153,7 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	if len(pools.Items) == 0 {
 		return fmt.Errorf("no GPUNodePools configured")
 	}
-	pool := findPoolByNodeType(pools.Items, cfg.NodeType)
+	pool := findPool(pools.Items, cfg.Pool, cfg.NodeType)
 
 	// Check pool limits
 	activeCount := 0
@@ -458,7 +458,7 @@ func (r *ProvisionTrigger) createBinPackedClaim(ctx context.Context, candidates 
 	if err := r.List(ctx, &pools); err != nil {
 		return fmt.Errorf("listing pools: %w", err)
 	}
-	pool := findPoolByNodeType(pools.Items, primary.cfg.NodeType)
+	pool := findPool(pools.Items, primary.cfg.Pool, primary.cfg.NodeType)
 
 	nodeType := primary.cfg.NodeType
 	if nodeType == "" {
@@ -562,9 +562,26 @@ func (r *ProvisionTrigger) reconcileQueues(ctx context.Context) {
 	r.checkConsolidation(ctx, claimList.Items)
 }
 
-// findPoolByNodeType returns the pool whose provider nodeType matches the
-// requested nodeType. Falls back to the first pool if no match is found.
-func findPoolByNodeType(pools []v1alpha1.GPUNodePool, nodeType string) *v1alpha1.GPUNodePool {
+// findPool returns the pool to use for a given model.
+// If poolName is set, it is used as an exact match — this is the expected path
+// when models have an explicit "pool" field in their config.
+// Falls back to nodeType matching only when poolName is empty (legacy behaviour).
+// Panics-safe: returns the first pool if nothing matches.
+func findPool(pools []v1alpha1.GPUNodePool, poolName, nodeType string) *v1alpha1.GPUNodePool {
+	if len(pools) == 0 {
+		return nil
+	}
+	// Explicit pool name — exact match, no guessing.
+	if poolName != "" {
+		for i := range pools {
+			if pools[i].Name == poolName {
+				return &pools[i]
+			}
+		}
+	}
+	// Fallback: match by nodeType (first match wins — ambiguous when multiple
+	// pools share the same nodeType, but keeps backward compat for models
+	// that don't set an explicit pool).
 	if nodeType == "" {
 		nodeType = "ray-worker"
 	}

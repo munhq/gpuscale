@@ -286,14 +286,18 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		return
 	}
 
-	// Match pool by nodeType from model config (full-node → Verda pool, ray-worker → default pool)
+	// Select pool from model config: explicit pool name first, then nodeType fallback.
 	modelNodeType := "ray-worker"
+	modelPool := ""
 	if r.DemandStore != nil && modelID != "" {
-		if mcfg, err := r.DemandStore.GetModelConfig(ctx, modelID); err == nil && mcfg != nil && mcfg.NodeType != "" {
-			modelNodeType = mcfg.NodeType
+		if mcfg, err := r.DemandStore.GetModelConfig(ctx, modelID); err == nil && mcfg != nil {
+			if mcfg.NodeType != "" {
+				modelNodeType = mcfg.NodeType
+			}
+			modelPool = mcfg.Pool
 		}
 	}
-	pool := findPoolByNodeType(pools.Items, modelNodeType)
+	pool := findPool(pools.Items, modelPool, modelNodeType)
 
 	// Check pool limits
 	if err := r.checkPoolLimits(ctx, pool); err != nil {
