@@ -40,7 +40,8 @@ type DisruptionController struct {
 	Registry       *provider.Registry
 	CooldownPeriod time.Duration
 	WorkerStore    *WorkerStore
-	DemandStore    *DemandStore // reads demand counters from Dragonfly DB 3
+	DemandStore    *DemandStore    // reads demand counters from Dragonfly DB 3
+	RayCapacity    *RayCapacityStore // queries Ray Serve application status
 }
 
 // NewDisruptionController creates a new disruption controller.
@@ -122,6 +123,16 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 	}
 
 	if !idle {
+		// Stuck detection: Ray worker pod is running but all models are DEPLOY_FAILED/UNHEALTHY
+		// with no demand. The model load loop is broken and the node is burning money doing nothing.
+		// Treat it like idle and drain after cooldown.
+		if r.isNodeStuck(ctx, modelIDs) {
+			log.Info("Node is stuck: models DEPLOY_FAILED/UNHEALTHY with no demand, draining after cooldown", "models", modelIDs)
+			return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
+				return r.hibernateOrDestroy(ctx, &node, claim, log)
+			})
+		}
+		// Genuinely busy — clear any stale idle timer and wait.
 		if claim.Status.IdleSince != nil {
 			claim.Status.IdleSince = nil
 			if err := r.Status().Update(ctx, claim); err != nil {
@@ -448,6 +459,40 @@ func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha
 
 	log.Info("Worker destroy complete")
 	return ctrl.Result{}, nil
+}
+
+// isNodeStuck returns true when a full-node has running GPU pods but all of its
+// models are DEPLOY_FAILED or UNHEALTHY in Ray Serve with no active demand.
+// This catches the broken-bootstrap failure mode: Ray worker pod stays Running
+// indefinitely while vLLM replicas keep crashing, blocking normal idle detection.
+func (r *DisruptionController) isNodeStuck(ctx context.Context, modelIDs []string) bool {
+	if len(modelIDs) == 0 || r.DemandStore == nil || r.RayCapacity == nil {
+		return false
+	}
+	// Any demand means something is waiting for this node — not stuck.
+	if r.hasAnyModelDemand(ctx, modelIDs) {
+		return false
+	}
+	statuses, err := r.RayCapacity.GetServeAppStatus(ctx)
+	if err != nil || len(statuses) == 0 {
+		return false // can't determine status; fail safe, don't drain
+	}
+	statusMap := make(map[string]string, len(statuses))
+	for _, s := range statuses {
+		statusMap[s.Name] = s.Status
+	}
+	// Every model on this claim must be broken (DEPLOY_FAILED or UNHEALTHY).
+	// If even one is healthy the node may be in use.
+	for _, id := range modelIDs {
+		status, known := statusMap[id]
+		if !known {
+			return false // model not in Serve yet — might be cold-starting, not stuck
+		}
+		if status != "DEPLOY_FAILED" && status != "UNHEALTHY" {
+			return false
+		}
+	}
+	return true
 }
 
 // --- Shared helpers ---
