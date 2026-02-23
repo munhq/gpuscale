@@ -39,11 +39,6 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		return nil, fmt.Errorf("listing verda instance types: %w", err)
 	}
 
-	locations, err := p.client.ListLocations(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("listing verda locations: %w", err)
-	}
-
 	isSpot := req.CapacityType == "spot"
 
 	var offers []provider.Offer
@@ -83,28 +78,21 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			continue
 		}
 
-		// Check per-location availability and emit one offer per available location.
-		// This tells CreateInstance exactly where to deploy instead of defaulting to
-		// the account's home datacenter which may not have the required GPU.
-		for _, loc := range locations {
-			avail, err := p.client.CheckAvailabilityInLocation(ctx, t.InstanceType, isSpot, loc.Code)
-			if err != nil || !avail {
-				continue
-			}
-			offers = append(offers, provider.Offer{
-				ProviderName: p.Name(),
-				OfferID:      t.InstanceType,
-				GPUType:      gpuType,
-				GPUCount:     gpuCount,
-				VRAM:         vramGB,
-				PricePerHour: price,
-				CapacityType: capacityType,
-				Region:       loc.Code,
-				Reliability:  0.95,
-				DiskGB:       0,
-				RAMGB:        ramGB,
-			})
-		}
+		// No region set — Verda picks the datacenter at create time.
+		// The per-location availability API is unreliable (false positives and false negatives);
+		// the coordinator's 503→next-offer retry is the real availability signal.
+		offers = append(offers, provider.Offer{
+			ProviderName: p.Name(),
+			OfferID:      t.InstanceType,
+			GPUType:      gpuType,
+			GPUCount:     gpuCount,
+			VRAM:         vramGB,
+			PricePerHour: price,
+			CapacityType: capacityType,
+			Reliability:  0.95,
+			DiskGB:       0,
+			RAMGB:        ramGB,
+		})
 	}
 
 	return offers, nil
