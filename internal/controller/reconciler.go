@@ -241,6 +241,17 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		}
 	}
 
+	// Ensure ModelID is set for all node types — providers use it to tag OS volumes
+	// for model-aware reuse (e.g. Verda volume tracking in Redis).
+	// The ray-worker block above sets it from pool config; full-node gets it here.
+	if config.ModelID == "" {
+		if claim.Spec.ModelID != "" {
+			config.ModelID = claim.Spec.ModelID
+		} else if ids := claimModelIDs(claim); len(ids) > 0 {
+			config.ModelID = ids[0]
+		}
+	}
+
 	reqs := provider.GPURequirements{
 		GPUCount:     claim.Spec.Requirements.GPUCount,
 		MinVRAM:      claim.Spec.Requirements.MinVRAM,
