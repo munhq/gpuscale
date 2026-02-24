@@ -42,6 +42,11 @@ func ClassifyError(err error) ErrorCategory {
 		strings.Contains(msg, "gpu conflict") {
 		return ErrorConflict
 	}
+	// 400 invalid_request errors mean this offer type is incompatible (e.g. OS image not
+	// supported for this instance type). Blacklist so we don't retry the same offer.
+	if strings.Contains(msg, "invalid_request") || strings.Contains(msg, "operating system is not valid") {
+		return ErrorExpired
+	}
 	if strings.Contains(msg, "401") || strings.Contains(msg, "403") ||
 		strings.Contains(msg, "unauthorized") || strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "insufficient_credit") || strings.Contains(msg, "lacks credit") ||
