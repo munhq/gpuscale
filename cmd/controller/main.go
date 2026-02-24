@@ -11,6 +11,8 @@ import (
 	gpumetrics "github.com/munhq/gpuscale/internal/metrics"
 	"github.com/munhq/gpuscale/pkg/provider"
 	"golang.org/x/time/rate"
+	"github.com/munhq/gpuscale/pkg/provider/aws"
+	"github.com/munhq/gpuscale/pkg/provider/gcp"
 	"github.com/munhq/gpuscale/pkg/provider/runpod"
 	"github.com/munhq/gpuscale/pkg/provider/vastai"
 	"github.com/munhq/gpuscale/pkg/provider/verda"
@@ -89,6 +91,20 @@ func main() {
 		registry.Register(runpod.New(key))
 		setupLog.Info("Registered provider: runpod")
 	}
+	if saJSON := os.Getenv("GCP_SERVICE_ACCOUNT_JSON"); saJSON != "" {
+		gcpProvider, err := gcp.New(saJSON, os.Getenv("GCP_PROJECT_ID"), os.Getenv("GCP_ZONES"))
+		if err != nil {
+			setupLog.Error(err, "Failed to initialize GCP provider")
+		} else {
+			registry.Register(gcpProvider)
+			setupLog.Info("Registered provider: gcp")
+		}
+	}
+	if keyID, secret := os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"); keyID != "" && secret != "" {
+		awsProvider := aws.New(keyID, secret, os.Getenv("AWS_REGION"), os.Getenv("AWS_SUBNET_ID"), os.Getenv("AWS_SECURITY_GROUP_ID"))
+		registry.Register(awsProvider)
+		setupLog.Info("Registered provider: aws", "region", os.Getenv("AWS_REGION"))
+	}
 
 	if len(registry.List()) == 0 {
 		setupLog.Info("WARNING: No providers configured. Set VASTAI_API_KEY, VERDA_CLIENT_ID/VERDA_CLIENT_SECRET, or RUNPOD_API_KEY.")
@@ -139,6 +155,8 @@ func main() {
 			"vast.ai": 1, // 1 req/sec
 			"verda":   3,
 			"runpod":  3,
+			"gcp":     2,
+			"aws":     2,
 		},
 	})
 
