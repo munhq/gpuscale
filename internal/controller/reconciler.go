@@ -253,15 +253,15 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	}
 
 	reqs := provider.GPURequirements{
-		GPUCount:     claim.Spec.Requirements.GPUCount,
-		MinVRAM:      claim.Spec.Requirements.MinVRAM,
-		MaxVRAM:      claim.Spec.Requirements.MaxVRAM,
-		GPUTypes:     claim.Spec.Requirements.GPUTypes,
-		MaxPrice:     claim.Spec.Requirements.MaxPrice,
-		CapacityType: "spot",
-		NodeType:     nodeType,
-		MinPCIeGen:   pool.Spec.Requirements.MinPCIeGen,
-		MultiGpu:     claim.Spec.Requirements.MultiGpu,
+		GPUCount:       claim.Spec.Requirements.GPUCount,
+		MinVRAM:        claim.Spec.Requirements.MinVRAM,
+		MaxVRAM:        claim.Spec.Requirements.MaxVRAM,
+		GPUTypes:       claim.Spec.Requirements.GPUTypes,
+		MaxPricePerGPU: claim.Spec.Requirements.MaxPricePerGPU,
+		CapacityType:   "spot",
+		NodeType:       nodeType,
+		MinPCIeGen:     pool.Spec.Requirements.MinPCIeGen,
+		MultiGpu:       claim.Spec.Requirements.MultiGpu,
 	}
 
 	// Note: full-node bootstrap script is generated inside the coordinator

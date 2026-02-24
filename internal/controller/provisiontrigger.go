@@ -164,28 +164,15 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	// Aggregate co-located models into a single claim via bin-packing.
 	modelIDs, totalVRAM, maxDisk, gpuTypes := r.aggregateModelsForClaim(ctx, model, cfg, claims.Items, pool)
 
-	// Build GPU requirements from aggregated model requirements.
-	// If multiGpu is disabled, force single GPU — the coordinator must find
-	// a GPU with enough VRAM to fit the whole model on one card.
-	gpuCount := 1
-	if cfg.MultiGpu && totalVRAM > 24 {
-		gpuCount = (totalVRAM + 23) / 24 // ceil(vram/24)
-	}
-
-	maxPrice := 0.0
-	if cfg.MaxPricePerGPU > 0 {
-		maxPrice = cfg.MaxPricePerGPU * float64(gpuCount)
-	}
-
 	// MaxVRAM: use explicit per-model config if set, otherwise no upper bound.
-	// The coordinator finds the cheapest GPU where VRAM >= MinVRAM naturally.
-	// For multi-model claims: always 0 (no cap) — MinVRAM = sum of all models drives selection.
+	// For multi-model claims: always 0 — MinVRAM = sum of all models drives selection.
 	maxVRAM := 0
 	if len(modelIDs) == 1 {
 		maxVRAM = cfg.MaxVRAMPerGPU // 0 if not explicitly set = no upper bound
 	}
 
-	// Create the claim
+	// Create the claim. GPUCount=0: the coordinator picks any instance whose
+	// total VRAM covers MinVRAM — no hardcoded GPU count assumptions.
 	claimID := uuid.New().String()[:8]
 	claim := &v1alpha1.GPUNodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -200,13 +187,12 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 			ModelIDs:    modelIDs,
 			ModelSource: cfg.Source,
 			Requirements: v1alpha1.ClaimRequirements{
-				GPUCount: gpuCount,
-				MinVRAM:  totalVRAM,
-				MaxVRAM:  maxVRAM,
-				GPUTypes: gpuTypes,
-				MaxPrice: maxPrice,
-				MinDisk:  maxDisk,
-				MultiGpu: cfg.MultiGpu,
+				MinVRAM:        totalVRAM,
+				MaxVRAM:        maxVRAM,
+				GPUTypes:       gpuTypes,
+				MaxPricePerGPU: cfg.MaxPricePerGPU,
+				MinDisk:        maxDisk,
+				MultiGpu:       cfg.MultiGpu,
 			},
 		},
 	}
@@ -218,7 +204,6 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	log.Info("Created GPUNodeClaim from cold-start trigger",
 		"claim", claim.Name,
 		"nodeType", nodeType,
-		"gpuCount", gpuCount,
 		"models", modelIDs,
 		"totalVRAM", totalVRAM,
 	)
@@ -429,10 +414,6 @@ func (r *ProvisionTrigger) createBinPackedClaim(ctx context.Context, candidates 
 	// Disk = sum of all model weights + overhead once.
 	const diskOverheadGB = 50
 	maxDisk := totalVRAM + diskOverheadGB
-	// MaxPrice: use the highest per-GPU price among co-located models.
-	// A bin-packed node replaces multiple single-model nodes; the highest
-	// individual per-GPU price is a safe ceiling for the combined node.
-	maxPrice := maxPricePerGPU // gpuCount=1 for standard single-GPU bin-packed claims
 
 	// Get the pool for the primary model.
 	var pools v1alpha1.GPUNodePoolList
@@ -463,12 +444,11 @@ func (r *ProvisionTrigger) createBinPackedClaim(ctx context.Context, candidates 
 			ModelIDs:    modelIDs,
 			ModelSource: primary.cfg.Source,
 			Requirements: v1alpha1.ClaimRequirements{
-				GPUCount: 1,
-				MinVRAM:  totalVRAM,
+				MinVRAM: totalVRAM,
 				// No MaxVRAM cap — MinVRAM drives selection for multi-model claims.
 				// No GPUTypes — conflicting preferences across models; let MinVRAM select.
-				MaxPrice: maxPrice,
-				MinDisk:  maxDisk,
+				// MaxPricePerGPU not set — consolidation targets lowest cost overall.
+				MinDisk: maxDisk,
 			},
 		},
 	}

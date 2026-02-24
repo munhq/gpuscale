@@ -15,17 +15,17 @@ var (
 
 // GPURequirements describes what GPU resources are needed.
 type GPURequirements struct {
-	GPUCount     int      // nvidia.com/gpu limit
-	MinVRAM      int      // GB, from annotation
-	MaxVRAM      int      // GB, max VRAM per GPU to prevent over-provisioning (0 = no limit)
-	GPUTypes     []string // preferred GPU types (empty = any)
-	MaxPrice     float64  // $/hr, 0 = no limit
-	CapacityType string   // "spot" or "on-demand"
-	MinDisk      int      // GB
-	MinRAM       int      // GB
-	NodeType     string   // "full-node" or "ray-worker" — used by providers to filter VM vs container offers
-	MinPCIeGen   int      // minimum PCIe generation (e.g., 4 for PCIe 4.0); 0 = no restriction
-	MultiGpu     bool     // allow multi-GPU instances (tensor parallel); false = single GPU only
+	GPUCount        int      // minimum number of GPUs; 0 = any count that covers MinVRAM
+	MinVRAM         int      // GB, total VRAM required across all GPUs on the instance
+	MaxVRAM         int      // GB, max VRAM per GPU to prevent over-provisioning (0 = no limit)
+	GPUTypes        []string // preferred GPU types (empty = any)
+	MaxPricePerGPU  float64  // $/hr per GPU; 0 = no limit (total price = MaxPricePerGPU * offer.GPUCount)
+	CapacityType    string   // "spot" or "on-demand"
+	MinDisk         int      // GB
+	MinRAM          int      // GB
+	NodeType        string   // "full-node" or "ray-worker" — used by providers to filter VM vs container offers
+	MinPCIeGen      int      // minimum PCIe generation (e.g., 4 for PCIe 4.0); 0 = no restriction
+	MultiGpu        bool     // allow multi-GPU instances (tensor parallel); false = single GPU only
 }
 
 // Offer represents an available GPU instance from a provider.
@@ -34,8 +34,8 @@ type Offer struct {
 	OfferID      string  // provider-specific offer/machine ID
 	GPUType      string  // "RTX 4090", "A100 80GB", etc
 	GPUCount     int
-	VRAM         int     // per GPU, in GB
-	PricePerHour float64
+	VRAM         int     // total VRAM in GB across all GPUs on the instance
+	PricePerHour float64 // total $/hr for the instance
 	CapacityType string // "spot" or "on-demand"
 	Region       string
 	Reliability  float64 // 0-1, provider-specific

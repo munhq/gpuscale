@@ -33,18 +33,23 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 	var offers []provider.Offer
 	for _, t := range types {
-		// Filter by VRAM
-		if req.MinVRAM > 0 && t.MemoryInGB < req.MinVRAM {
-			continue
-		}
 		// Filter by GPU type
 		if len(req.GPUTypes) > 0 && !matchesGPUType(t.DisplayName, req.GPUTypes) {
+			continue
+		}
+		if !req.MultiGpu && req.GPUCount > 1 {
 			continue
 		}
 
 		gpuCount := 1
 		if req.GPUCount > 0 {
 			gpuCount = req.GPUCount
+		}
+
+		// Total VRAM across all GPUs must cover the requirement.
+		totalVRAM := t.MemoryInGB * gpuCount
+		if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
+			continue
 		}
 
 		// Select pricing based on capacity type
@@ -72,8 +77,8 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			continue
 		}
 
-		// Filter by price
-		if req.MaxPrice > 0 && price > req.MaxPrice {
+		// Per-GPU price cap.
+		if req.MaxPricePerGPU > 0 && gpuCount > 0 && price/float64(gpuCount) > req.MaxPricePerGPU {
 			continue
 		}
 
@@ -82,7 +87,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			OfferID:      t.ID,
 			GPUType:      t.DisplayName,
 			GPUCount:     gpuCount,
-			VRAM:         t.MemoryInGB,
+			VRAM:         totalVRAM,
 			PricePerHour: price,
 			CapacityType: capacityType,
 			Reliability:  0.90, // RunPod doesn't expose reliability

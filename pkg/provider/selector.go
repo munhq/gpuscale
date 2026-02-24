@@ -126,7 +126,10 @@ func filterByRequirements(offers []Offer, req GPURequirements) []Offer {
 		if req.MinVRAM > 0 && o.VRAM < req.MinVRAM {
 			continue
 		}
-		if req.MaxPrice > 0 && o.PricePerHour > req.MaxPrice {
+		if req.MaxPricePerGPU > 0 && o.GPUCount > 0 && o.PricePerHour/float64(o.GPUCount) > req.MaxPricePerGPU {
+			continue
+		}
+		if !req.MultiGpu && o.GPUCount > 1 {
 			continue
 		}
 		if req.CapacityType != "" && o.CapacityType != req.CapacityType {

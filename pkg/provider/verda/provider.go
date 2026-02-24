@@ -57,6 +57,10 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
 			continue
 		}
+		// Enforce single-GPU constraint when MultiGpu is disabled.
+		if !req.MultiGpu && gpuCount > 1 {
+			continue
+		}
 		if req.MinRAM > 0 && ramGB < req.MinRAM {
 			continue
 		}
@@ -74,7 +78,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			capacityType = "spot"
 		}
 
-		if req.MaxPrice > 0 && price > req.MaxPrice {
+		if req.MaxPricePerGPU > 0 && gpuCount > 0 && price/float64(gpuCount) > req.MaxPricePerGPU {
 			continue
 		}
 
@@ -86,7 +90,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			OfferID:      t.InstanceType,
 			GPUType:      gpuType,
 			GPUCount:     gpuCount,
-			VRAM:         vramGB,
+			VRAM:         totalVRAM,
 			PricePerHour: price,
 			CapacityType: capacityType,
 			Reliability:  0.95,

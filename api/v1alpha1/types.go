@@ -268,21 +268,22 @@ type GPUNodeClaimSpec struct {
 }
 
 type ClaimRequirements struct {
-	// GPUCount is the number of GPUs needed.
-	GPUCount int `json:"gpuCount"`
+	// GPUCount is the minimum number of GPUs needed. 0 = any count covering MinVRAM.
+	GPUCount int `json:"gpuCount,omitempty"`
 
-	// MinVRAM is the minimum VRAM per GPU in GB.
+	// MinVRAM is the total VRAM required across all GPUs on the instance in GB.
 	MinVRAM int `json:"minVRAM,omitempty"`
 
 	// MaxVRAM is the maximum VRAM per GPU in GB.
 	// Prevents over-provisioning (e.g., getting an H200 for a 7B model).
 	MaxVRAM int `json:"maxVRAM,omitempty"`
 
-	// GPUTypes are the acceptable GPU types.
+	// GPUTypes are the preferred GPU types (soft preference — sort order only).
 	GPUTypes []string `json:"gpuTypes,omitempty"`
 
-	// MaxPrice is the maximum $/hr.
-	MaxPrice float64 `json:"maxPrice,omitempty"`
+	// MaxPricePerGPU is the maximum $/hr per GPU (0 = no limit).
+	// Total instance price cap = MaxPricePerGPU * offer.GPUCount.
+	MaxPricePerGPU float64 `json:"maxPricePerGpu,omitempty"`
 
 	// MinDisk is the minimum OS volume size in GB (model weights + image + OS overhead).
 	// Used by VM providers (Verda) to size the OS volume at creation time.

@@ -7,27 +7,37 @@ import (
 )
 
 // filterByRequirements returns only offers that meet the GPU requirements.
+// o.VRAM is total VRAM across all GPUs on the instance.
+// req.GPUCount is a minimum (0 = any count covering MinVRAM).
+// req.MaxPricePerGPU caps $/hr per GPU (offer.PricePerHour / offer.GPUCount).
 func filterByRequirements(offers []provider.Offer, req provider.GPURequirements) []provider.Offer {
 	var result []provider.Offer
 	for _, o := range offers {
+		// Minimum GPU count — 0 means no constraint.
 		if req.GPUCount > 0 && o.GPUCount < req.GPUCount {
 			continue
 		}
+		// Total VRAM must cover the requirement.
 		if req.MinVRAM > 0 && o.VRAM < req.MinVRAM {
 			continue
 		}
-		if req.MaxVRAM > 0 && o.VRAM > req.MaxVRAM {
+		// MaxVRAM is per GPU — prevent landing on a massively over-sized card.
+		if req.MaxVRAM > 0 && o.GPUCount > 0 && o.VRAM/o.GPUCount > req.MaxVRAM {
 			continue
 		}
-		if req.MaxPrice > 0 && o.PricePerHour > req.MaxPrice {
+		// Per-GPU price cap.
+		if req.MaxPricePerGPU > 0 && o.GPUCount > 0 && o.PricePerHour/float64(o.GPUCount) > req.MaxPricePerGPU {
 			continue
 		}
 		if req.CapacityType != "" && o.CapacityType != req.CapacityType {
 			continue
 		}
+		// Enforce single-GPU constraint when MultiGpu is disabled.
+		if !req.MultiGpu && o.GPUCount > 1 {
+			continue
+		}
 		// GPUTypes is a soft preference (sort order), not a hard filter.
-		// MaxVRAM is the hard upper bound. This allows fallback to any GPU
-		// when preferred types aren't available.
+		// MinVRAM alone drives offer selection when types are not specified.
 		if req.MinDisk > 0 && o.DiskGB > 0 && o.DiskGB < req.MinDisk {
 			continue
 		}

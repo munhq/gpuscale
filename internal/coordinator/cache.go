@@ -45,7 +45,7 @@ func cacheKey(providerName string, req provider.GPURequirements) string {
 		providerName,
 		req.GPUCount,
 		req.MinVRAM,
-		req.MaxPrice,
+		req.MaxPricePerGPU,
 		req.CapacityType,
 		gpuTypes,
 		req.MinDisk,
