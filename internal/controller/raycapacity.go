@@ -354,13 +354,27 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 }
 
 // PatchServeModelFractions updates gpu_memory_utilization AND placement_group_config
-// for named models in the live Ray Serve config. Used when multiple models share a
-// single GPU node so each vLLM process gets the correct fraction of GPU memory and
-// Ray's scheduler reserves the correct GPU resource fraction for co-location.
+// for named models in the live Ray Serve config. Called only for multi-model claims
+// so each co-located vLLM process uses its correct share of GPU memory and Ray's
+// scheduler reserves the right GPU resource fraction.
 //
-// fractions maps model-name → fraction (e.g., {"glm-4-7-flash": 0.29}).
-// This is a GET+PUT operation against the Ray Dashboard. It runs on every 60s tick
-// so that ArgoCD resets (which re-apply Helm values) are corrected within a minute.
+// fractions maps model-name → fraction (e.g., {"qwen3.5-35b-a3b": 0.875}).
+// Runs on every 60s tick so ArgoCD resets (which re-apply Helm placeholder values)
+// are corrected within a minute.
+//
+// GET/PUT shape mismatch in Ray's serve API:
+//   GET /api/serve/applications/ → {"applications": {"app-name": {...status...,
+//                                    "deployed_app_config": {clean config}}}}
+//   PUT /api/serve/applications/ → {"applications": [{clean config}, ...]}
+//
+// We use each app's deployed_app_config as the PUT payload for that app. It is
+// the exact config Ray last accepted — no runtime fields — so PUTting it back for
+// an unmodified app produces no diff and Ray does NOT redeploy it. Only apps whose
+// fractions changed will be redeployed.
+//
+// If any app is missing deployed_app_config (still initialising on first deploy),
+// we bail out and retry on the next tick rather than risk omitting an app from the
+// PUT (omitted apps are deleted by Ray).
 func (r *RayCapacityStore) PatchServeModelFractions(ctx context.Context, fractions map[string]float64) error {
 	if len(fractions) == 0 {
 		return nil
@@ -371,7 +385,7 @@ func (r *RayCapacityStore) PatchServeModelFractions(ctx context.Context, fractio
 		return nil // dashboard not available, non-fatal
 	}
 
-	// GET the current live serve config
+	// GET the current live serve config.
 	getURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
 	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
 	if err != nil {
@@ -390,69 +404,77 @@ func (r *RayCapacityStore) PatchServeModelFractions(ctx context.Context, fractio
 		return fmt.Errorf("GET serve config returned %d", getResp.StatusCode)
 	}
 
-	// Unmarshal as generic map so we can patch nested fields without knowing
-	// the full schema (Ray adds many runtime fields on top of the base config).
-	var config map[string]interface{}
-	if err := json.Unmarshal(body, &config); err != nil {
+	// Ray GET response: applications is a MAP keyed by app name.
+	// Each value has runtime status fields PLUS "deployed_app_config" which
+	// contains the clean config that was last successfully submitted.
+	var getResponse map[string]interface{}
+	if err := json.Unmarshal(body, &getResponse); err != nil {
 		return fmt.Errorf("parsing serve config: %w", err)
 	}
 
-	apps, ok := config["applications"].([]interface{})
+	appsMap, ok := getResponse["applications"].(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("unexpected serve config format: applications is not an array")
+		return fmt.Errorf("unexpected serve config: applications is not an object")
 	}
 
 	patched := false
-	for _, raw := range apps {
-		app, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		name, _ := app["name"].(string)
-		util, ok := fractions[name]
-		if !ok {
-			continue // this model is not in our fractions map
-		}
-		// Path: app.args.llm_configs[0].engine_kwargs.gpu_memory_utilization
-		args, ok := app["args"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		llmCfgs, ok := args["llm_configs"].([]interface{})
-		if !ok || len(llmCfgs) == 0 {
-			continue
-		}
-		llmCfg, ok := llmCfgs[0].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		engineKwargs, ok := llmCfg["engine_kwargs"].(map[string]interface{})
-		if !ok {
-			// engine_kwargs missing — create it
-			engineKwargs = make(map[string]interface{})
-			llmCfg["engine_kwargs"] = engineKwargs
-		}
-		engineKwargs["gpu_memory_utilization"] = util
+	putApps := make([]interface{}, 0, len(appsMap))
 
-		// Patch placement_group_config so Ray's scheduler reserves the correct
-		// GPU fraction, allowing multiple models to co-locate on one GPU.
-		// Without this, the default placement bundle requests GPU: 1.0 per model
-		// and Ray refuses to schedule a second model on the same node.
-		llmCfg["placement_group_config"] = map[string]interface{}{
-			"bundles": []interface{}{
-				map[string]interface{}{"GPU": util},
-			},
-			"strategy": "PACK",
+	for appName, rawApp := range appsMap {
+		app, ok := rawApp.(map[string]interface{})
+		if !ok {
+			continue
 		}
-		patched = true
+
+		// deployed_app_config is the clean config Ray last accepted for this app.
+		// It contains only the fields the PUT endpoint expects (name, import_path,
+		// route_prefix, args) — no status/message/last_deployed_time_s/etc.
+		// PUTting it back verbatim for an unchanged app produces no diff → no redeploy.
+		appConfig, ok := app["deployed_app_config"].(map[string]interface{})
+		if !ok || len(appConfig) == 0 {
+			// App hasn't completed its first deploy yet — deployed_app_config not set.
+			// Bail out entirely: we must not omit any app from the PUT list (omitted
+			// apps are deleted by Ray). Retry on the next 60s tick.
+			return nil
+		}
+
+		if util, needsPatch := fractions[appName]; needsPatch {
+			// Navigate: appConfig → args → llm_configs[0] → engine_kwargs / placement_group_config
+			args, ok := appConfig["args"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			llmCfgs, ok := args["llm_configs"].([]interface{})
+			if !ok || len(llmCfgs) == 0 {
+				continue
+			}
+			llmCfg, ok := llmCfgs[0].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			engineKwargs, ok := llmCfg["engine_kwargs"].(map[string]interface{})
+			if !ok {
+				engineKwargs = make(map[string]interface{})
+				llmCfg["engine_kwargs"] = engineKwargs
+			}
+			engineKwargs["gpu_memory_utilization"] = util
+			llmCfg["placement_group_config"] = map[string]interface{}{
+				"bundles":  []interface{}{map[string]interface{}{"GPU": util}},
+				"strategy": "PACK",
+			}
+			patched = true
+		}
+
+		putApps = append(putApps, appConfig)
 	}
 
 	if !patched {
-		return nil // none of the target models found in live config, nothing to do
+		return nil // fractions map had no overlap with live apps, nothing to do
 	}
 
-	// PUT the patched config back
-	putBody, err := json.Marshal(config)
+	// Ray PUT endpoint expects applications as a LIST (same shape as serveConfigV2).
+	putPayload := map[string]interface{}{"applications": putApps}
+	putBody, err := json.Marshal(putPayload)
 	if err != nil {
 		return fmt.Errorf("marshaling patched config: %w", err)
 	}
