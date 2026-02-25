@@ -179,6 +179,7 @@ func (c *Coordinator) ProvisionInstance(
 				"offerIndex", i,
 				"provider", offer.ProviderName,
 				"offerID", offer.OfferID,
+				"region", offer.Region,
 				"gpu", offer.GPUType,
 				"gpuCount", offer.GPUCount,
 				"price", offer.PricePerHour,

@@ -45,9 +45,13 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 	if err != nil {
 		return nil, fmt.Errorf("listing verda locations: %w", err)
 	}
+	seen := make(map[string]bool)
 	var regionCodes []string
 	for _, loc := range locations {
-		regionCodes = append(regionCodes, loc.Code)
+		if !seen[loc.Code] {
+			seen[loc.Code] = true
+			regionCodes = append(regionCodes, loc.Code)
+		}
 	}
 	if len(regionCodes) == 0 {
 		regionCodes = []string{""} // fallback: let Verda pick
