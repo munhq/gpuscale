@@ -92,10 +92,11 @@ func (c *Coordinator) getLimiter(providerName string) *rate.Limiter {
 //  1. Gather offers from all providers (cached, with singleflight dedup)
 //  2. Filter by requirements and blacklist
 //  3. Sort by price (primary), reliability (secondary)
-//  4. Try top N offers: rate-limit-aware CreateInstance call
-//  5. On expired/conflict: blacklist offer, try next
+//  4. Try ALL filtered offers in order: rate-limit-aware CreateInstance call
+//  5. On expired/conflict/no-capacity: blacklist offer, try next
 //  6. On rate limit: back off, invalidate cache, retry outer loop
-//  7. On success: return instance + offer used
+//  7. If all offers exhausted: invalidate cache, retry outer loop (fresh offers)
+//  8. On success: return instance + offer used
 func (c *Coordinator) ProvisionInstance(
 	ctx context.Context,
 	req provider.GPURequirements,
@@ -152,14 +153,13 @@ func (c *Coordinator) ProvisionInstance(
 			return filtered[i].Reliability > filtered[j].Reliability
 		})
 
-		// 4. Try top N offers.
-		tryCount := c.opts.OffersPerAttempt
-		if tryCount > len(filtered) {
-			tryCount = len(filtered)
-		}
-
+		// 4. Try ALL filtered offers in sorted order.
+		// OffersPerAttempt is intentionally not applied here — we exhaust every
+		// available option (A100 FIN-01, A100 FIN-02, ..., RTX PRO FIN-01, ...)
+		// before giving up and re-fetching. Blacklisting handles skipping offers
+		// that are known to be out of capacity.
 		rateLimited := false
-		for i := 0; i < tryCount; i++ {
+		for i := 0; i < len(filtered); i++ {
 			offer := filtered[i]
 
 			// Rate limit before CreateInstance.
