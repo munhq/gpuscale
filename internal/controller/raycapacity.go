@@ -353,11 +353,12 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 	return nil
 }
 
-// PatchServeModelFractions updates gpu_memory_utilization for named models in the
-// live Ray Serve config. Used when multiple models share a single GPU node so each
-// vLLM process gets the correct fraction of GPU memory rather than the default 0.90.
+// PatchServeModelFractions updates gpu_memory_utilization AND placement_group_config
+// for named models in the live Ray Serve config. Used when multiple models share a
+// single GPU node so each vLLM process gets the correct fraction of GPU memory and
+// Ray's scheduler reserves the correct GPU resource fraction for co-location.
 //
-// fractions maps model-name → gpu_memory_utilization (e.g., {"glm-4-7-flash": 0.175}).
+// fractions maps model-name → fraction (e.g., {"glm-4-7-flash": 0.29}).
 // This is a GET+PUT operation against the Ray Dashboard. It runs on every 60s tick
 // so that ArgoCD resets (which re-apply Helm values) are corrected within a minute.
 func (r *RayCapacityStore) PatchServeModelFractions(ctx context.Context, fractions map[string]float64) error {
@@ -432,6 +433,17 @@ func (r *RayCapacityStore) PatchServeModelFractions(ctx context.Context, fractio
 			llmCfg["engine_kwargs"] = engineKwargs
 		}
 		engineKwargs["gpu_memory_utilization"] = util
+
+		// Patch placement_group_config so Ray's scheduler reserves the correct
+		// GPU fraction, allowing multiple models to co-locate on one GPU.
+		// Without this, the default placement bundle requests GPU: 1.0 per model
+		// and Ray refuses to schedule a second model on the same node.
+		llmCfg["placement_group_config"] = map[string]interface{}{
+			"bundles": []interface{}{
+				map[string]interface{}{"GPU": util},
+			},
+			"strategy": "PACK",
+		}
 		patched = true
 	}
 
