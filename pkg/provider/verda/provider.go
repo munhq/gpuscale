@@ -39,6 +39,20 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		return nil, fmt.Errorf("listing verda instance types: %w", err)
 	}
 
+	// Expand offers across all regions. When a region returns 503 (no capacity),
+	// the coordinator's retry-next-offer logic will try the next region naturally.
+	locations, err := p.client.ListLocations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing verda locations: %w", err)
+	}
+	var regionCodes []string
+	for _, loc := range locations {
+		regionCodes = append(regionCodes, loc.Code)
+	}
+	if len(regionCodes) == 0 {
+		regionCodes = []string{""} // fallback: let Verda pick
+	}
+
 	isSpot := req.CapacityType == "spot"
 
 	var offers []provider.Offer
@@ -48,17 +62,11 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		ramGB := t.Memory.SizeInGigabytes
 		gpuType := t.Model
 
-		// Single-GPU only when multiGpu is disabled.
 		if !req.MultiGpu && gpuCount > 1 {
 			continue
 		}
-		// Total VRAM on this instance must cover the requirement.
 		totalVRAM := gpuCount * vramGB
 		if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
-			continue
-		}
-		// Enforce single-GPU constraint when MultiGpu is disabled.
-		if !req.MultiGpu && gpuCount > 1 {
 			continue
 		}
 		if req.MinRAM > 0 && ramGB < req.MinRAM {
@@ -82,21 +90,22 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			continue
 		}
 
-		// No region set — Verda picks the datacenter at create time.
-		// The per-location availability API is unreliable (false positives and false negatives);
-		// the coordinator's 503→next-offer retry is the real availability signal.
-		offers = append(offers, provider.Offer{
-			ProviderName: p.Name(),
-			OfferID:      t.InstanceType,
-			GPUType:      gpuType,
-			GPUCount:     gpuCount,
-			VRAM:         totalVRAM,
-			PricePerHour: price,
-			CapacityType: capacityType,
-			Reliability:  0.95,
-			DiskGB:       0,
-			RAMGB:        ramGB,
-		})
+		// One offer per region — coordinator retries through regions on 503.
+		for _, region := range regionCodes {
+			offers = append(offers, provider.Offer{
+				ProviderName: p.Name(),
+				OfferID:      t.InstanceType,
+				GPUType:      gpuType,
+				GPUCount:     gpuCount,
+				VRAM:         totalVRAM,
+				PricePerHour: price,
+				CapacityType: capacityType,
+				Reliability:  0.95,
+				DiskGB:       0,
+				RAMGB:        ramGB,
+				Region:       region,
+			})
+		}
 	}
 
 	return offers, nil
