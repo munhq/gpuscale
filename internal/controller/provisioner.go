@@ -247,8 +247,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 					"reason", decision.Reason,
 					"models", decision.Models,
 					"requiredVRAM", decision.RequiredVRAM,
-					"requiredGPUs", decision.RequiredGPUs,
-					"gpuType", decision.GPUType,
+					"multiGpu", decision.MultiGpu,
 				)
 				// Override requirements from bin-packing
 				// (will be used below in SearchOffers)

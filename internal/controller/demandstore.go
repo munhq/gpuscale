@@ -183,6 +183,7 @@ type ModelDemand struct {
 	ActiveDemand int64 // active requests from demand:{model}
 	VRAMRequired int   // VRAM needed to load the model (GB)
 	AlwaysActive bool  // should stay warm
+	MultiGpu     bool  // allow multi-GPU instances (2×48GB counts as 96GB total)
 }
 
 // GetModelDemand retrieves all demand data for a specific model.
@@ -215,6 +216,7 @@ func (s *DemandStore) GetModelDemand(ctx context.Context, model string) (*ModelD
 		ActiveDemand: activeDemand,
 		VRAMRequired: cfg.VRAMRequired,
 		AlwaysActive: cfg.AlwaysActive,
+		MultiGpu:     cfg.MultiGpu,
 	}, nil
 }
 
@@ -240,6 +242,7 @@ func (s *DemandStore) GetAllDemands(ctx context.Context) ([]*ModelDemand, error)
 			ActiveDemand: activeDemand,
 			VRAMRequired: cfg.VRAMRequired,
 			AlwaysActive: cfg.AlwaysActive,
+			MultiGpu:     cfg.MultiGpu,
 		})
 	}
 	return demands, nil
