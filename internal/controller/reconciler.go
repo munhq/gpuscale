@@ -880,6 +880,26 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 	// For multi-model bin-packed claims we check all co-located models.
 	if r.DemandStore != nil && r.RayCapacityStore != nil {
 		statuses, serveErr := r.RayCapacityStore.GetServeAppStatus(ctx)
+
+		// If any model this claim is responsible for is DEPLOY_FAILED, re-submit
+		// the serve config to reset Ray's retry counter. Ray stops retrying after
+		// 3 failures and will never recover without an explicit re-submission.
+		if serveErr == nil {
+			for _, app := range statuses {
+				for _, modelID := range claimModelIDs(claim) {
+					if app.Name == modelID && app.Status == "DEPLOY_FAILED" {
+						log.Info("Model is DEPLOY_FAILED, re-submitting serve config to reset retry counter",
+							"model", modelID)
+						if resubErr := r.RayCapacityStore.ResubmitServeConfig(ctx); resubErr != nil {
+							log.Error(resubErr, "Failed to resubmit serve config")
+						}
+						goto doneResubmit
+					}
+				}
+			}
+		}
+	doneResubmit:
+
 		for _, modelID := range claimModelIDs(claim) {
 			if r.DemandStore.IsModelLoaded(ctx, modelID) {
 				continue

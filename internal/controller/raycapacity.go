@@ -301,20 +301,24 @@ func (r *RayCapacityStore) GetServeAppStatus(ctx context.Context) ([]ServeAppSta
 }
 
 // ResubmitServeConfig re-submits the current Serve configuration to reset
-// DEPLOY_FAILED state. Reads current config, then PUTs it back.
+// DEPLOY_FAILED state. Ray stops retrying after 3 failures; submitting the
+// same config again resets the counter and triggers a fresh attempt.
+//
+// Uses the same GET→deployed_app_config→PUT pattern as PatchServeModelFractions:
+// GET returns applications as a map, PUT expects a list of deployed_app_config
+// objects. PUTting deployed_app_config verbatim is idempotent for healthy apps
+// and resets DEPLOY_FAILED for failed ones.
 func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 	dashboardURL, _, err := r.discoverRayHead(ctx)
 	if err != nil {
 		return fmt.Errorf("discovering Ray head: %w", err)
 	}
 
-	// GET current serve config
 	getURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
 	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
 	if err != nil {
 		return err
 	}
-
 	getResp, err := r.httpClient.Do(getReq)
 	if err != nil {
 		return fmt.Errorf("GET serve config: %w", err)
@@ -331,9 +335,37 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 		return fmt.Errorf("reading serve config: %w", err)
 	}
 
-	// PUT the same config back to reset DEPLOY_FAILED
+	// applications is a MAP in the GET response; PUT expects a LIST.
+	// Extract deployed_app_config from each app — same approach as PatchServeModelFractions.
+	var getResponse map[string]interface{}
+	if err := json.Unmarshal(body, &getResponse); err != nil {
+		return fmt.Errorf("parsing serve config: %w", err)
+	}
+	appsMap, ok := getResponse["applications"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected serve config: applications is not an object")
+	}
+
+	putApps := make([]interface{}, 0, len(appsMap))
+	for _, rawApp := range appsMap {
+		app, ok := rawApp.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		appConfig, ok := app["deployed_app_config"].(map[string]interface{})
+		if !ok || len(appConfig) == 0 {
+			return nil // app still initialising, retry later
+		}
+		putApps = append(putApps, appConfig)
+	}
+
+	putBody, err := json.Marshal(map[string]interface{}{"applications": putApps})
+	if err != nil {
+		return fmt.Errorf("marshaling serve config: %w", err)
+	}
+
 	putURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
-	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, strings.NewReader(string(body)))
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, strings.NewReader(string(putBody)))
 	if err != nil {
 		return err
 	}
