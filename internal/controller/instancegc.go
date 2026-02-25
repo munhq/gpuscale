@@ -14,19 +14,29 @@ import (
 // InstanceGC periodically lists all provider instances and destroys any
 // that don't have a matching GPUNodeClaim. This catches orphans from
 // controller restarts, failed finalizers, or force-deleted claims.
+//
+// To avoid a race between instance creation and annotation/status propagation
+// in the informer cache, an instance must appear orphaned in TWO consecutive
+// sweeps before it is destroyed. This gives the reconciler at least one full
+// GC interval to write the claim annotation.
 type InstanceGC struct {
 	client.Client
 	Log      logr.Logger
 	Registry *provider.Registry
 	Interval time.Duration
+
+	// candidates tracks instanceIDs seen as orphaned in the previous sweep.
+	// Only instances present in both the previous and current sweep are destroyed.
+	candidates map[string]bool // instanceID → true
 }
 
 func NewInstanceGC(c client.Client, log logr.Logger, registry *provider.Registry, interval time.Duration) *InstanceGC {
 	return &InstanceGC{
-		Client:   c,
-		Log:      log,
-		Registry: registry,
-		Interval: interval,
+		Client:     c,
+		Log:        log,
+		Registry:   registry,
+		Interval:   interval,
+		candidates: make(map[string]bool),
 	}
 }
 
@@ -35,8 +45,10 @@ func (g *InstanceGC) Start(ctx context.Context) error {
 	log := g.Log
 	log.Info("Starting instance garbage collector", "interval", g.Interval)
 
-	// Initial sweep after a short delay to let claims populate.
-	time.Sleep(10 * time.Second)
+	// Initial sweep after a delay to let the informer cache populate.
+	// Two minutes is enough for the reconciler to process all existing claims
+	// and write their instance-id annotations after a controller restart.
+	time.Sleep(2 * time.Minute)
 	g.sweep(ctx)
 
 	ticker := time.NewTicker(g.Interval)
@@ -77,7 +89,9 @@ func (g *InstanceGC) sweep(ctx context.Context) {
 		}
 	}
 
-	// Check each provider for orphaned instances.
+	// Collect the set of orphaned instance IDs seen in this sweep.
+	currentOrphans := make(map[string]bool)
+
 	for _, prov := range g.Registry.List() {
 		instances, err := prov.ListInstances(ctx)
 		if err != nil {
@@ -90,7 +104,20 @@ func (g *InstanceGC) sweep(ctx context.Context) {
 				continue
 			}
 
-			// Orphan found — destroy it.
+			// Instance not claimed. Check if it was also orphaned last sweep.
+			if !g.candidates[inst.InstanceID] {
+				// First time we see this as orphaned — record and wait one more cycle.
+				log.Info("GC: orphan candidate (will destroy next sweep if still unclaimed)",
+					"provider", prov.Name(),
+					"instanceID", inst.InstanceID,
+					"gpu", inst.GPUType,
+					"status", inst.Status,
+				)
+				currentOrphans[inst.InstanceID] = true
+				continue
+			}
+
+			// Orphaned in both previous and current sweep — safe to destroy.
 			log.Info("GC: destroying orphaned instance",
 				"provider", prov.Name(),
 				"instanceID", inst.InstanceID,
@@ -102,6 +129,8 @@ func (g *InstanceGC) sweep(ctx context.Context) {
 					"provider", prov.Name(),
 					"instanceID", inst.InstanceID,
 				)
+				// Keep in candidates so we retry next sweep.
+				currentOrphans[inst.InstanceID] = true
 			} else {
 				log.Info("GC: orphaned instance destroyed",
 					"provider", prov.Name(),
@@ -110,6 +139,10 @@ func (g *InstanceGC) sweep(ctx context.Context) {
 			}
 		}
 	}
+
+	// Advance the candidate set: only instances seen as orphaned this sweep
+	// survive into the next sweep's candidate set.
+	g.candidates = currentOrphans
 }
 
 // SetupWithManager registers the GC as a Runnable.
