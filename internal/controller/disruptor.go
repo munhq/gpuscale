@@ -110,6 +110,18 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 		return r.drainAndDestroy(ctx, &node, claim, log)
 	}
 
+	// Grace period: skip idle/stuck detection for 15 min after node became Ready.
+	// The Ray worker pod image pull + vLLM load + runtime_env pip install can take
+	// longer than the 2 min cooldown, causing premature termination of healthy nodes.
+	const startupGrace = 15 * time.Minute
+	if claim.Status.ReadyAt != nil && time.Since(claim.Status.ReadyAt.Time) < startupGrace {
+		log.Info("Node in startup grace period, skipping idle detection",
+			"readyAt", claim.Status.ReadyAt.Time,
+			"graceRemaining", (startupGrace - time.Since(claim.Status.ReadyAt.Time)).Round(time.Second),
+		)
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// Check if node is idle (no GPU workload pods)
 	idle, err := r.isNodeIdle(ctx, &node)
 	if err != nil {
@@ -121,8 +133,11 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 		// Stuck detection: Ray worker pod is running but all models are DEPLOY_FAILED/UNHEALTHY
 		// with no demand. The model load loop is broken and the node is burning money doing nothing.
 		// Treat it like idle and drain after cooldown.
-		if r.isNodeStuck(ctx, modelIDs) {
-			log.Info("Node is stuck: models DEPLOY_FAILED/UNHEALTHY with no demand, draining after cooldown", "models", modelIDs)
+		if stuck, serveStatuses := r.isNodeStuckWithDetails(ctx, modelIDs); stuck {
+			log.Info("Node is stuck: models DEPLOY_FAILED/UNHEALTHY with no demand, draining after cooldown",
+				"models", modelIDs,
+				"serveStatuses", serveStatuses,
+			)
 			return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
 				return r.drainAndDestroy(ctx, &node, claim, log)
 			})
@@ -411,16 +426,23 @@ func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha
 // This catches the broken-bootstrap failure mode: Ray worker pod stays Running
 // indefinitely while vLLM replicas keep crashing, blocking normal idle detection.
 func (r *DisruptionController) isNodeStuck(ctx context.Context, modelIDs []string) bool {
+	stuck, _ := r.isNodeStuckWithDetails(ctx, modelIDs)
+	return stuck
+}
+
+// isNodeStuckWithDetails is like isNodeStuck but also returns the Ray Serve statuses
+// for each model, so callers can log the actual reason for the stuck detection.
+func (r *DisruptionController) isNodeStuckWithDetails(ctx context.Context, modelIDs []string) (bool, map[string]string) {
 	if len(modelIDs) == 0 || r.DemandStore == nil || r.RayCapacity == nil {
-		return false
+		return false, nil
 	}
 	// Any demand means something is waiting for this node — not stuck.
 	if r.hasAnyModelDemand(ctx, modelIDs) {
-		return false
+		return false, nil
 	}
 	statuses, err := r.RayCapacity.GetServeAppStatus(ctx)
 	if err != nil || len(statuses) == 0 {
-		return false // can't determine status; fail safe, don't drain
+		return false, nil // can't determine status; fail safe, don't drain
 	}
 	statusMap := make(map[string]string, len(statuses))
 	for _, s := range statuses {
@@ -428,16 +450,18 @@ func (r *DisruptionController) isNodeStuck(ctx context.Context, modelIDs []strin
 	}
 	// Every model on this claim must be broken (DEPLOY_FAILED or UNHEALTHY).
 	// If even one is healthy the node may be in use.
+	relevant := make(map[string]string)
 	for _, id := range modelIDs {
 		status, known := statusMap[id]
 		if !known {
-			return false // model not in Serve yet — might be cold-starting, not stuck
+			return false, nil // model not in Serve yet — might be cold-starting, not stuck
 		}
+		relevant[id] = status
 		if status != "DEPLOY_FAILED" && status != "UNHEALTHY" {
-			return false
+			return false, relevant
 		}
 	}
-	return true
+	return true, relevant
 }
 
 // --- Shared helpers ---
