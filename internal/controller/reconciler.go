@@ -16,6 +16,7 @@ import (
 	"github.com/munhq/gpuscale/pkg/provider"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -470,6 +471,7 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 			if r.WorkerStore != nil {
 				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 			}
+			r.deleteNodeIfExists(ctx, claim, log)
 			r.retriggerIfDemandExists(ctx, claim, log)
 			return ctrl.Result{}, nil
 		}
@@ -533,6 +535,7 @@ func (r *ClaimReconciler) handleBootstrapping(ctx context.Context, claim *v1alph
 		if r.WorkerStore != nil {
 			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 		}
+		r.deleteNodeIfExists(ctx, claim, log)
 		r.retriggerIfDemandExists(ctx, claim, log)
 		return ctrl.Result{}, nil
 	}
@@ -767,6 +770,7 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 					}
 				}
 			}
+			r.deleteNodeIfExists(ctx, claim, log)
 			r.retriggerIfDemandExists(ctx, claim, log)
 			return ctrl.Result{}, nil
 		}
@@ -802,6 +806,7 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 				}
 			}
 		}
+		r.deleteNodeIfExists(ctx, claim, log)
 		r.retriggerIfDemandExists(ctx, claim, log)
 		return ctrl.Result{}, nil
 	}
@@ -845,6 +850,7 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 						}
 					}
 				}
+				r.deleteNodeIfExists(ctx, claim, log)
 				r.retriggerIfDemandExists(ctx, claim, log)
 				return ctrl.Result{}, nil
 			}
@@ -878,6 +884,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 						_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
 					}
 				}
+			}
+			if err := r.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+				log.Error(err, "Failed to delete NotReady node", "node", node.Name)
+			} else {
+				log.Info("Deleted NotReady node", "node", node.Name)
 			}
 			r.retriggerIfDemandExists(ctx, claim, log)
 			return ctrl.Result{}, nil
@@ -1198,6 +1209,24 @@ func (r *ClaimReconciler) findNodeByInstanceID(ctx context.Context, instanceID s
 	return &nodeList.Items[0], nil
 }
 
+// deleteNodeIfExists removes the K8s node object for a claim if one exists.
+// Called on all terminate paths to prevent stale NotReady nodes accumulating.
+func (r *ClaimReconciler) deleteNodeIfExists(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
+	node, err := r.findNodeByInstanceID(ctx, claim.Name)
+	if err != nil {
+		log.Error(err, "Failed to look up node for deletion")
+		return
+	}
+	if node == nil {
+		return
+	}
+	if err := r.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "Failed to delete node", "node", node.Name)
+		return
+	}
+	log.Info("Deleted stale K8s node", "node", node.Name)
+}
+
 func (r *ClaimReconciler) isBootstrapTimedOut(claim *v1alpha1.GPUNodeClaim) bool {
 	if claim.Status.ProvisionedAt == nil {
 		return false
@@ -1240,6 +1269,7 @@ func (r *ClaimReconciler) terminateTimedOut(ctx context.Context, claim *v1alpha1
 		}
 	}
 
+	r.deleteNodeIfExists(ctx, claim, log)
 	r.retriggerIfDemandExists(ctx, claim, log)
 	return ctrl.Result{}, nil
 }
