@@ -58,6 +58,10 @@ type ClaimReconciler struct {
 	// RayCapacityStore queries Ray Serve app status to confirm model readiness.
 	// Used in handleReady to gate SetModelLoaded until the model is actually RUNNING.
 	RayCapacityStore *RayCapacityStore
+
+	// ClaimWriter writes claim lifecycle events to Postgres for history.
+	// Nil-safe: all writes are no-ops when unset.
+	ClaimWriter *ClaimWriter
 }
 
 // SecretReader fetches secret values needed for bootstrap.
@@ -635,6 +639,25 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 		)
 	}
 
+	if r.ClaimWriter != nil {
+		readyAt := now.Time
+		if err := r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
+			Name:          claim.Name,
+			Pool:          claim.Spec.PoolRef,
+			Provider:      claim.Status.Provider,
+			GPUType:       claim.Status.GPUType,
+			GPUCount:      claim.Status.GPUCount,
+			PricePerHour:  claim.Status.PricePerHour,
+			ModelID:       claimPrimaryModel(claim),
+			NodeType:      claim.Status.NodeType,
+			Phase:         string(v1alpha1.ClaimPhaseReady),
+			ProvisionedAt: provisionedAtTime(claim),
+			ReadyAt:       &readyAt,
+		}); err != nil {
+			log.Error(err, "Failed to write Ready claim to Postgres (non-fatal)")
+		}
+	}
+
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 }
 
@@ -722,6 +745,25 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 			"provider", claim.Status.Provider,
 			"gpu", claim.Status.GPUType,
 		)
+	}
+
+	if r.ClaimWriter != nil {
+		readyAt := now.Time
+		if err := r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
+			Name:          claim.Name,
+			Pool:          claim.Spec.PoolRef,
+			Provider:      claim.Status.Provider,
+			GPUType:       claim.Status.GPUType,
+			GPUCount:      claim.Status.GPUCount,
+			PricePerHour:  claim.Status.PricePerHour,
+			ModelID:       claimPrimaryModel(claim),
+			NodeType:      claim.Status.NodeType,
+			Phase:         string(v1alpha1.ClaimPhaseReady),
+			ProvisionedAt: provisionedAtTime(claim),
+			ReadyAt:       &readyAt,
+		}); err != nil {
+			log.Error(err, "Failed to write Ready ray-worker claim to Postgres (non-fatal)")
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
@@ -1450,6 +1492,30 @@ func claimModelIDs(claim *v1alpha1.GPUNodeClaim) []string {
 		return []string{claim.Spec.ModelID}
 	}
 	return nil
+}
+
+func claimPrimaryModel(claim *v1alpha1.GPUNodeClaim) string {
+	ids := claimModelIDs(claim)
+	if len(ids) > 0 {
+		return ids[0]
+	}
+	return ""
+}
+
+func provisionedAtTime(claim *v1alpha1.GPUNodeClaim) *time.Time {
+	if claim.Status.ProvisionedAt == nil {
+		return nil
+	}
+	t := claim.Status.ProvisionedAt.Time
+	return &t
+}
+
+func readyAtTime(claim *v1alpha1.GPUNodeClaim) *time.Time {
+	if claim.Status.ReadyAt == nil {
+		return nil
+	}
+	t := claim.Status.ReadyAt.Time
+	return &t
 }
 
 // backoffDuration returns an exponential backoff duration based on retry count.

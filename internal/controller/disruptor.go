@@ -45,6 +45,8 @@ type DisruptionController struct {
 	// When set, drainAndDestroy re-submits the Ray Serve config after destroying
 	// the node so Ray allocates replicas to live workers instead of stale actors.
 	RayHeadAddr string
+	// ClaimWriter writes claim lifecycle events to Postgres for history.
+	ClaimWriter *ClaimWriter
 }
 
 // NewDisruptionController creates a new disruption controller.
@@ -269,6 +271,25 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 			if err := r.DemandStore.RemoveModelLoaded(ctx, modelID); err != nil {
 				log.Error(err, "Failed to remove loaded_models key", "model", modelID)
 			}
+		}
+	}
+
+	// Write Terminated to Postgres history
+	if r.ClaimWriter != nil {
+		if err := r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
+			Name:          claim.Name,
+			Pool:          claim.Spec.PoolRef,
+			Provider:      claim.Status.Provider,
+			GPUType:       claim.Status.GPUType,
+			GPUCount:      claim.Status.GPUCount,
+			PricePerHour:  claim.Status.PricePerHour,
+			ModelID:       claimPrimaryModel(claim),
+			NodeType:      claim.Status.NodeType,
+			Phase:         string(v1alpha1.ClaimPhaseTerminated),
+			ProvisionedAt: provisionedAtTime(claim),
+			ReadyAt:       readyAtTime(claim),
+		}); err != nil {
+			log.Error(err, "Failed to write Terminated claim to Postgres (non-fatal)")
 		}
 	}
 
@@ -499,6 +520,24 @@ func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha
 			if err := r.DemandStore.RemoveModelLoaded(ctx, modelID); err != nil {
 				log.Error(err, "Failed to remove loaded_models key", "model", modelID)
 			}
+		}
+	}
+
+	if r.ClaimWriter != nil {
+		if err := r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
+			Name:          claim.Name,
+			Pool:          claim.Spec.PoolRef,
+			Provider:      claim.Status.Provider,
+			GPUType:       claim.Status.GPUType,
+			GPUCount:      claim.Status.GPUCount,
+			PricePerHour:  claim.Status.PricePerHour,
+			ModelID:       claimPrimaryModel(claim),
+			NodeType:      claim.Status.NodeType,
+			Phase:         string(v1alpha1.ClaimPhaseTerminated),
+			ProvisionedAt: provisionedAtTime(claim),
+			ReadyAt:       readyAtTime(claim),
+		}); err != nil {
+			log.Error(err, "Failed to write Terminated ray-worker claim to Postgres (non-fatal)")
 		}
 	}
 

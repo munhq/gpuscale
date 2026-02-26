@@ -174,6 +174,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	var claimWriter *gpucontroller.ClaimWriter
+	if pgURL := os.Getenv("POSTGRES_URL"); pgURL != "" {
+		cw, err := gpucontroller.NewClaimWriter(pgURL)
+		if err != nil {
+			setupLog.Error(err, "Failed to connect claim writer to Postgres — history disabled")
+		} else {
+			claimWriter = cw
+			setupLog.Info("Claim writer enabled (Postgres history)")
+			defer cw.Close()
+		}
+	}
+
 	disruptionCtrl := gpucontroller.NewDisruptionController(
 		mgr.GetClient(),
 		ctrl.Log.WithName("disruptor"),
@@ -184,6 +196,7 @@ func main() {
 	disruptionCtrl.DemandStore = demandStore
 	disruptionCtrl.RayCapacity = rayCapacityStore
 	disruptionCtrl.RayHeadAddr = os.Getenv("RAY_HEAD_ADDRESS")
+	disruptionCtrl.ClaimWriter = claimWriter
 	if err := disruptionCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create disruption controller")
 		os.Exit(1)
@@ -198,6 +211,7 @@ func main() {
 	claimReconciler.WorkerStore = workerStore
 	claimReconciler.DemandStore = demandStore
 	claimReconciler.RayCapacityStore = rayCapacityStore
+	claimReconciler.ClaimWriter = claimWriter
 	if rayHead := os.Getenv("RAY_HEAD_ADDRESS"); rayHead != "" {
 		claimReconciler.RayHeadAddress = rayHead
 		setupLog.Info("Ray head address configured from env", "address", rayHead)
