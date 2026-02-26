@@ -566,7 +566,17 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Node is Ready!
+	// Node is Ready! Apply nvidia.com/gpu.present=true label immediately so the
+	// Ray worker pod (nodeSelector: nvidia.com/gpu.present=true) can schedule
+	// without waiting for NFD/nvidia-device-plugin to label the node first.
+	nodePatch := []byte(`{"metadata":{"labels":{"nvidia.com/gpu.present":"true"}}}`)
+	if err := r.Patch(ctx, node, client.RawPatch(types.MergePatchType, nodePatch)); err != nil {
+		log.Error(err, "Failed to patch nvidia.com/gpu.present label on node")
+		// Non-fatal — NFD will eventually add it, just slower
+	} else {
+		log.Info("Patched node with nvidia.com/gpu.present=true", "node", node.Name)
+	}
+
 	now := metav1.Now()
 	claim.Status.Phase = v1alpha1.ClaimPhaseReady
 	claim.Status.NodeName = node.Name
