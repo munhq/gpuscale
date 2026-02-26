@@ -115,6 +115,14 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 	// longer than the 2 min cooldown, causing premature termination of healthy nodes.
 	const startupGrace = 15 * time.Minute
 	if claim.Status.ReadyAt != nil && time.Since(claim.Status.ReadyAt.Time) < startupGrace {
+		// Clear any stale idleSince that was set before ReadyAt was persisted (race on first run).
+		// Without this, when the grace period expires idleSince is already old and the node drains instantly.
+		if claim.Status.IdleSince != nil {
+			claim.Status.IdleSince = nil
+			if err := r.Status().Update(ctx, claim); err != nil {
+				log.Error(err, "Failed to clear stale idleSince during grace period")
+			}
+		}
 		log.Info("Node in startup grace period, skipping idle detection",
 			"readyAt", claim.Status.ReadyAt.Time,
 			"graceRemaining", (startupGrace - time.Since(claim.Status.ReadyAt.Time)).Round(time.Second),
