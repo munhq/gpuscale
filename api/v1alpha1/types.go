@@ -92,9 +92,17 @@ type ScalingSpec struct {
 	// +kubebuilder:default="10s"
 	BatchWindow metav1.Duration `json:"batchWindow,omitempty"`
 
-	// CooldownPeriod is how long to keep an idle node before destroying it.
-	// +kubebuilder:default="10m"
+	// CooldownPeriod is the minimum idle time before destroying a node.
+	// With BillingPeriod set, this becomes a floor — the node is kept until
+	// the next billing tick regardless.
+	// +kubebuilder:default="2m"
 	CooldownPeriod metav1.Duration `json:"cooldownPeriod,omitempty"`
+
+	// BillingPeriod is the provider's billing increment (e.g. 10m for Verda).
+	// When set, idle nodes are destroyed just before the next billing tick
+	// (BillingPeriod - 1 min) to avoid paying for unused time.
+	// Zero means no billing-aware scheduling — use CooldownPeriod only.
+	BillingPeriod metav1.Duration `json:"billingPeriod,omitempty"`
 
 	// MaxNodes is the maximum number of nodes this pool can manage.
 	MaxNodes int `json:"maxNodes"`

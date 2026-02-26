@@ -183,6 +183,7 @@ func main() {
 	disruptionCtrl.WorkerStore = workerStore
 	disruptionCtrl.DemandStore = demandStore
 	disruptionCtrl.RayCapacity = rayCapacityStore
+	disruptionCtrl.RayHeadAddr = os.Getenv("RAY_HEAD_ADDRESS")
 	if err := disruptionCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create disruption controller")
 		os.Exit(1)

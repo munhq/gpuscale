@@ -1,8 +1,11 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/munhq/gpuscale/api/v1alpha1"
@@ -36,8 +39,12 @@ type DisruptionController struct {
 	Registry       *provider.Registry
 	CooldownPeriod time.Duration
 	WorkerStore    *WorkerStore
-	DemandStore    *DemandStore    // reads demand counters from Dragonfly DB 3
+	DemandStore    *DemandStore      // reads demand counters from Dragonfly DB 3
 	RayCapacity    *RayCapacityStore // queries Ray Serve application status
+	// RayHeadAddr is the Ray dashboard URL (e.g. http://head-svc:8265).
+	// When set, drainAndDestroy re-submits the Ray Serve config after destroying
+	// the node so Ray allocates replicas to live workers instead of stale actors.
+	RayHeadAddr string
 }
 
 // NewDisruptionController creates a new disruption controller.
@@ -265,8 +272,78 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 		}
 	}
 
+	// Re-submit Ray Serve config to clear stale actor state (GCS entries from
+	// the dead worker pod). Without this, Ray Serve tries to connect to the old
+	// pod IP and hits connection refused, failing 3 times → DEPLOY_FAILED.
+	if r.RayHeadAddr != "" && r.RayCapacity != nil {
+		if err := r.resubmitServeApps(ctx, log); err != nil {
+			log.Error(err, "Failed to re-submit Ray Serve config after drain (non-fatal)")
+		}
+	}
+
 	log.Info("Node drain and destroy complete")
 	return ctrl.Result{}, nil
+}
+
+// resubmitServeApps fetches the current Ray Serve deployed config and PUTs it
+// back so Ray resets DEPLOY_FAILED state and allocates replicas to live workers.
+func (r *DisruptionController) resubmitServeApps(ctx context.Context, log logr.Logger) error {
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Fetch current deployed config.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.RayHeadAddr+"/api/serve/applications/", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var raw struct {
+		Applications map[string]struct {
+			DeployedAppConfig json.RawMessage `json:"deployed_app_config"`
+		} `json:"applications"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return err
+	}
+
+	apps := make([]json.RawMessage, 0, len(raw.Applications))
+	for _, app := range raw.Applications {
+		if app.DeployedAppConfig != nil {
+			apps = append(apps, app.DeployedAppConfig)
+		}
+	}
+	if len(apps) == 0 {
+		return nil
+	}
+
+	payload, err := json.Marshal(map[string]interface{}{"applications": apps})
+	if err != nil {
+		return err
+	}
+
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		r.RayHeadAddr+"/api/serve/applications/",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+
+	putResp, err := httpClient.Do(putReq)
+	if err != nil {
+		return err
+	}
+	putResp.Body.Close()
+
+	log.Info("Re-submitted Ray Serve config after node drain to clear stale GCS actors",
+		"apps", len(apps),
+	)
+	return nil
 }
 
 func (r *DisruptionController) findClaimForNode(ctx context.Context, node *corev1.Node) (*v1alpha1.GPUNodeClaim, error) {
@@ -475,31 +552,41 @@ func (r *DisruptionController) isNodeStuckWithDetails(ctx context.Context, model
 // --- Shared helpers ---
 
 // handleIdleClaim processes idle detection and cooldown for any claim type.
+// When BillingPeriod is set, it waits until 1 min before the next billing tick
+// so we use the time we've already paid for instead of destroying mid-cycle.
 // The destroyFn callback performs the type-specific destruction.
 func (r *DisruptionController) handleIdleClaim(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger, destroyFn func() (ctrl.Result, error)) (ctrl.Result, error) {
 	now := metav1.Now()
+
+	// Read pool for billing period + min-nodes.
+	pool, err := r.getPool(ctx, claim.Spec.PoolRef)
+	if err != nil {
+		log.Error(err, "Failed to get pool")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	var billingPeriod time.Duration
+	if pool != nil {
+		billingPeriod = pool.Spec.Scaling.BillingPeriod.Duration
+	}
+
 	if claim.Status.IdleSince == nil {
 		claim.Status.IdleSince = &now
 		if err := r.Status().Update(ctx, claim); err != nil {
 			log.Error(err, "Failed to set idle timestamp")
 		}
 		log.Info("Claim became idle, starting cooldown timer")
-		return ctrl.Result{RequeueAfter: r.CooldownPeriod}, nil
+		return ctrl.Result{RequeueAfter: r.nextDestroyIn(claim, now.Time, billingPeriod)}, nil
 	}
 
-	idleDuration := time.Since(claim.Status.IdleSince.Time)
-	if idleDuration < r.CooldownPeriod {
-		remaining := r.CooldownPeriod - idleDuration
-		log.Info("Idle but cooldown not expired", "remaining", remaining.String())
-		return ctrl.Result{RequeueAfter: remaining}, nil
+	destroyIn := r.nextDestroyIn(claim, now.Time, billingPeriod)
+	if destroyIn > 0 {
+		log.Info("Idle but waiting for optimal destroy time",
+			"destroyIn", destroyIn.Round(time.Second).String(),
+		)
+		return ctrl.Result{RequeueAfter: destroyIn}, nil
 	}
 
-	// Check pool min-nodes constraint
-	pool, err := r.getPool(ctx, claim.Spec.PoolRef)
-	if err != nil {
-		log.Error(err, "Failed to get pool")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
 	if pool != nil {
 		activeCount := r.countActiveNodes(ctx, pool.Name)
 		if activeCount <= pool.Spec.Scaling.MinNodes {
@@ -508,12 +595,36 @@ func (r *DisruptionController) handleIdleClaim(ctx context.Context, claim *v1alp
 		}
 	}
 
-	log.Info("Idle past cooldown, initiating destroy",
-		"idleDuration", idleDuration.String(),
-		"cooldown", r.CooldownPeriod.String(),
-	)
-
+	log.Info("Idle at optimal destroy time, initiating destroy")
 	return destroyFn()
+}
+
+// nextDestroyIn returns how long to wait before destroying an idle claim.
+// With billingPeriod set: waits until 1 min before the next billing tick so we
+// use the time already paid for (e.g. destroy at min 9 or 19, not min 12).
+// Without billingPeriod: uses CooldownPeriod as a simple floor from idleSince.
+func (r *DisruptionController) nextDestroyIn(claim *v1alpha1.GPUNodeClaim, now time.Time, billingPeriod time.Duration) time.Duration {
+	const billingBuffer = 1 * time.Minute
+
+	if billingPeriod > 0 && claim.Status.ProvisionedAt != nil {
+		age := now.Sub(claim.Status.ProvisionedAt.Time)
+		cyclesDone := int(age / billingPeriod)
+		nextTick := claim.Status.ProvisionedAt.Time.Add(time.Duration(cyclesDone+1) * billingPeriod)
+		optimalDestroy := nextTick.Add(-billingBuffer)
+		if now.Before(optimalDestroy) {
+			return optimalDestroy.Sub(now)
+		}
+		return 0
+	}
+
+	// No billing period — simple cooldown from idleSince.
+	if claim.Status.IdleSince != nil {
+		idleDuration := now.Sub(claim.Status.IdleSince.Time)
+		if idleDuration < r.CooldownPeriod {
+			return r.CooldownPeriod - idleDuration
+		}
+	}
+	return 0
 }
 
 func (r *DisruptionController) getPool(ctx context.Context, name string) (*v1alpha1.GPUNodePool, error) {
