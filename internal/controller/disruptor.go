@@ -233,6 +233,15 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 		log.Error(err, "Failed to remove worker from Dragonfly")
 	}
 
+	// Remove loaded_models keys so GPU API cold-starts on next request.
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			if err := r.DemandStore.RemoveModelLoaded(ctx, modelID); err != nil {
+				log.Error(err, "Failed to remove loaded_models key", "model", modelID)
+			}
+		}
+	}
+
 	log.Info("Node drain and destroy complete")
 	return ctrl.Result{}, nil
 }
@@ -382,6 +391,15 @@ func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha
 	// Remove from Dragonfly
 	if err := r.WorkerStore.RemoveWorker(ctx, claim.Name); err != nil {
 		log.Error(err, "Failed to remove worker from Dragonfly")
+	}
+
+	// Remove loaded_models keys so GPU API cold-starts on next request.
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			if err := r.DemandStore.RemoveModelLoaded(ctx, modelID); err != nil {
+				log.Error(err, "Failed to remove loaded_models key", "model", modelID)
+			}
+		}
 	}
 
 	log.Info("Worker destroy complete")
