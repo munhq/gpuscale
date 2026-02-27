@@ -123,3 +123,15 @@ func (w *ClaimWriter) Upsert(ctx context.Context, r ClaimWriteRecord) error {
 	)
 	return err
 }
+
+// WriteEvent inserts a bootstrap event for a claim. No-op if pool is nil.
+func (cw *ClaimWriter) WriteEvent(ctx context.Context, claimName, step, message string) error {
+	if cw.pool == nil {
+		return nil
+	}
+	_, err := cw.pool.Exec(ctx,
+		`INSERT INTO bootstrap_events (claim_name, step, message) VALUES ($1, $2, $3)`,
+		claimName, step, message,
+	)
+	return err
+}

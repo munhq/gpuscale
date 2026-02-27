@@ -310,6 +310,9 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		if err := r.Status().Update(ctx, claim); err != nil {
 			return ctrl.Result{}, err
 		}
+		if r.ClaimWriter != nil {
+			_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "provisioning", "requesting instance from provider")
+		}
 
 		result, err := r.Coordinator.ProvisionInstance(ctx, reqs, config, providerNames)
 		if err != nil {
@@ -393,6 +396,10 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	}
 	claim.Status.InstanceID = instanceID
 	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
+	if r.ClaimWriter != nil {
+		msg := fmt.Sprintf("instance %s created (%s, %.4f$/hr)", instanceID, claim.Status.GPUType, claim.Status.PricePerHour)
+		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "bootstrapping", msg)
+	}
 	claim.Status.RetryCount = 0
 	if endpoint != "" {
 		claim.Status.Endpoint = endpoint
@@ -656,6 +663,7 @@ func (r *ClaimReconciler) handleBootstrappingFullNode(ctx context.Context, claim
 		}); err != nil {
 			log.Error(err, "Failed to write Ready claim to Postgres (non-fatal)")
 		}
+		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "ready", fmt.Sprintf("node joined K8s (%s)", claim.Status.GPUType))
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil

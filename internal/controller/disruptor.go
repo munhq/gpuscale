@@ -291,6 +291,7 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 		}); err != nil {
 			log.Error(err, "Failed to write Terminated claim to Postgres (non-fatal)")
 		}
+		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated", fmt.Sprintf("instance %s destroyed", claim.Status.InstanceID))
 	}
 
 	// Re-submit Ray Serve config to clear stale actor state (GCS entries from
