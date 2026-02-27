@@ -347,7 +347,7 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 	}
 
 	putApps := make([]interface{}, 0, len(appsMap))
-	for _, rawApp := range appsMap {
+	for appName, rawApp := range appsMap {
 		app, ok := rawApp.(map[string]interface{})
 		if !ok {
 			continue
@@ -355,6 +355,22 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 		appConfig, ok := app["deployed_app_config"].(map[string]interface{})
 		if !ok || len(appConfig) == 0 {
 			return nil // app still initialising, retry later
+		}
+		// If this app is DEPLOY_FAILED, delete it first so Ray drops the stale
+		// GCS actor references before we re-submit. A plain PUT re-uses the same
+		// dead actor handle and loops forever.
+		if status, _ := app["status"].(string); status == "DEPLOY_FAILED" {
+			delURL := fmt.Sprintf("%s/api/serve/applications/%s", dashboardURL, appName)
+			delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
+			if err != nil {
+				return fmt.Errorf("building DELETE request for %s: %w", appName, err)
+			}
+			delResp, err := r.httpClient.Do(delReq)
+			if err != nil {
+				return fmt.Errorf("DELETE serve app %s: %w", appName, err)
+			}
+			delResp.Body.Close()
+			// 200 or 404 are both fine — app is gone either way.
 		}
 		putApps = append(putApps, appConfig)
 	}
