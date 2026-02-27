@@ -154,9 +154,20 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 			case "RUNNING":
 				anyRunning = true
 				allFailed = false
-			case "DEPLOYING", "":
+			case "DEPLOYING":
 				anyDeploying = true
 				allFailed = false
+			case "":
+				// Empty = app not yet registered in Ray Serve, OR min_replicas=0 with no
+				// replica ever started. Only treat as deploying if there is actual demand
+				// (a queued request triggered provisioning and is waiting). With zero demand
+				// the node was provisioned but nothing ever requested it — treat as idle.
+				allFailed = false
+				if r.DemandStore != nil {
+					if demand, _ := r.DemandStore.GetDemand(ctx, id); demand > 0 {
+						anyDeploying = true
+					}
+				}
 			case "DEPLOY_FAILED", "UNHEALTHY":
 				// counts toward allFailed
 			default:
