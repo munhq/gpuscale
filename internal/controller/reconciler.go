@@ -1046,9 +1046,9 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		if serveErr == nil {
 			for _, app := range statuses {
 				for _, modelID := range claimModelIDs(claim) {
-					if app.Name == modelID && app.Status == "DEPLOY_FAILED" {
-						log.Info("Model is DEPLOY_FAILED, re-submitting serve config to reset retry counter",
-							"model", modelID)
+					if app.Name == modelID && (app.Status == "DEPLOY_FAILED" || app.Status == "UNHEALTHY") {
+						log.Info("Model is DEPLOY_FAILED/UNHEALTHY, re-submitting serve config to reset retry counter",
+						"model", modelID)
 						if resubErr := r.RayCapacityStore.ResubmitServeConfig(ctx); resubErr != nil {
 							log.Error(resubErr, "Failed to resubmit serve config")
 						}
@@ -1082,7 +1082,7 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 							log.Error(err, "Failed to set model as loaded", "model", modelID)
 						} else {
 							log.Info("Model confirmed RUNNING in Ray Serve, marked as loaded",
-								"model", modelID)
+									"model", modelID)
 						}
 						// Emit ray_running event once (annotation dedup).
 						r.emitRayEventOnce(ctx, claim, log, "ray_running",
