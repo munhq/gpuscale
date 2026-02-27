@@ -197,27 +197,9 @@ func (r *ClaimReconciler) handleDraining(ctx context.Context, claim *v1alpha1.GP
 	}
 
 	if r.ClaimWriter != nil {
-		models := claimModelIDs(claim)
-		modelID := ""
-		if len(models) > 0 {
-			modelID = models[0]
-		}
-		var readyAt *time.Time
-		if claim.Status.ReadyAt != nil {
-			t := claim.Status.ReadyAt.Time
-			readyAt = &t
-		}
-		_ = r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
-			Name:         claim.Name,
-			Phase:        string(v1alpha1.ClaimPhaseTerminated),
-			Provider:     providerName,
-			GPUType:      claim.Status.GPUType,
-			GPUCount:     claim.Status.GPUCount,
-			NodeType:     claim.Spec.NodeType,
-			ModelID:      modelID,
-			PricePerHour: claim.Status.PricePerHour,
-			ReadyAt:      readyAt,
-		})
+		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated",
+			fmt.Sprintf("instance %s terminated (drain resumed after controller restart)", claim.Status.InstanceID))
+		r.writeTerminatedRecord(ctx, claim, log)
 	}
 
 	r.retriggerIfDemandExists(ctx, claim, log)
@@ -441,6 +423,10 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		claim.Annotations["gpuscale.io/instance-id"] = instanceID
 		claim.Annotations["gpuscale.io/provider"] = providerName
 		claim.Annotations["gpuscale.io/offer-id"] = result.Offer.OfferID
+		// Persist price so handleDraining can recover it if status is lost.
+		if pricePerHour > 0 {
+			claim.Annotations["gpuscale.io/price-per-hour"] = fmt.Sprintf("%.4f", pricePerHour)
+		}
 		if err := r.Patch(ctx, claim, patch); err != nil {
 			log.Error(err, "Failed to persist instance annotation — instance may be orphaned",
 				"instanceID", instanceID, "provider", providerName)
@@ -478,7 +464,9 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 	}
 	claim.Status.InstanceID = instanceID
 	claim.Status.Phase = v1alpha1.ClaimPhaseBootstrapping
-	if r.ClaimWriter != nil {
+	// Only emit the "bootstrapping" event when we freshly created the instance,
+	// not on retries that reuse the annotation (existingInstanceID != "").
+	if r.ClaimWriter != nil && existingInstanceID == "" {
 		msg := fmt.Sprintf("instance %s created (%s, %.4f$/hr)", instanceID, claim.Status.GPUType, claim.Status.PricePerHour)
 		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "bootstrapping", msg)
 	}
@@ -892,6 +880,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 				Message:            "Instance no longer exists on the provider",
 			})
 			_ = r.Status().Update(ctx, claim)
+			if r.ClaimWriter != nil {
+				_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated",
+					fmt.Sprintf("spot instance %s reclaimed by provider (preempted)", claim.Status.InstanceID))
+				r.writeTerminatedRecord(ctx, claim, log)
+			}
 			if r.WorkerStore != nil {
 				_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 			}
@@ -928,6 +921,14 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 			Message:            fmt.Sprintf("Instance status: %s", instance.Status),
 		})
 		_ = r.Status().Update(ctx, claim)
+		if r.ClaimWriter != nil {
+			reason := fmt.Sprintf("instance %s died on provider (status: %s)", claim.Status.InstanceID, instance.Status)
+			if instance.StatusMsg != "" {
+				reason += " — " + instance.StatusMsg
+			}
+			_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated", reason)
+			r.writeTerminatedRecord(ctx, claim, log)
+		}
 		if r.WorkerStore != nil {
 			_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
 		}
@@ -997,6 +998,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 			if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
 				log.Error(err, "Failed to destroy instance with NotReady node")
 			}
+			if r.ClaimWriter != nil {
+				_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated",
+					fmt.Sprintf("K8s node %s went NotReady — VM likely preempted or rebooted", claim.Status.NodeName))
+				r.writeTerminatedRecord(ctx, claim, log)
+			}
 			claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
 			now := metav1.Now()
 			claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
@@ -1059,7 +1065,11 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 			}
 			if serveErr == nil {
 				for _, app := range statuses {
-					if app.Name == modelID && app.Status == "RUNNING" {
+					if app.Name != modelID {
+						continue
+					}
+					switch app.Status {
+					case "RUNNING":
 						info := LoadedModelInfo{
 							ClaimName:  claim.Name,
 							Provider:   claim.Status.Provider,
@@ -1074,7 +1084,13 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 							log.Info("Model confirmed RUNNING in Ray Serve, marked as loaded",
 								"model", modelID)
 						}
-						break
+						// Emit ray_running event once (annotation dedup).
+						r.emitRayEventOnce(ctx, claim, log, "ray_running",
+							fmt.Sprintf("Ray Serve RUNNING — model %s ready to serve", modelID))
+					case "DEPLOYING":
+						// Emit ray_deploying event once (annotation dedup).
+						r.emitRayEventOnce(ctx, claim, log, "ray_deploying",
+							fmt.Sprintf("Ray Serve deploying model %s (image pull + load)", modelID))
 					}
 				}
 			}
@@ -1107,6 +1123,73 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+}
+
+// writeTerminatedRecord upserts a Terminated record in Postgres, recovering price from
+// the annotation if claim.Status.PricePerHour is zero (happens when status update failed
+// or the provider didn't return price in the provisioning response).
+func (r *ClaimReconciler) writeTerminatedRecord(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
+	if r.ClaimWriter == nil {
+		return
+	}
+	price := claim.Status.PricePerHour
+	if price == 0 {
+		if s := claim.Annotations["gpuscale.io/price-per-hour"]; s != "" {
+			_, _ = fmt.Sscanf(s, "%f", &price)
+		}
+	}
+	models := claimModelIDs(claim)
+	modelID := ""
+	if len(models) > 0 {
+		modelID = models[0]
+	}
+	var readyAt *time.Time
+	if claim.Status.ReadyAt != nil {
+		t := claim.Status.ReadyAt.Time
+		readyAt = &t
+	}
+	if err := r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
+		Name:          claim.Name,
+		Pool:          claim.Spec.PoolRef,
+		Provider:      claim.Status.Provider,
+		GPUType:       claim.Status.GPUType,
+		GPUCount:      claim.Status.GPUCount,
+		PricePerHour:  price,
+		ModelID:       modelID,
+		NodeType:      claim.Spec.NodeType,
+		Phase:         string(v1alpha1.ClaimPhaseTerminated),
+		ProvisionedAt: provisionedAtTime(claim),
+		ReadyAt:       readyAt,
+	}); err != nil {
+		log.Error(err, "Failed to write Terminated claim to Postgres (non-fatal)")
+	}
+}
+
+// emitRayEventOnce writes a bootstrap event for the given step exactly once per claim.
+// It uses a claim annotation as a dedup key so the event is not duplicated on every 60s tick.
+// The annotation patch is best-effort; a failure means the event may be emitted more than
+// once (acceptable — it will appear as a duplicate in the timeline rather than missing).
+func (r *ClaimReconciler) emitRayEventOnce(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger, step, message string) {
+	if r.ClaimWriter == nil {
+		return
+	}
+	annotKey := "gpuscale.io/event-" + step
+	if claim.Annotations[annotKey] == "1" {
+		return
+	}
+	if err := r.ClaimWriter.WriteEvent(ctx, claim.Name, step, message); err != nil {
+		log.Error(err, "Failed to write ray event", "step", step)
+		return
+	}
+	// Mark as emitted via annotation patch so we don't duplicate on next reconcile.
+	patch := client.MergeFrom(claim.DeepCopy())
+	if claim.Annotations == nil {
+		claim.Annotations = make(map[string]string)
+	}
+	claim.Annotations[annotKey] = "1"
+	if err := r.Patch(ctx, claim, patch); err != nil {
+		log.Error(err, "Failed to mark ray event emitted (non-fatal)", "step", step)
+	}
 }
 
 // patchFractionalGPUAllocation reads the actual GPU VRAM from the K8s node labels

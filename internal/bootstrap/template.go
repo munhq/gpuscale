@@ -18,13 +18,21 @@ func GenerateScript(config provider.BootstrapConfig) string {
 
 	downloadSection := buildModelDownloadSection(config.ModelSources, config.HFToken)
 
-	gpuAPIEvent := "curl -sf -X POST http://gpu-api.gpu-workloads.svc.cluster.local:8000/internal/bootstrap-event -H 'Content-Type: application/json' -d"
+	// Derive utility-server IP from K8sURL (e.g. https://100.x.x.x:6443 → 100.x.x.x).
+	// This IP is reachable via Netbird VPN once wt0 is up — before k3s joins the cluster
+	// and before cluster DNS is available. We use the NodePort (30800) on that host.
+	// The cluster-internal URL would silently fail before k3s joins.
 	return fmt.Sprintf(`#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 CLAIM_NAME='%s'
+# Derive GPU API URL via NodePort — works before k3s joins (no cluster DNS yet)
+API_HOST=$(echo '%s' | sed 's|https://||' | cut -d: -f1)
+GPU_API="http://${API_HOST}:30800/internal/bootstrap-event"
+emit() { curl -sf -X POST "$GPU_API" -H 'Content-Type: application/json' -d "$1" ||true; }
 echo '[gpuscale] bootstrap start'
 if ! command -v netbird &>/dev/null; then
+emit '{"claim":"'"$CLAIM_NAME"'","step":"vpn_installing","message":"installing Netbird VPN"}'
 curl -fsSL https://pkgs.netbird.io/debian/public.key|gpg --dearmor -o /usr/share/keyrings/netbird.gpg
 echo 'deb [signed-by=/usr/share/keyrings/netbird.gpg] https://pkgs.netbird.io/debian stable main'>/etc/apt/sources.list.d/netbird.list
 apt-get update -qq && apt-get install -y netbird
@@ -37,15 +45,16 @@ NB_IP=$(ip -4 addr show wt0 2>/dev/null|grep -oP '(?<=inet\s)\d+(\.\d+){3}'||tru
 done
 [ -z "$NB_IP" ] && echo 'ERROR: no VPN IP' && exit 1
 echo "[gpuscale] VPN IP: $NB_IP"
-%s '{"claim":"'"$CLAIM_NAME"'","step":"vpn_ready","message":"VPN IP: '"$NB_IP"'"}' ||true
+emit '{"claim":"'"$CLAIM_NAME"'","step":"vpn_ready","message":"VPN IP: '"$NB_IP"'"}'
 if ! command -v nvidia-container-runtime &>/dev/null; then
+emit '{"claim":"'"$CLAIM_NAME"'","step":"nvidia_installing","message":"installing NVIDIA Container Toolkit"}'
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey|gpg --dearmor -o /usr/share/keyrings/nvcr.gpg
 A=$(dpkg --print-architecture)
 echo "deb [signed-by=/usr/share/keyrings/nvcr.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/$A /">/etc/apt/sources.list.d/nvcr.list
 apt-get update -qq && apt-get install -y nvidia-container-toolkit
 fi
 nvidia-smi -pm 1||true
-%s '{"claim":"'"$CLAIM_NAME"'","step":"nvidia_ready","message":"nvidia-container-runtime installed"}' ||true
+emit '{"claim":"'"$CLAIM_NAME"'","step":"nvidia_ready","message":"nvidia-container-runtime installed"}'
 mkdir -p /opt/gpu && chmod 777 /opt/gpu
 mkdir -p /var/lib/rancher/k3s/agent/etc/containerd
 cat>/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl<<'C'
@@ -62,31 +71,30 @@ runtime_type = "io.containerd.runc.v2"
 BinaryName = "/usr/bin/nvidia-container-runtime"
 SystemdCgroup = true
 C
+emit '{"claim":"'"$CLAIM_NAME"'","step":"k3s_installing","message":"downloading and running K3s install script"}'
 curl -sfL https://get.k3s.io -o /tmp/k3s.sh && chmod +x /tmp/k3s.sh
 GL=$(echo '%s'|tr ' ' '-'|tr '[:upper:]' '[:lower:]')
 INSTALL_K3S_EXEC="agent --node-name=%s --node-ip=$NB_IP --node-external-ip=$NB_IP --flannel-iface=wt0 --node-label=gpuscale.io/managed=true --node-label=gpuscale.io/provider=%s --node-label=gpuscale.io/gpu-type=$GL --node-label=gpuscale.io/instance-id=%s --node-label=nvidia.com/gpu.present=true --node-taint=nvidia.com/gpu:NoSchedule --kubelet-arg=eviction-hard=imagefs.available<0%%,nodefs.available<0%%"
 INSTALL_K3S_VERSION='v1.35.0+k3s3' K3S_URL='%s' K3S_TOKEN='%s' INSTALL_K3S_EXEC="$INSTALL_K3S_EXEC" /tmp/k3s.sh
-%s '{"claim":"'"$CLAIM_NAME"'","step":"k3s_joined","message":"K3s agent started, joining cluster"}' ||true
+emit '{"claim":"'"$CLAIM_NAME"'","step":"k3s_joined","message":"K3s agent started, joining cluster"}'
 %secho '[gpuscale] done'
-`, config.InstanceID, config.NetbirdKey,
-		gpuAPIEvent, gpuAPIEvent,
+`, config.InstanceID, config.K8sURL, config.NetbirdKey,
 		gpuLabel, nodeName, provLabel, config.InstanceID,
 		config.K8sURL, config.K8sToken,
-		gpuAPIEvent,
 		downloadSection)
 }
 
 // buildModelDownloadSection returns a bash snippet that pre-downloads the given
 // HuggingFace model repos in the background. The snippet is empty if sources is empty.
 // Downloads run concurrently with K3s agent registration so cold-start latency is reduced.
+// Uses the $emit shell function defined in GenerateScript (NodePort URL, no cluster DNS needed).
 func buildModelDownloadSection(sources []string, hfToken string) string {
 	if len(sources) == 0 {
 		return ""
 	}
-	gpuAPIEvent := "curl -sf -X POST http://gpu-api.gpu-workloads.svc.cluster.local:8000/internal/bootstrap-event -H 'Content-Type: application/json' -d"
 	var b strings.Builder
 	b.WriteString("# Pre-download model weights into /opt/gpu (background, runs while K3s agent registers)\n")
-	fmt.Fprintf(&b, "%s '{\"claim\":\"'\"$CLAIM_NAME\"'\",\"step\":\"model_downloading\",\"message\":\"starting HuggingFace download\"}' ||true\n", gpuAPIEvent)
+	b.WriteString("emit '{\"claim\":\"'\"$CLAIM_NAME\"'\",\"step\":\"model_downloading\",\"message\":\"starting HuggingFace download\"}'\n")
 	b.WriteString("(\n")
 	b.WriteString("  export HF_HOME=/opt/gpu/huggingface\n")
 	if hfToken != "" {
@@ -99,7 +107,7 @@ func buildModelDownloadSection(sources []string, hfToken string) string {
 		repo = strings.TrimPrefix(repo, "hf:")
 		fmt.Fprintf(&b, "  huggingface-cli download '%s' && echo '[gpuscale] downloaded %s'\n", repo, repo)
 	}
-	fmt.Fprintf(&b, "  %s '{\"claim\":\"'\"$CLAIM_NAME\"'\",\"step\":\"model_ready\",\"message\":\"model download complete\"}' ||true\n", gpuAPIEvent)
+	b.WriteString("  emit '{\"claim\":\"'\"$CLAIM_NAME\"'\",\"step\":\"model_ready\",\"message\":\"model download complete\"}'\n")
 	b.WriteString(") >> /tmp/hf-download.log 2>&1 &\n")
 	return b.String()
 }

@@ -116,7 +116,7 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 	// Skip the idle/cooldown check and drain immediately.
 	if claim.Annotations[annotationConsolidationDrain] == "true" {
 		log.Info("Consolidation drain requested, draining immediately", "models", modelIDs)
-		return r.drainAndDestroy(ctx, &node, claim, log)
+		return r.drainAndDestroy(ctx, &node, claim, log, "consolidated — replaced by bin-packed node")
 	}
 
 	// State-based disruption: instead of a flat grace timer, watch Ray Serve status
@@ -185,7 +185,7 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 				"sinceReady", sinceReady.Round(time.Second),
 				"statuses", statusMap,
 			)
-			return r.drainAndDestroy(ctx, &node, claim, log)
+			return r.drainAndDestroy(ctx, &node, claim, log, fmt.Sprintf("model deploy timed out after %s", sinceReady.Round(time.Second)))
 		} else if allFailed {
 			// All models DEPLOY_FAILED/UNHEALTHY. Reconciler re-submits every 60s.
 			// Give it deployFailedTolerance to recover before we pull the plug.
@@ -201,7 +201,7 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 				"sinceReady", sinceReady.Round(time.Second),
 				"statuses", statusMap,
 			)
-			return r.drainAndDestroy(ctx, &node, claim, log)
+			return r.drainAndDestroy(ctx, &node, claim, log, fmt.Sprintf("models DEPLOY_FAILED for %s — irrecoverable", sinceReady.Round(time.Second)))
 		}
 	}
 
@@ -225,7 +225,7 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 
 	// Node is idle (no GPU pods). Enter cooldown then destroy.
 	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
-		return r.drainAndDestroy(ctx, &node, claim, log)
+		return r.drainAndDestroy(ctx, &node, claim, log, "no active requests — idle cooldown expired")
 	})
 }
 
@@ -259,7 +259,7 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 	return false
 }
 
-func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1.Node, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1.Node, claim *v1alpha1.GPUNodeClaim, log logr.Logger, reason string) (ctrl.Result, error) {
 	// Update claim phase to Draining
 	claim.Status.Phase = v1alpha1.ClaimPhaseDraining
 	if err := r.Status().Update(ctx, claim); err != nil {
@@ -345,7 +345,11 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 		}); err != nil {
 			log.Error(err, "Failed to write Terminated claim to Postgres (non-fatal)")
 		}
-		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated", fmt.Sprintf("instance %s destroyed", claim.Status.InstanceID))
+		msg := fmt.Sprintf("instance %s destroyed", claim.Status.InstanceID)
+	if reason != "" {
+		msg += " — " + reason
+	}
+	_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "terminated", msg)
 	}
 
 	// Re-submit Ray Serve config to clear stale actor state (GCS entries from
