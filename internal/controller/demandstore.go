@@ -275,9 +275,10 @@ func (s *DemandStore) GetGPUVRAM(ctx context.Context, gpuType string) (int, erro
 // --- Model Registry (loaded_models) ---
 
 const (
-	loadedModelPrefix  = "loaded_models:"
-	modelLoadedChannel = "gpuscale:model_loaded"
-	provisionChannel   = "gpuscale:provision"
+	loadedModelPrefix    = "loaded_models:"
+	modelLoadedChannel   = "gpuscale:model_loaded"
+	modelFailedChPrefix  = "gpuscale:model_failed:"
+	provisionChannel     = "gpuscale:provision"
 )
 
 // LoadedModelInfo is the JSON value stored in loaded_models:{model}.
@@ -367,6 +368,16 @@ func (s *DemandStore) PublishModelAvailable(ctx context.Context, model string) {
 		return
 	}
 	s.rdb.Publish(ctx, modelLoadedChannel, model)
+}
+
+// PublishModelFailed signals GPU API to cancel any pending Ray Serve HTTP forwards
+// for this model. Called by drainAndDestroy when an instance is destroyed (DEPLOY_FAILED,
+// preemption, deploy timeout) so the queue processor doesn't wait for the 30-min timeout.
+func (s *DemandStore) PublishModelFailed(ctx context.Context, model string) {
+	if s == nil || s.rdb == nil || model == "" {
+		return
+	}
+	s.rdb.Publish(ctx, modelFailedChPrefix+model, "failed") //nolint:errcheck
 }
 
 // PublishProvisionTrigger publishes a provision request (used by InterruptionController for auto-replace).

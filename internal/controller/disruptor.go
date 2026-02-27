@@ -319,12 +319,15 @@ func (r *DisruptionController) drainAndDestroy(ctx context.Context, node *corev1
 		log.Error(err, "Failed to remove worker from Dragonfly")
 	}
 
-	// Remove loaded_models keys so GPU API cold-starts on next request.
+	// Remove loaded_models keys and signal GPU API to cancel any pending HTTP forwards.
+	// GPU API's queue processor may be blocked waiting on Ray Serve (up to 30 min timeout).
+	// Publishing model_failed cancels that context immediately so it re-enqueues the request.
 	if r.DemandStore != nil {
 		for _, modelID := range claimModelIDs(claim) {
 			if err := r.DemandStore.RemoveModelLoaded(ctx, modelID); err != nil {
 				log.Error(err, "Failed to remove loaded_models key", "model", modelID)
 			}
+			r.DemandStore.PublishModelFailed(ctx, modelID)
 		}
 	}
 
@@ -573,12 +576,15 @@ func (r *DisruptionController) destroyWorker(ctx context.Context, claim *v1alpha
 		log.Error(err, "Failed to remove worker from Dragonfly")
 	}
 
-	// Remove loaded_models keys so GPU API cold-starts on next request.
+	// Remove loaded_models keys and signal GPU API to cancel any pending HTTP forwards.
+	// GPU API's queue processor may be blocked waiting on Ray Serve (up to 30 min timeout).
+	// Publishing model_failed cancels that context immediately so it re-enqueues the request.
 	if r.DemandStore != nil {
 		for _, modelID := range claimModelIDs(claim) {
 			if err := r.DemandStore.RemoveModelLoaded(ctx, modelID); err != nil {
 				log.Error(err, "Failed to remove loaded_models key", "model", modelID)
 			}
+			r.DemandStore.PublishModelFailed(ctx, modelID)
 		}
 	}
 
