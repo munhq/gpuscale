@@ -119,24 +119,90 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 		return r.drainAndDestroy(ctx, &node, claim, log)
 	}
 
-	// Grace period: skip idle/stuck detection for 15 min after node became Ready.
-	// The Ray worker pod image pull + vLLM load + runtime_env pip install can take
-	// longer than the 2 min cooldown, causing premature termination of healthy nodes.
-	const startupGrace = 15 * time.Minute
-	if claim.Status.ReadyAt != nil && time.Since(claim.Status.ReadyAt.Time) < startupGrace {
-		// Clear any stale idleSince that was set before ReadyAt was persisted (race on first run).
-		// Without this, when the grace period expires idleSince is already old and the node drains instantly.
-		if claim.Status.IdleSince != nil {
-			claim.Status.IdleSince = nil
-			if err := r.Status().Update(ctx, claim); err != nil {
-				log.Error(err, "Failed to clear stale idleSince during grace period")
+	// State-based disruption: instead of a flat grace timer, watch Ray Serve status
+	// and act immediately on what's actually happening.
+	//
+	//   DEPLOYING / not-yet-in-serve  → model is loading or downloading, keep waiting
+	//                                   (hard cap: 20 min after Ready to catch hung downloads)
+	//   RUNNING                       → model loaded, apply normal idle detection
+	//   DEPLOY_FAILED (persisted)     → reconciler re-submits every 60s; if still
+	//                                   DEPLOY_FAILED after 5 min of retries → destroy now
+	//   UNHEALTHY + no demand         → stuck, drain immediately
+	const maxDeployWait = 20 * time.Minute
+	const deployFailedTolerance = 5 * time.Minute
+
+	if r.RayCapacity != nil && len(modelIDs) > 0 {
+		statuses, serveErr := r.RayCapacity.GetServeAppStatus(ctx)
+		statusMap := make(map[string]string)
+		if serveErr == nil {
+			for _, s := range statuses {
+				statusMap[s.Name] = s.Status
 			}
 		}
-		log.Info("Node in startup grace period, skipping idle detection",
-			"readyAt", claim.Status.ReadyAt.Time,
-			"graceRemaining", (startupGrace - time.Since(claim.Status.ReadyAt.Time)).Round(time.Second),
-		)
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+
+		sinceReady := time.Duration(0)
+		if claim.Status.ReadyAt != nil {
+			sinceReady = time.Since(claim.Status.ReadyAt.Time)
+		}
+
+		allFailed := len(modelIDs) > 0
+		anyRunning := false
+		anyDeploying := false
+		for _, id := range modelIDs {
+			s := statusMap[id]
+			switch s {
+			case "RUNNING":
+				anyRunning = true
+				allFailed = false
+			case "DEPLOYING", "":
+				anyDeploying = true
+				allFailed = false
+			case "DEPLOY_FAILED", "UNHEALTHY":
+				// counts toward allFailed
+			default:
+				allFailed = false
+			}
+		}
+
+		if anyRunning {
+			// Model is serving — normal idle detection below.
+		} else if anyDeploying {
+			// Actively deploying (or not yet in serve config — still downloading).
+			if sinceReady < maxDeployWait {
+				log.Info("Model deploying/downloading, waiting",
+					"sinceReady", sinceReady.Round(time.Second),
+					"maxWait", maxDeployWait,
+					"statuses", statusMap,
+				)
+				if claim.Status.IdleSince != nil {
+					claim.Status.IdleSince = nil
+					_ = r.Status().Update(ctx, claim)
+				}
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			// Exceeded max wait — something is hung.
+			log.Info("Model deploy timed out, draining",
+				"sinceReady", sinceReady.Round(time.Second),
+				"statuses", statusMap,
+			)
+			return r.drainAndDestroy(ctx, &node, claim, log)
+		} else if allFailed {
+			// All models DEPLOY_FAILED/UNHEALTHY. Reconciler re-submits every 60s.
+			// Give it deployFailedTolerance to recover before we pull the plug.
+			if sinceReady < deployFailedTolerance {
+				log.Info("Models DEPLOY_FAILED, waiting for reconciler re-submit",
+					"sinceReady", sinceReady.Round(time.Second),
+					"tolerance", deployFailedTolerance,
+					"statuses", statusMap,
+				)
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			log.Info("Models still DEPLOY_FAILED after tolerance, draining immediately",
+				"sinceReady", sinceReady.Round(time.Second),
+				"statuses", statusMap,
+			)
+			return r.drainAndDestroy(ctx, &node, claim, log)
+		}
 	}
 
 	// Check if node is idle (no GPU workload pods)
@@ -147,18 +213,6 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 	}
 
 	if !idle {
-		// Stuck detection: Ray worker pod is running but all models are DEPLOY_FAILED/UNHEALTHY
-		// with no demand. The model load loop is broken and the node is burning money doing nothing.
-		// Treat it like idle and drain after cooldown.
-		if stuck, serveStatuses := r.isNodeStuckWithDetails(ctx, modelIDs); stuck {
-			log.Info("Node is stuck: models DEPLOY_FAILED/UNHEALTHY with no demand, draining after cooldown",
-				"models", modelIDs,
-				"serveStatuses", serveStatuses,
-			)
-			return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
-				return r.drainAndDestroy(ctx, &node, claim, log)
-			})
-		}
 		// Genuinely busy — clear any stale idle timer and wait.
 		if claim.Status.IdleSince != nil {
 			claim.Status.IdleSince = nil
