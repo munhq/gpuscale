@@ -130,7 +130,9 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return r.handleReady(ctx, &claim, log)
 	case v1alpha1.ClaimPhaseHibernated:
 		return r.handleHibernated(ctx, &claim, log)
-	case v1alpha1.ClaimPhaseDraining, v1alpha1.ClaimPhaseTerminated:
+	case v1alpha1.ClaimPhaseDraining:
+		return r.handleDraining(ctx, &claim, log)
+	case v1alpha1.ClaimPhaseTerminated:
 		return ctrl.Result{}, nil
 	default:
 		// New claim without phase — set to Pending
@@ -140,6 +142,86 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
+}
+
+// handleDraining resumes a Draining claim that was interrupted mid-flight
+// (e.g. controller restart while drainAndDestroy was running in the disruptor).
+// It ensures the provider instance is destroyed and the claim reaches Terminated.
+func (r *ClaimReconciler) handleDraining(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
+	log.Info("Resuming Draining claim — destroying instance and finalising",
+		"instanceID", claim.Status.InstanceID, "provider", claim.Status.Provider)
+
+	providerName := claim.Status.Provider
+	if providerName == "" {
+		providerName = claim.Spec.Provider
+	}
+
+	if claim.Status.InstanceID != "" {
+		if prov, ok := r.Registry.Get(providerName); ok {
+			if err := prov.DestroyInstance(ctx, claim.Status.InstanceID); err != nil {
+				if !errors.Is(err, provider.ErrInstanceNotFound) {
+					log.Error(err, "Failed to destroy instance during Draining resume")
+					return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+				}
+				log.Info("Instance already gone on provider", "instanceID", claim.Status.InstanceID)
+			} else {
+				log.Info("Instance destroyed", "instanceID", claim.Status.InstanceID)
+			}
+		}
+	}
+
+	r.deleteNodeIfExists(ctx, claim, log)
+
+	if r.WorkerStore != nil {
+		_ = r.WorkerStore.RemoveWorker(ctx, claim.Name)
+	}
+	if r.DemandStore != nil {
+		for _, modelID := range claimModelIDs(claim) {
+			if !r.hasOtherReadyClaims(ctx, modelID, claim.Name) {
+				_ = r.DemandStore.RemoveModelLoaded(ctx, modelID)
+			}
+		}
+	}
+
+	claim.Status.Phase = v1alpha1.ClaimPhaseTerminated
+	now := metav1.Now()
+	claim.Status.Conditions = append(claim.Status.Conditions, metav1.Condition{
+		Type:               "DrainResumed",
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: now,
+		Reason:             "DrainResumedAfterRestart",
+		Message:            "Draining resumed by reconciler after controller restart",
+	})
+	if err := r.Status().Update(ctx, claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("setting Draining claim to Terminated: %w", err)
+	}
+
+	if r.ClaimWriter != nil {
+		models := claimModelIDs(claim)
+		modelID := ""
+		if len(models) > 0 {
+			modelID = models[0]
+		}
+		var readyAt *time.Time
+		if claim.Status.ReadyAt != nil {
+			t := claim.Status.ReadyAt.Time
+			readyAt = &t
+		}
+		_ = r.ClaimWriter.Upsert(ctx, ClaimWriteRecord{
+			Name:         claim.Name,
+			Phase:        string(v1alpha1.ClaimPhaseTerminated),
+			Provider:     providerName,
+			GPUType:      claim.Status.GPUType,
+			GPUCount:     claim.Status.GPUCount,
+			NodeType:     claim.Spec.NodeType,
+			ModelID:      modelID,
+			PricePerHour: claim.Status.PricePerHour,
+			ReadyAt:      readyAt,
+		})
+	}
+
+	r.retriggerIfDemandExists(ctx, claim, log)
+	return ctrl.Result{}, nil
 }
 
 func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) (ctrl.Result, error) {
