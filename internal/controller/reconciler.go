@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -357,10 +358,23 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		)
 		instanceID = existingInstanceID
 		providerName = existingProvider
-		// Recover offer details from the provider.
+		// Recover offer details from annotations (stored atomically when instance was created).
+		if gt := claim.Annotations["gpuscale.io/gpu-type"]; gt != "" {
+			gpuType = gt
+		}
+		if gc := claim.Annotations["gpuscale.io/gpu-count"]; gc != "" {
+			if n, err := strconv.Atoi(gc); err == nil {
+				gpuCount = n
+			}
+		}
+		if ph := claim.Annotations["gpuscale.io/price-per-hour"]; ph != "" {
+			if f, err := strconv.ParseFloat(ph, 64); err == nil {
+				pricePerHour = f
+			}
+		}
+		// Also recover endpoint from provider (not stored in annotations).
 		if prov, ok := r.Registry.Get(providerName); ok {
 			if inst, err := prov.GetInstance(ctx, existingInstanceID); err == nil {
-				gpuType = inst.GPUType
 				endpoint = inst.IP
 			}
 		}
@@ -423,7 +437,13 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		claim.Annotations["gpuscale.io/instance-id"] = instanceID
 		claim.Annotations["gpuscale.io/provider"] = providerName
 		claim.Annotations["gpuscale.io/offer-id"] = result.Offer.OfferID
-		// Persist price so handleDraining can recover it if status is lost.
+		// Persist offer details so the reuse path can recover them if status update conflicts.
+		if gpuType != "" {
+			claim.Annotations["gpuscale.io/gpu-type"] = gpuType
+		}
+		if gpuCount > 0 {
+			claim.Annotations["gpuscale.io/gpu-count"] = strconv.Itoa(gpuCount)
+		}
 		if pricePerHour > 0 {
 			claim.Annotations["gpuscale.io/price-per-hour"] = fmt.Sprintf("%.4f", pricePerHour)
 		}
@@ -1059,6 +1079,18 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 		}
 	doneResubmit:
 
+		// Emit one-time events for Ray worker pod state transitions.
+		// These appear in the dashboard timeline so operators can see what the node is doing.
+		workerPodStage := r.getRayWorkerPodStage(ctx, claim.Status.NodeName)
+		switch workerPodStage {
+		case "pending":
+			r.emitRayEventOnce(ctx, claim, log, "ray_worker_pending",
+				fmt.Sprintf("Ray worker pod scheduled on node %s — waiting to start", claim.Status.NodeName))
+		case "running":
+			r.emitRayEventOnce(ctx, claim, log, "ray_worker_running",
+				fmt.Sprintf("Ray worker pod running on node %s — joining Ray cluster", claim.Status.NodeName))
+		}
+
 		for _, modelID := range claimModelIDs(claim) {
 			if r.DemandStore.IsModelLoaded(ctx, modelID) {
 				continue
@@ -1190,6 +1222,33 @@ func (r *ClaimReconciler) emitRayEventOnce(ctx context.Context, claim *v1alpha1.
 	if err := r.Patch(ctx, claim, patch); err != nil {
 		log.Error(err, "Failed to mark ray event emitted (non-fatal)", "step", step)
 	}
+}
+
+// getRayWorkerPodStage returns "none", "pending", or "running" based on Ray worker
+// pods scheduled on the given K8s node. Used to emit state-transition events and
+// to let the disruptor know whether the node is still making progress.
+func (r *ClaimReconciler) getRayWorkerPodStage(ctx context.Context, nodeName string) string {
+	if nodeName == "" {
+		return "none"
+	}
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList,
+		client.MatchingFields{"spec.nodeName": nodeName},
+		client.MatchingLabels{"ray.io/node-type": "worker"},
+	); err != nil {
+		return "none"
+	}
+	for _, p := range podList.Items {
+		switch p.Status.Phase {
+		case corev1.PodFailed, corev1.PodSucceeded:
+			continue
+		case corev1.PodRunning:
+			return "running"
+		default:
+			return "pending"
+		}
+	}
+	return "none"
 }
 
 // patchFractionalGPUAllocation reads the actual GPU VRAM from the K8s node labels

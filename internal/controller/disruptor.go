@@ -198,8 +198,23 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 			)
 			return r.drainAndDestroy(ctx, &node, claim, log, fmt.Sprintf("model deploy timed out after %s", sinceReady.Round(time.Second)))
 		} else if allFailed {
-			// All models DEPLOY_FAILED/UNHEALTHY. Reconciler re-submits every 60s.
-			// Give it deployFailedTolerance to recover before we pull the plug.
+			// All models DEPLOY_FAILED/UNHEALTHY.
+			// If a Ray worker pod exists on the node (Pending or Running), the autoscaler
+			// is responding — the model hasn't had a chance to load yet. Give it the full
+			// deploy window (maxDeployWait) rather than the short failure tolerance.
+			if r.hasRayWorkerOnNode(ctx, nodeName) {
+				if sinceReady < maxDeployWait {
+					log.Info("Models UNHEALTHY but Ray worker pod present on node — waiting for worker to join and load model",
+						"sinceReady", sinceReady.Round(time.Second),
+						"maxWait", maxDeployWait,
+						"statuses", statusMap,
+					)
+					return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+				}
+				// Worker pod present but exceeded max wait — something is stuck.
+				return r.drainAndDestroy(ctx, &node, claim, log, fmt.Sprintf("Ray worker pod present but model never loaded after %s", sinceReady.Round(time.Second)))
+			}
+			// No worker pod — reconciler re-submits every 60s. Give it deployFailedTolerance.
 			if sinceReady < deployFailedTolerance {
 				log.Info("Models DEPLOY_FAILED, waiting for reconciler re-submit",
 					"sinceReady", sinceReady.Round(time.Second),
@@ -238,6 +253,28 @@ func (r *DisruptionController) reconcileFullNode(ctx context.Context, claim *v1a
 	return r.handleIdleClaim(ctx, claim, log, func() (ctrl.Result, error) {
 		return r.drainAndDestroy(ctx, &node, claim, log, "no active requests — idle cooldown expired")
 	})
+}
+
+// hasRayWorkerOnNode returns true if there is at least one non-terminal Ray worker pod
+// scheduled on the given node. A Pending or Running worker pod means the Ray autoscaler
+// is responding and the model may still load — don't destroy the node prematurely.
+func (r *DisruptionController) hasRayWorkerOnNode(ctx context.Context, nodeName string) bool {
+	if nodeName == "" {
+		return false
+	}
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList,
+		client.MatchingFields{"spec.nodeName": nodeName},
+		client.MatchingLabels{"ray.io/node-type": "worker"},
+	); err != nil {
+		return false
+	}
+	for _, p := range podList.Items {
+		if p.Status.Phase != corev1.PodFailed && p.Status.Phase != corev1.PodSucceeded {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *DisruptionController) isNodeIdle(ctx context.Context, node *corev1.Node) (bool, error) {
