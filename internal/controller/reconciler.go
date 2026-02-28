@@ -862,6 +862,8 @@ func (r *ClaimReconciler) handleBootstrappingRayWorker(ctx context.Context, clai
 		}); err != nil {
 			log.Error(err, "Failed to write Ready ray-worker claim to Postgres (non-fatal)")
 		}
+		_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "ray_joined",
+			fmt.Sprintf("Ray worker joined cluster (%s, %s)", claim.Status.GPUType, claim.Status.Provider))
 	}
 
 	return ctrl.Result{RequeueAfter: 60 * time.Second}, nil

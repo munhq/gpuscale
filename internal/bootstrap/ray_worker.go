@@ -53,6 +53,12 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("#!/bin/bash\n")
 	script.WriteString("set -euo pipefail\n\n")
 
+	// GPU API event emission — same NodePort as full-node bootstrap (30800).
+	// rayHost is the Hetzner control-plane IP already parsed from RayHeadAddr.
+	script.WriteString(fmt.Sprintf("CLAIM_NAME='%s'\n", config.InstanceID))
+	script.WriteString(fmt.Sprintf("GPU_API='http://%s:30800/internal/bootstrap-event'\n", rayHost))
+	script.WriteString("emit() { curl -sf -X POST \"$GPU_API\" -H 'Content-Type: application/json' -d \"$1\" || true; }\n\n")
+
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Starting Ray worker on %s'\n", config.ProviderName))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Instance ID: %s'\n", config.InstanceID))
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] GPU Type: %s'\n", config.GPUType))
@@ -120,6 +126,7 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("done\n\n")
 
 	script.WriteString("CHISEL_LOG=/tmp/chisel.log\n")
+	script.WriteString("emit \"{\\\"claim\\\":\\\"$CLAIM_NAME\\\",\\\"step\\\":\\\"tunnel_connecting\\\",\\\"message\\\":\\\"connecting chisel tunnel to $TUNNEL_SERVER, port block $BASE_PORT-$MAX_WORKER_PORT\\\"}\"\n")
 	script.WriteString("chisel client \"http://$TUNNEL_SERVER\" $CHISEL_REMOTES > \"$CHISEL_LOG\" 2>&1 &\n")
 	script.WriteString("CHISEL_PID=$!\n")
 	script.WriteString("echo \"[gpuscale] Chisel client started (PID $CHISEL_PID)\"\n\n")
@@ -145,11 +152,13 @@ func GenerateRayWorkerScript(config provider.BootstrapConfig) string {
 	script.WriteString("  echo '[gpuscale] ERROR: Failed to establish reverse tunnel'\n")
 	script.WriteString("  cat \"$CHISEL_LOG\"\n")
 	script.WriteString("  exit 1\n")
-	script.WriteString("fi\n\n")
+	script.WriteString("fi\n")
+	script.WriteString("emit \"{\\\"claim\\\":\\\"$CLAIM_NAME\\\",\\\"step\\\":\\\"tunnel_ready\\\",\\\"message\\\":\\\"chisel tunnel established, ports $BASE_PORT-$MAX_WORKER_PORT\\\"}\"\n\n")
 
 	// node-ip-address = Hetzner IP (chisel server host). GCS/proxy connect to
 	// Hetzner:port → chisel → worker localhost:port for all tunneled ports.
 	script.WriteString(fmt.Sprintf("echo '[gpuscale] Joining Ray cluster as worker with %d GPUs...'\n", numGPUs))
+	script.WriteString("emit \"{\\\"claim\\\":\\\"$CLAIM_NAME\\\",\\\"step\\\":\\\"ray_joining\\\",\\\"message\\\":\\\"starting ray worker process, joining cluster\\\"}\"\n")
 	script.WriteString("GPUSCALE_INSTANCE_ID=\"${INSTANCE_ID:-${VAST_CONTAINERLABEL:-${CONTAINER_ID:-unknown}}}\"\n")
 	script.WriteString("echo \"[gpuscale] Instance ID: $GPUSCALE_INSTANCE_ID\"\n")
 	script.WriteString(fmt.Sprintf("NODE_IP='%s'\n", rayHost))
