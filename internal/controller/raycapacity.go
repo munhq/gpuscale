@@ -248,15 +248,17 @@ func (r *RayCapacityStore) queryLoadedModels(ctx context.Context, serveURL strin
 
 // ServeAppStatus represents the status of a Ray Serve application.
 type ServeAppStatus struct {
-	Name   string // application name (e.g., "qwen3-coder-next")
-	Status string // "RUNNING", "DEPLOY_FAILED", "DEPLOYING", "UNHEALTHY", "NOT_STARTED", "DELETING"
+	Name    string // application name (e.g., "qwen3-coder-next")
+	Status  string // "RUNNING", "DEPLOY_FAILED", "DEPLOYING", "UNHEALTHY", "NOT_STARTED", "DELETING"
+	Message string // human-readable reason from Ray (populated on DEPLOY_FAILED/UNHEALTHY)
 }
 
 // serveApplicationsResponse is the response from Ray Dashboard GET /api/serve/applications/.
 // The `applications` field is a map keyed by application name, not an array.
 type serveApplicationsResponse struct {
 	Applications map[string]struct {
-		Status string `json:"status"`
+		Status  string `json:"status"`
+		Message string `json:"message"` // error detail from Ray on failure
 	} `json:"applications"`
 }
 
@@ -293,8 +295,9 @@ func (r *RayCapacityStore) GetServeAppStatus(ctx context.Context) ([]ServeAppSta
 	statuses := make([]ServeAppStatus, 0, len(serveResp.Applications))
 	for name, app := range serveResp.Applications {
 		statuses = append(statuses, ServeAppStatus{
-			Name:   name,
-			Status: app.Status,
+			Name:    name,
+			Status:  app.Status,
+			Message: app.Message,
 		})
 	}
 	return statuses, nil

@@ -1070,7 +1070,17 @@ func (r *ClaimReconciler) handleReady(ctx context.Context, claim *v1alpha1.GPUNo
 				for _, modelID := range claimModelIDs(claim) {
 					if app.Name == modelID && (app.Status == "DEPLOY_FAILED" || app.Status == "UNHEALTHY") {
 						log.Info("Model is DEPLOY_FAILED/UNHEALTHY, re-submitting serve config to reset retry counter",
-						"model", modelID)
+							"model", modelID, "rayMessage", app.Message)
+						// Emit a failure event with Ray's error message so it appears in
+						// the dashboard timeline. Not deduped (use WriteEvent directly)
+						// because we want to record each resubmit attempt.
+						if r.ClaimWriter != nil {
+							msg := fmt.Sprintf("Ray Serve %s for model %s", app.Status, modelID)
+							if app.Message != "" {
+								msg += ": " + app.Message
+							}
+							_ = r.ClaimWriter.WriteEvent(ctx, claim.Name, "ray_deploy_error", msg)
+						}
 						if resubErr := r.RayCapacityStore.ResubmitServeConfig(ctx); resubErr != nil {
 							log.Error(resubErr, "Failed to resubmit serve config")
 						}
@@ -1216,11 +1226,14 @@ func (r *ClaimReconciler) emitRayEventOnce(ctx context.Context, claim *v1alpha1.
 		return
 	}
 	// Mark as emitted via annotation patch so we don't duplicate on next reconcile.
+	// Also update bootstrap-step so the Live tab shows current progress (same field
+	// the bootstrap script posts to via /internal/bootstrap-event).
 	patch := client.MergeFrom(claim.DeepCopy())
 	if claim.Annotations == nil {
 		claim.Annotations = make(map[string]string)
 	}
 	claim.Annotations[annotKey] = "1"
+	claim.Annotations["gpuscale.io/bootstrap-step"] = step
 	if err := r.Patch(ctx, claim, patch); err != nil {
 		log.Error(err, "Failed to mark ray event emitted (non-fatal)", "step", step)
 	}
