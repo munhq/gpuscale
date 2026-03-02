@@ -349,8 +349,12 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 		return fmt.Errorf("unexpected serve config: applications is not an object")
 	}
 
+	// Ray 2.x does not support DELETE /api/serve/applications/{name} (returns 404).
+	// To remove a DEPLOY_FAILED app, omit it from the PUT — Ray deletes any app
+	// absent from a PUT request. The app is re-added by the KubeRay operator on
+	// its next reconcile cycle, which resets the DEPLOY_FAILED state cleanly.
 	putApps := make([]interface{}, 0, len(appsMap))
-	for appName, rawApp := range appsMap {
+	for _, rawApp := range appsMap {
 		app, ok := rawApp.(map[string]interface{})
 		if !ok {
 			continue
@@ -359,21 +363,10 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 		if !ok || len(appConfig) == 0 {
 			return nil // app still initialising, retry later
 		}
-		// If this app is DEPLOY_FAILED, delete it first so Ray drops the stale
-		// GCS actor references before we re-submit. A plain PUT re-uses the same
-		// dead actor handle and loops forever.
+		// Skip DEPLOY_FAILED apps — omitting them from PUT removes them from Ray.
+		// KubeRay will re-add them on next reconcile, resetting the failure state.
 		if status, _ := app["status"].(string); status == "DEPLOY_FAILED" {
-			delURL := fmt.Sprintf("%s/api/serve/applications/%s", dashboardURL, appName)
-			delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
-			if err != nil {
-				return fmt.Errorf("building DELETE request for %s: %w", appName, err)
-			}
-			delResp, err := r.httpClient.Do(delReq)
-			if err != nil {
-				return fmt.Errorf("DELETE serve app %s: %w", appName, err)
-			}
-			delResp.Body.Close()
-			// 200 or 404 are both fine — app is gone either way.
+			continue
 		}
 		putApps = append(putApps, appConfig)
 	}
@@ -404,14 +397,16 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 	return nil
 }
 
-// DeleteDeployingApps deletes all Ray Serve applications that are stuck in DEPLOYING
-// state. This is called when KubeRay worker pods are pending with no API demand,
-// which indicates Ray Serve created a config-update verification replica that can
-// never be satisfied (no GPU node exists and none should be provisioned without real
-// demand). Deleting the app causes the KubeRay operator to re-submit it on its next
-// reconcile cycle; with initial_replicas:0 in the new serveConfigV2, Ray Serve
-// will not create a verification replica and the app will go straight to RUNNING at
-// 0 replicas.
+// DeleteDeployingApps removes all Ray Serve applications that are stuck in DEPLOYING
+// state by PUTting a config that omits them (Ray deletes any app absent from a PUT).
+// This is called when KubeRay worker pods are pending with no API demand, indicating
+// Ray Serve created a config-update verification replica that can never be satisfied.
+// After removal the KubeRay operator re-submits the app from the RayService spec;
+// with initial_replicas:0 now in the serveConfigV2 the re-submitted app settles at
+// 0 replicas without creating a worker pod.
+//
+// Note: Ray 2.x does not support DELETE /api/serve/applications/{name} (returns 404).
+// The correct way to remove an app is to omit it from a PUT to /api/serve/applications/.
 func (r *RayCapacityStore) DeleteDeployingApps(ctx context.Context) error {
 	dashboardURL, _, err := r.discoverRayHead(ctx)
 	if err != nil {
@@ -447,26 +442,45 @@ func (r *RayCapacityStore) DeleteDeployingApps(ctx context.Context) error {
 		return nil
 	}
 
-	for appName, rawApp := range appsMap {
+	// Build PUT payload containing only non-DEPLOYING apps with a valid
+	// deployed_app_config. DEPLOYING apps are intentionally omitted — Ray
+	// deletes any app absent from a PUT request.
+	putApps := make([]interface{}, 0, len(appsMap))
+	for _, rawApp := range appsMap {
 		app, ok := rawApp.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		status, _ := app["status"].(string)
-		if status != "DEPLOYING" {
-			continue
+		if status == "DEPLOYING" {
+			continue // omit → Ray will delete this app
 		}
-		delURL := fmt.Sprintf("%s/api/serve/applications/%s", dashboardURL, appName)
-		delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
-		if err != nil {
-			return fmt.Errorf("building DELETE for %s: %w", appName, err)
+		appConfig, ok := app["deployed_app_config"].(map[string]interface{})
+		if !ok || len(appConfig) == 0 {
+			continue // skip apps without a committed config
 		}
-		delResp, err := r.httpClient.Do(delReq)
-		if err != nil {
-			return fmt.Errorf("DELETE serve app %s: %w", appName, err)
-		}
-		delResp.Body.Close()
-		// 200 or 404 are both fine
+		putApps = append(putApps, appConfig)
+	}
+
+	putBody, err := json.Marshal(map[string]interface{}{"applications": putApps})
+	if err != nil {
+		return fmt.Errorf("marshaling serve config: %w", err)
+	}
+
+	putURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, strings.NewReader(string(putBody)))
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp, err := r.httpClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("PUT serve config: %w", err)
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("PUT serve config returned %d: %s", putResp.StatusCode, string(respBody))
 	}
 	return nil
 }
