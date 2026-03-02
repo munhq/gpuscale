@@ -404,6 +404,73 @@ func (r *RayCapacityStore) ResubmitServeConfig(ctx context.Context) error {
 	return nil
 }
 
+// DeleteDeployingApps deletes all Ray Serve applications that are stuck in DEPLOYING
+// state. This is called when KubeRay worker pods are pending with no API demand,
+// which indicates Ray Serve created a config-update verification replica that can
+// never be satisfied (no GPU node exists and none should be provisioned without real
+// demand). Deleting the app causes the KubeRay operator to re-submit it on its next
+// reconcile cycle; with initial_replicas:0 in the new serveConfigV2, Ray Serve
+// will not create a verification replica and the app will go straight to RUNNING at
+// 0 replicas.
+func (r *RayCapacityStore) DeleteDeployingApps(ctx context.Context) error {
+	dashboardURL, _, err := r.discoverRayHead(ctx)
+	if err != nil {
+		return nil // dashboard not available, non-fatal
+	}
+
+	getURL := fmt.Sprintf("%s/api/serve/applications/", dashboardURL)
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
+	if err != nil {
+		return err
+	}
+	getResp, err := r.httpClient.Do(getReq)
+	if err != nil {
+		return nil // connection error is non-fatal
+	}
+	defer getResp.Body.Close()
+
+	body, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		return fmt.Errorf("reading serve apps: %w", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET serve apps returned %d: %s", getResp.StatusCode, string(body))
+	}
+
+	var getResponse map[string]interface{}
+	if err := json.Unmarshal(body, &getResponse); err != nil {
+		return fmt.Errorf("parsing serve apps: %w", err)
+	}
+
+	appsMap, ok := getResponse["applications"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	for appName, rawApp := range appsMap {
+		app, ok := rawApp.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		status, _ := app["status"].(string)
+		if status != "DEPLOYING" {
+			continue
+		}
+		delURL := fmt.Sprintf("%s/api/serve/applications/%s", dashboardURL, appName)
+		delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
+		if err != nil {
+			return fmt.Errorf("building DELETE for %s: %w", appName, err)
+		}
+		delResp, err := r.httpClient.Do(delReq)
+		if err != nil {
+			return fmt.Errorf("DELETE serve app %s: %w", appName, err)
+		}
+		delResp.Body.Close()
+		// 200 or 404 are both fine
+	}
+	return nil
+}
+
 // PatchServeModelFractions updates gpu_memory_utilization AND placement_group_config
 // for named models in the live Ray Serve config. Called only for multi-model claims
 // so each co-located vLLM process uses its correct share of GPU memory and Ray's

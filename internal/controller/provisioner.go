@@ -83,12 +83,49 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Skip KubeRay worker pods — they are created by Ray's in-tree autoscaler
-	// and do not carry model requirements. Picking them up would use wrong
-	// defaults (nodeType=ray-worker, minVRAM=10). Cold-start provisioning is
-	// handled by the provision_trigger pub/sub path (ProvisionTriggerSubscriber).
+	// KubeRay worker pods are created by Ray's in-tree autoscaler and do not
+	// carry model requirements, so GPUScale cannot provision for them directly
+	// (wrong GPU type/VRAM would be selected). Cold-start provisioning is handled
+	// by the provision_trigger pub/sub path (ProvisionTriggerSubscriber).
+	//
+	// However: Ray Serve also creates a "config-update verification" replica
+	// (CONFIG_UPDATE_STARTED) even when min_replicas=0 and there is no demand.
+	// This leaves a pending worker pod that nothing will ever satisfy.
+	// Fix: after a 2-minute grace period (enough time for a real demand pub/sub
+	// trigger to have fired), if there is still no demand, delete the stuck
+	// DEPLOYING Ray Serve apps so the KubeRay operator re-submits them fresh.
+	// With initial_replicas:0 in the new serveConfigV2, Ray won't create a
+	// verification replica and the app will settle at 0 replicas.
 	if pod.Labels["app.kubernetes.io/created-by"] == "kuberay-operator" {
-		return ctrl.Result{}, nil
+		if r.DemandStore == nil || r.RayCapacityStore == nil {
+			return ctrl.Result{}, nil
+		}
+		// Grace period: real demand pub/sub triggers fire within seconds.
+		// 2 minutes is more than enough; if we still have no demand after
+		// that, the pod was created purely for config-update verification.
+		if time.Since(pod.CreationTimestamp.Time) < 2*time.Minute {
+			return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
+		}
+		demands, err := r.DemandStore.GetAllDemands(ctx)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		for _, d := range demands {
+			if d.QueueDepth > 0 || d.ActiveDemand > 0 || d.AlwaysActive {
+				// Real demand exists — the pub/sub path will provision.
+				return ctrl.Result{}, nil
+			}
+		}
+		// No demand. Cancel the stuck verification replica.
+		log.Info("KubeRay worker pod pending with no demand — cancelling stuck DEPLOYING apps",
+			"pod", req.NamespacedName,
+			"age", time.Since(pod.CreationTimestamp.Time).Round(time.Second),
+		)
+		if err := r.RayCapacityStore.DeleteDeployingApps(ctx); err != nil {
+			log.Error(err, "Failed to delete stuck DEPLOYING apps")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Demand-level dedup: count active claims vs pending GPU pods.
