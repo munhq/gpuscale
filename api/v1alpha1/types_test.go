@@ -19,22 +19,9 @@ func TestClaimPhaseConstants(t *testing.T) {
 	}
 }
 
-func TestModelConfigDefaults(t *testing.T) {
-	mc := ModelConfig{}
-	if mc.DType != "" {
-		t.Errorf("expected empty dtype default, got %q", mc.DType)
-	}
-	if mc.GPUMemoryUtilization != 0 {
-		t.Errorf("expected zero GPUMemoryUtilization, got %f", mc.GPUMemoryUtilization)
-	}
-	if mc.EnablePrefixCaching != false {
-		t.Error("expected false EnablePrefixCaching by default")
-	}
-}
-
 func TestProviderConfigDefaultNodeType(t *testing.T) {
 	pc := ProviderConfig{}
-	// NodeType zero value is empty string; code defaults to "ray-worker" at runtime
+	// NodeType zero value is empty string; code defaults to "standalone" at runtime
 	if pc.NodeType != "" {
 		t.Errorf("expected empty NodeType zero value, got %q", pc.NodeType)
 	}

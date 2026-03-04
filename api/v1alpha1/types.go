@@ -54,10 +54,9 @@ type ProviderConfig struct {
 	MaxPrice float64 `json:"maxPrice,omitempty"`
 
 	// NodeType specifies how to deploy nodes with this provider.
-	// "full-node" = VM that joins the Kubernetes cluster via VPN as a real node
-	// "ray-worker" = standalone vLLM instance (works in containers)
-	// +kubebuilder:validation:Enum=full-node;ray-worker
-	// +kubebuilder:default=ray-worker
+	// "standalone" = gpu-agent binary + vLLM, connects outbound WSS tunnel to GPU API.
+	// +kubebuilder:validation:Enum=standalone
+	// +kubebuilder:default=standalone
 	NodeType string `json:"nodeType,omitempty"`
 }
 
@@ -118,79 +117,29 @@ type ScalingSpec struct {
 
 type BootstrapSpec struct {
 	// Image is the Docker image for the worker container.
-	// e.g., "rayproject/ray-llm:2.53.0-py311-cu128" or "vllm/vllm-openai:latest"
+	// e.g., "vllm/vllm-openai:latest" (has vLLM pre-installed; gpu-agent manages it)
 	Image string `json:"image"`
 
-	// VPNSetupKeySecret references the Secret containing the VPN setup key.
-	// Only used for full-node type.
-	VPNSetupKeySecret SecretReference `json:"vpnSetupKeySecret,omitempty"`
+	// GPUAPIUrl is the WSS endpoint for gpu-agent to connect its reverse tunnel.
+	// e.g., "wss://ai.example.com"
+	GPUAPIUrl string `json:"gpuApiURL,omitempty"`
 
-	// K8sTokenSecret references the Secret containing the Kubernetes join token.
-	// Only used for full-node type.
-	K8sTokenSecret SecretReference `json:"k8sTokenSecret,omitempty"`
-
-	// K8sURL is the Kubernetes API server URL for node join.
-	// Only used for full-node type.
-	K8sURL string `json:"k8sURL,omitempty"`
-
-	// RayConfig contains Ray Serve configuration for the worker.
-	RayConfig *RayConfig `json:"rayConfig,omitempty"`
-
-	// ModelConfig defines the model to serve on the worker.
-	ModelConfig *ModelConfig `json:"modelConfig,omitempty"`
+	// GPUAPITokenSecret references the Secret containing the GPU API bearer token.
+	// gpu-agent uses this token to authenticate its WSS tunnel connection.
+	GPUAPITokenSecret *SecretKeyReference `json:"gpuApiTokenSecret,omitempty"`
 
 	// ModelCacheURL is an optional rclone-compatible URL for pre-caching model weights.
 	ModelCacheURL string `json:"modelCacheURL,omitempty"`
 }
 
-// ModelConfig defines the inference model configuration for vLLM workers.
-type ModelConfig struct {
-	// ModelID is the HuggingFace model ID (e.g., "THUDM/glm-4-9b-chat").
-	ModelID string `json:"modelId"`
-
-	// ModelSource is the HuggingFace model source path (e.g., "THUDM/glm-4-9b-chat").
-	// If empty, defaults to ModelID.
-	ModelSource string `json:"modelSource,omitempty"`
-
-	// MaxModelLen is the maximum sequence length for vLLM.
-	MaxModelLen int `json:"maxModelLen,omitempty"`
-
-	// DType is the data type for model weights ("auto", "float16", "bfloat16").
-	// +kubebuilder:default=auto
-	DType string `json:"dtype,omitempty"`
-
-	// GPUMemoryUtilization is the fraction of GPU memory to use (0.0-1.0).
-	// +kubebuilder:default=0.90
-	GPUMemoryUtilization float64 `json:"gpuMemoryUtilization,omitempty"`
-
-	// TrustRemoteCode allows loading models with custom code from HuggingFace.
-	TrustRemoteCode bool `json:"trustRemoteCode,omitempty"`
-
-	// EnablePrefixCaching enables vLLM automatic prefix caching for KV cache reuse.
-	// +kubebuilder:default=true
-	EnablePrefixCaching bool `json:"enablePrefixCaching,omitempty"`
-
-	// MaxOngoingRequests is the maximum concurrent requests per worker.
-	// +kubebuilder:default=16
-	MaxOngoingRequests int `json:"maxOngoingRequests,omitempty"`
-}
-
-// RayConfig contains configuration for Ray Serve workers
-type RayConfig struct {
-	// DashboardPort is the Ray dashboard port (default: 8265)
-	// +kubebuilder:default=8265
-	DashboardPort int `json:"dashboardPort,omitempty"`
-
-	// ServePort is the Ray Serve HTTP port (default: 8000)
-	// +kubebuilder:default=8000
-	ServePort int `json:"servePort,omitempty"`
-
-	// HeadAddress is the Ray head node address for workers to join.
-	// Empty means run as standalone head node.
-	HeadAddress string `json:"headAddress,omitempty"`
-
-	// ServeConfig is an optional YAML/JSON string for Ray Serve deployment config.
-	ServeConfig string `json:"serveConfig,omitempty"`
+// SecretKeyReference references a specific key in a Kubernetes Secret.
+type SecretKeyReference struct {
+	// Name of the Secret.
+	Name string `json:"name"`
+	// Namespace of the Secret.
+	Namespace string `json:"namespace"`
+	// Key within the Secret. Defaults to "gpu-api-token" if empty.
+	Key string `json:"key,omitempty"`
 }
 
 type PoolLimits struct {
@@ -250,7 +199,7 @@ type GPUNodeClaimSpec struct {
 	// Set at creation time by the provisioner so it survives status update failures.
 	Provider string `json:"provider,omitempty"`
 
-	// NodeType is the deployment mode: "full-node" or "ray-worker".
+	// NodeType is the deployment mode. Currently always "standalone".
 	// Set at creation time by the provisioner so it survives status update failures.
 	NodeType string `json:"nodeType,omitempty"`
 
@@ -332,15 +281,15 @@ type GPUNodeClaimStatus struct {
 	// InstanceID is the provider-specific instance identifier.
 	InstanceID string `json:"instanceID,omitempty"`
 
-	// NodeType is the deployment mode: "full-node" or "ray-worker".
+	// NodeType is the deployment mode. Currently always "standalone".
 	NodeType string `json:"nodeType,omitempty"`
 
-	// NodeName is the Kubernetes node name once joined.
-	// Only set for full-node type.
+	// NodeName is unused for standalone nodes (no K8s join).
+	// Kept for backward compatibility.
 	NodeName string `json:"nodeName,omitempty"`
 
-	// Endpoint is the HTTP endpoint for the vLLM worker.
-	// Format: "http://host:port". Only set for ray-worker type.
+	// Endpoint is unused for standalone nodes (connection is inbound WSS from gpu-agent).
+	// Kept for backward compatibility.
 	Endpoint string `json:"endpoint,omitempty"`
 
 	// GPUType is the actual GPU type provisioned.

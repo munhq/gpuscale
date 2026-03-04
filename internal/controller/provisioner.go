@@ -33,9 +33,6 @@ type ProvisioningController struct {
 	// DemandStore reads API queue depth and model configs from Dragonfly DB 3
 	DemandStore *DemandStore
 
-	// RayCapacityStore queries Ray cluster for current GPU capacity
-	RayCapacityStore *RayCapacityStore
-
 	// Batch window for collecting pending pods before provisioning
 	BatchWindow time.Duration
 
@@ -59,10 +56,8 @@ func NewProvisioningController(c client.Client, log logr.Logger, batchWindow tim
 // Reconcile processes pending GPU pods.
 // Dedup is demand-level: we count active (non-Terminated) claims and only
 // provision if there are more pending GPU pods than active claims.
-// Only GPUScale demand-signal pods (gpuscale.io/demand-signal=true) trigger
-// provisioning. KubeRay worker pods are explicitly excluded — they are
-// managed by Ray's in-tree autoscaler and must not drive GPUScale provisioning,
-// since they carry no model requirements and would use wrong defaults.
+// Note: provisioning is primarily driven by the ProvisionTrigger pub/sub path.
+// This controller handles demand-signal pods only (gpuscale.io/demand-signal=true).
 func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pod", req.NamespacedName)
 
@@ -81,51 +76,6 @@ func (r *ProvisioningController) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if !scheduler.IsUnschedulable(&pod) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// KubeRay worker pods are created by Ray's in-tree autoscaler and do not
-	// carry model requirements, so GPUScale cannot provision for them directly
-	// (wrong GPU type/VRAM would be selected). Cold-start provisioning is handled
-	// by the provision_trigger pub/sub path (ProvisionTriggerSubscriber).
-	//
-	// However: Ray Serve also creates a "config-update verification" replica
-	// (CONFIG_UPDATE_STARTED) even when min_replicas=0 and there is no demand.
-	// This leaves a pending worker pod that nothing will ever satisfy.
-	// Fix: after a 2-minute grace period (enough time for a real demand pub/sub
-	// trigger to have fired), if there is still no demand, delete the stuck
-	// DEPLOYING Ray Serve apps so the KubeRay operator re-submits them fresh.
-	// With initial_replicas:0 in the new serveConfigV2, Ray won't create a
-	// verification replica and the app will settle at 0 replicas.
-	if pod.Labels["app.kubernetes.io/created-by"] == "kuberay-operator" {
-		if r.DemandStore == nil || r.RayCapacityStore == nil {
-			return ctrl.Result{}, nil
-		}
-		// Grace period: real demand pub/sub triggers fire within seconds.
-		// 2 minutes is more than enough; if we still have no demand after
-		// that, the pod was created purely for config-update verification.
-		if time.Since(pod.CreationTimestamp.Time) < 2*time.Minute {
-			return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
-		}
-		demands, err := r.DemandStore.GetAllDemands(ctx)
-		if err != nil {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-		for _, d := range demands {
-			if d.QueueDepth > 0 || d.ActiveDemand > 0 || d.AlwaysActive {
-				// Real demand exists — the pub/sub path will provision.
-				return ctrl.Result{}, nil
-			}
-		}
-		// No demand. Cancel the stuck verification replica.
-		log.Info("KubeRay worker pod pending with no demand — cancelling stuck DEPLOYING apps",
-			"pod", req.NamespacedName,
-			"age", time.Since(pod.CreationTimestamp.Time).Round(time.Second),
-		)
-		if err := r.RayCapacityStore.DeleteDeployingApps(ctx); err != nil {
-			log.Error(err, "Failed to delete stuck DEPLOYING apps")
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Demand-level dedup: count active claims vs pending GPU pods.
@@ -193,105 +143,6 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 		return
 	}
 
-	// Health gate: don't provision if Ray Serve has DEPLOY_FAILED apps.
-	// Instead, attempt recovery by re-submitting the serve config.
-	if r.RayCapacityStore != nil {
-		statuses, err := r.RayCapacityStore.GetServeAppStatus(ctx)
-		if err == nil {
-			for _, app := range statuses {
-				if app.Status == "DEPLOY_FAILED" {
-					log.Error(nil, "Ray Serve DEPLOY_FAILED — attempting recovery instead of provisioning",
-						"app", app.Name)
-					if recoverErr := r.RayCapacityStore.ResubmitServeConfig(ctx); recoverErr != nil {
-						log.Error(recoverErr, "Failed to resubmit serve config")
-					} else {
-						log.Info("Resubmitted serve config to reset DEPLOY_FAILED")
-					}
-					r.releaseProvisioningLocks(batch)
-					return
-				}
-			}
-		}
-	}
-
-	// Query demand data from Dragonfly (Task #1: API queue metrics)
-	if r.DemandStore != nil {
-		demands, err := r.DemandStore.GetAllDemands(ctx)
-		if err != nil {
-			log.Error(err, "Failed to query demand data from Dragonfly")
-		} else {
-			log.Info("Demand data from API queue", "demands", len(demands))
-			for _, d := range demands {
-				if d.QueueDepth > 0 || d.ActiveDemand > 0 || d.AlwaysActive {
-					log.Info("Model demand",
-						"model", d.Model,
-						"queue", d.QueueDepth,
-						"active", d.ActiveDemand,
-						"vram", d.VRAMRequired,
-						"alwaysActive", d.AlwaysActive,
-					)
-				}
-			}
-		}
-	}
-
-	// Query Ray cluster capacity (Task #2: Ray capacity metrics)
-	var capacity *ClusterCapacity
-	if r.RayCapacityStore != nil {
-		var err error
-		capacity, err = r.RayCapacityStore.GetCapacity(ctx, r.DemandStore)
-		if err != nil {
-			log.Error(err, "Failed to query Ray cluster capacity")
-		} else {
-			log.Info("Ray cluster capacity",
-				"nodes", len(capacity.Nodes),
-				"totalGPUs", capacity.TotalGPUs,
-				"totalVRAM", capacity.TotalVRAM,
-				"usedVRAM", capacity.UsedVRAM,
-				"freeVRAM", capacity.FreeVRAM,
-				"loadedModels", len(capacity.LoadedModels),
-			)
-			for _, node := range capacity.Nodes {
-				log.Info("Ray node",
-					"nodeID", node.NodeID,
-					"gpuType", node.GPUType,
-					"gpuCount", node.GPUCount,
-					"totalVRAM", node.TotalVRAM,
-					"usedVRAM", node.UsedVRAM,
-					"freeVRAM", node.FreeVRAM,
-				)
-			}
-		}
-	}
-
-	// Bin-packing decision (Task #3: determine if provisioning needed)
-	if r.DemandStore != nil && capacity != nil {
-		demands, err := r.DemandStore.GetAllDemands(ctx)
-		if err != nil {
-			log.Error(err, "Failed to get demands for bin-packing")
-		} else {
-			decision, err := r.DecideProvisioning(ctx, demands, capacity)
-			if err != nil {
-				log.Error(err, "Failed to make provisioning decision")
-			} else if !decision.ShouldProvision {
-				log.Info("Bin-packing decision: skip provisioning",
-					"reason", decision.Reason,
-				)
-				r.releaseProvisioningLocks(batch)
-				return
-			} else {
-				log.Info("Bin-packing decision: provision",
-					"reason", decision.Reason,
-					"models", decision.Models,
-					"requiredVRAM", decision.RequiredVRAM,
-					"multiGpu", decision.MultiGpu,
-				)
-				// Override requirements from bin-packing
-				// (will be used below in SearchOffers)
-			}
-		}
-	}
-
 	// Determine model from demand data — needed for pool selection and dedup.
 	modelID := ""
 	if r.DemandStore != nil {
@@ -323,7 +174,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	}
 
 	// Select pool from model config: explicit pool name first, then nodeType fallback.
-	modelNodeType := "ray-worker"
+	modelNodeType := "standalone"
 	modelPool := ""
 	if r.DemandStore != nil && modelID != "" {
 		if mcfg, err := r.DemandStore.GetModelConfig(ctx, modelID); err == nil && mcfg != nil {
@@ -376,7 +227,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 	}
 
 	// Determine NodeType from the pool's provider config.
-	nodeType := "ray-worker"
+	nodeType := "standalone"
 	if len(pool.Spec.Providers) > 0 && pool.Spec.Providers[0].NodeType != "" {
 		nodeType = pool.Spec.Providers[0].NodeType
 	}

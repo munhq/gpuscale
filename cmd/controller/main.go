@@ -133,18 +133,6 @@ func main() {
 		setupLog.Info("Verda volume store enabled (model-aware volume reuse)")
 	}
 
-	// Ray capacity store — queries Ray cluster for GPU capacity
-	namespace := os.Getenv("POD_NAMESPACE")
-	if namespace == "" {
-		namespace = "gpu-workloads"
-	}
-	prometheusURL := os.Getenv("PROMETHEUS_URL")
-	if prometheusURL == "" {
-		prometheusURL = "http://prometheus-operated.monitoring.svc.cluster.local:9090"
-	}
-	rayCapacityStore := gpucontroller.NewRayCapacityStore(mgr.GetClient(), namespace, prometheusURL)
-	setupLog.Info("Ray capacity store enabled", "namespace", namespace, "prometheus", prometheusURL)
-
 	// Create provisioning coordinator: centralized offer caching, blacklisting, rate limiting.
 	coord := coordinator.NewCoordinator(registry, ctrl.Log.WithName("coordinator"), coordinator.Options{
 		CacheTTL:         7 * time.Second,
@@ -168,7 +156,6 @@ func main() {
 		batchWindow,
 	)
 	provisioningCtrl.DemandStore = demandStore
-	provisioningCtrl.RayCapacityStore = rayCapacityStore
 	if err := provisioningCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create provisioning controller")
 		os.Exit(1)
@@ -194,8 +181,6 @@ func main() {
 	)
 	disruptionCtrl.WorkerStore = workerStore
 	disruptionCtrl.DemandStore = demandStore
-	disruptionCtrl.RayCapacity = rayCapacityStore
-	disruptionCtrl.RayHeadAddr = os.Getenv("RAY_HEAD_ADDRESS")
 	disruptionCtrl.ClaimWriter = claimWriter
 	if err := disruptionCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create disruption controller")
@@ -210,12 +195,7 @@ func main() {
 	claimReconciler.Coordinator = coord
 	claimReconciler.WorkerStore = workerStore
 	claimReconciler.DemandStore = demandStore
-	claimReconciler.RayCapacityStore = rayCapacityStore
 	claimReconciler.ClaimWriter = claimWriter
-	if rayHead := os.Getenv("RAY_HEAD_ADDRESS"); rayHead != "" {
-		claimReconciler.RayHeadAddress = rayHead
-		setupLog.Info("Ray head address configured from env", "address", rayHead)
-	}
 	if err := claimReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create claim reconciler")
 		os.Exit(1)

@@ -23,6 +23,7 @@ func TestGenerateEnvVars(t *testing.T) {
 		"INSTANCE_ID":     "inst-abc",
 		"MODEL_ID":        "test-model",
 		"MODEL_CACHE_URL": "s3:bucket/models",
+		"NODE_TYPE":       "standalone",
 	}
 
 	for k, v := range expected {
@@ -65,6 +66,59 @@ func TestGenerateEnvVarsExtraEnv(t *testing.T) {
 	}
 }
 
+func TestGenerateScriptContainsGPUAgent(t *testing.T) {
+	config := provider.BootstrapConfig{
+		NodeType:     "standalone",
+		InstanceID:   "claim-abc123",
+		GPUAPIURL:    "wss://ai.example.com",
+		GPUAPIToken:  "tok-test",
+		Models:       "qwen3-7b:8000",
+		ModelSources: "Qwen/Qwen3-7B",
+		GPUCount:     1,
+		GPUType:      "RTX 4090",
+		ProviderName: "vast.ai",
+	}
+
+	script := GenerateScript(config)
+
+	checks := []string{
+		"gpu-agent",
+		"GPU_API_URL=",
+		"NODE_ID=",
+		"AUTH_TOKEN=",
+		"MODELS=",
+		"claim-abc123",
+		"wss://ai.example.com",
+		"nvidia-smi",
+	}
+	for _, want := range checks {
+		if !containsStr(script, want) {
+			t.Errorf("script missing %q", want)
+		}
+	}
+}
+
+func TestGenerateScriptWSSToHTTPS(t *testing.T) {
+	config := provider.BootstrapConfig{
+		InstanceID:   "claim-xyz",
+		GPUAPIURL:    "wss://ai.example.com",
+		GPUAPIToken:  "tok",
+		Models:       "model-a:8000",
+		ModelSources: "org/model-a",
+		GPUCount:     1,
+		GPUType:      "A100",
+		ProviderName: "verda",
+	}
+	script := GenerateScript(config)
+	// Bootstrap-event URL should use https, not wss
+	if containsStr(script, "wss://ai.example.com/internal/bootstrap-event") {
+		t.Error("script should use https:// for bootstrap-event, not wss://")
+	}
+	if !containsStr(script, "https://ai.example.com/internal/bootstrap-event") {
+		t.Error("script should contain https:// bootstrap-event URL")
+	}
+}
+
 func TestSanitizeLabel(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -92,4 +146,16 @@ func TestSanitizeLabelMaxLength(t *testing.T) {
 	if len(got) > 63 {
 		t.Errorf("label too long: %d chars", len(got))
 	}
+}
+
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		func() bool {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+			return false
+		}())
 }

@@ -100,86 +100,26 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 }
 
 func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, config provider.BootstrapConfig) (*provider.Instance, error) {
-	var env map[string]string
-	var image string
-	var dockerArgs string
-	var ports string
-
-	image = config.Image
-
-	if config.OnStartScript != "" {
-		// Caller provided a bootstrap script — use it as-is.
-		// RunPod doesn't support onstart scripts directly, so we embed it in docker args.
-		if image == "" {
-			if config.NodeType == "full-node" {
-				image = "ghcr.io/munhq/gpuscale-node:latest"
-			} else {
-				image = "rayproject/ray-llm:2.53.0-py311-cu128"
-			}
-		}
-		env = config.OnStartEnv
-		// RunPod uses docker args — wrap the script as a bash -c command
-		dockerArgs = fmt.Sprintf("bash -c %q", config.OnStartScript)
-		ports = "22/tcp"
-	} else if config.NodeType == "ray-worker" {
-		// Fallback: no script provided, generate standalone vLLM via docker args.
-		if image == "" {
-			image = "vllm/vllm-openai:latest"
-		}
-		env = map[string]string{
-			"GPU_TYPE":    config.GPUType,
-			"PROVIDER":    config.ProviderName,
-			"INSTANCE_ID": config.InstanceID,
-		}
-		if config.ModelID != "" {
-			env["MODEL_ID"] = config.ModelID
-		}
-		if config.ModelCacheURL != "" {
-			env["MODEL_CACHE_URL"] = config.ModelCacheURL
-		}
-
-		servePort := config.RayServePort
-		if servePort == 0 {
-			servePort = 8000
-		}
-		modelID := config.ModelID
-		if modelID == "" {
-			modelID = "THUDM/glm-4-9b-chat"
-		}
-		maxModelLen := config.MaxModelLen
-		if maxModelLen == 0 {
-			maxModelLen = 4096
-		}
-		dtype := config.DType
-		if dtype == "" {
-			dtype = "auto"
-		}
-		gpuMemUtil := config.GPUMemUtil
-		if gpuMemUtil <= 0 {
-			gpuMemUtil = 0.90
-		}
-
-		dockerArgs = fmt.Sprintf(
-			"--model %s --host 0.0.0.0 --port %d --gpu-memory-utilization %.2f --max-model-len %d --dtype %s",
-			modelID, servePort, gpuMemUtil, maxModelLen, dtype,
-		)
-		if config.TensorParallelSize > 1 {
-			dockerArgs += fmt.Sprintf(" --tensor-parallel-size %d", config.TensorParallelSize)
-		}
-		if config.TrustRemoteCode {
-			dockerArgs += " --trust-remote-code"
-		}
-		ports = fmt.Sprintf("%d/http", servePort)
-	} else {
-		return nil, fmt.Errorf("full-node requires OnStartScript")
+	if config.OnStartScript == "" {
+		return nil, fmt.Errorf("OnStartScript is required for standalone nodes")
 	}
 
+	image := config.Image
+	if image == "" {
+		image = "vllm/vllm-openai:latest"
+	}
+
+	env := config.OnStartEnv
 	for k, v := range config.ExtraEnv {
 		if env == nil {
 			env = make(map[string]string)
 		}
 		env[k] = v
 	}
+
+	// RunPod doesn't support onstart scripts directly — embed as docker args.
+	dockerArgs := fmt.Sprintf("bash -c %q", config.OnStartScript)
+	ports := "22/tcp"
 
 	cloudType := "COMMUNITY"
 	if offer.CapacityType == "on-demand" {
@@ -205,21 +145,10 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating runpod pod: %w", err)
 	}
 
-	// Build endpoint for ray-worker type
-	endpoint := ""
-	if config.NodeType == "ray-worker" {
-		servePort := config.RayServePort
-		if servePort == 0 {
-			servePort = 8000
-		}
-		endpoint = fmt.Sprintf("http://pending:%d", servePort) // placeholder until IP is assigned
-	}
-
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   pod.ID,
-		NodeType:     config.NodeType,
-		Endpoint:     endpoint,
+		NodeType:     "standalone",
 		Status:       normalizeStatus(pod.DesiredStatus),
 		GPUType:      offer.GPUType,
 		GPUCount:     offer.GPUCount,

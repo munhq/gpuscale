@@ -23,7 +23,7 @@ type GPURequirements struct {
 	CapacityType    string   // "spot" or "on-demand"
 	MinDisk         int      // GB
 	MinRAM          int      // GB
-	NodeType        string   // "full-node" or "ray-worker" — used by providers to filter VM vs container offers
+	NodeType        string   // "standalone" — used by providers to filter container offers
 	MinPCIeGen      int      // minimum PCIe generation (e.g., 4 for PCIe 4.0); 0 = no restriction
 	MultiGpu        bool     // allow multi-GPU instances (tensor parallel); false = single GPU only
 }
@@ -43,47 +43,29 @@ type Offer struct {
 	RAMGB        int
 }
 
-// BootstrapConfig contains the configuration needed to bootstrap a node.
+// BootstrapConfig contains the configuration needed to bootstrap a standalone gpu-agent node.
 type BootstrapConfig struct {
-	NodeType     string // "full-node" or "ray-worker"
-	Image        string // Docker image for the node
-	NetbirdKey   string // VPN setup key (full-node only)
-	K8sURL       string // Kubernetes API server URL (full-node only)
-	K8sToken     string // Kubernetes join token (full-node only)
-	RayHeadAddr  string // Ray head address (ray-worker only, empty = run as head)
-	RayDashPort  int    // Ray dashboard port (ray-worker only, default 8265)
-	RayServePort int    // Ray serve port (ray-worker only, default 8000)
+	NodeType string // always "standalone": gpu-agent + vLLM, outbound WSS tunnel to GPU API
+	Image    string // Docker image (e.g., "vllm/vllm-openai:latest")
 
-	// Model config (ray-worker only)
-	ModelID             string  // HuggingFace model ID (e.g., "THUDM/glm-4-9b-chat")
-	ModelSource         string  // HuggingFace model source (defaults to ModelID)
-	MaxModelLen         int     // vLLM max_model_len
-	DType               string  // "auto", "float16", "bfloat16"
-	GPUMemUtil          float64 // gpu_memory_utilization (0.0-1.0)
-	TrustRemoteCode     bool    // allow custom model code
-	EnablePrefixCaching bool    // vLLM prefix caching for KV cache reuse
-	MaxOngoingRequests  int     // max concurrent requests per worker
-	TensorParallelSize  int     // tensor_parallel_size for vLLM multi-GPU
+	// Standalone (gpu-agent) bootstrap fields.
+	GPUAPIURL   string // WSS endpoint for gpu-agent tunnel (e.g., "wss://ai.example.com")
+	GPUAPIToken string // bearer token for gpu-agent WSS auth (read from Secret by reconciler)
+	Models      string // "model_id:port,model_id:port" — one entry per co-located model
+	ModelSources string // HuggingFace sources in same order as Models (comma-separated)
+	GPUCount    int    // tensor-parallel-size (derived from model config)
+	HFToken     string // optional HuggingFace token for gated models
 
 	ModelCacheURL string            // optional rclone URL for model cache
+	ModelID       string            // primary model ID (for volume tracking; kept for provider compat)
 	InstanceID    string            // unique ID for tracking
 	GPUType       string            // GPU type label
 	ProviderName  string            // provider name label
 	ExtraEnv      map[string]string // additional env vars
-	MinDisk       int               // GB, minimum OS volume/disk size (used by VM providers for os_volume_size_gb)
+	MinDisk       int               // GB, minimum OS volume/disk size
 
-	// ModelSources is a list of HuggingFace model sources to pre-download during
-	// full-node bootstrap. Downloads run in the background after K3s starts so the
-	// cache is warm by the time Ray Serve tries to load the model.
-	// Format: "hf:org/model" or plain "org/model" (hf: prefix is stripped).
-	// Empty = no pre-download (model is fetched on first Ray Serve deploy).
-	ModelSources []string
-	// HFToken is an optional HuggingFace access token for gated models.
-	HFToken string
-
-	// Pre-generated bootstrap script and env vars for full-node mode.
-	// Callers set these when they have the bootstrap package available.
-	// If empty for ray-worker mode, providers generate their own vLLM script.
+	// Pre-generated bootstrap script and env vars.
+	// Set by the coordinator per-offer (since scripts embed ProviderName and GPUType).
 	OnStartScript string            // pre-generated startup script
 	OnStartEnv    map[string]string // pre-generated environment variables
 }

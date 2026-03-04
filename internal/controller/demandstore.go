@@ -601,6 +601,28 @@ func (s *DemandStore) ListTrackedVolumes(ctx context.Context) []VolumeInfo {
 	return volumes
 }
 
+// IsNodeRegistered checks if a gpu-agent node has connected its WSS tunnel to GPU API.
+// GPU API writes gpu_api:node:{node_id} in Dragonfly when the tunnel connects and
+// removes it when the tunnel disconnects or the node deregisters.
+func (s *DemandStore) IsNodeRegistered(ctx context.Context, nodeID string) bool {
+	if s == nil || s.rdb == nil || nodeID == "" {
+		return false
+	}
+	val, err := s.rdb.Exists(ctx, "gpu_api:node:"+nodeID).Result()
+	return err == nil && val > 0
+}
+
+// IsNodeIdle checks if GPU API has flagged a node as idle (no active inference streams).
+// GPU API writes gpu_api:node_idle:{node_id} with a TTL when the node has had zero
+// active streams for the configured idle timeout.
+func (s *DemandStore) IsNodeIdle(ctx context.Context, nodeID string) bool {
+	if s == nil || s.rdb == nil || nodeID == "" {
+		return false
+	}
+	val, err := s.rdb.Exists(ctx, "gpu_api:node_idle:"+nodeID).Result()
+	return err == nil && val > 0
+}
+
 // Client returns the underlying Redis client (for ProvisionTrigger to reuse).
 func (s *DemandStore) Client() *redis.Client {
 	if s == nil {

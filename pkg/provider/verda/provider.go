@@ -116,16 +116,10 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 }
 
 func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, config provider.BootstrapConfig) (*provider.Instance, error) {
-	var script string
-	if config.OnStartScript != "" {
-		// Caller provided a bootstrap script — use it as-is.
-		script = config.OnStartScript
-	} else if config.NodeType == "ray-worker" {
-		// Fallback: no script provided, generate standalone vLLM bootstrap.
-		script = generateVLLMBootstrapScript(config)
-	} else {
-		return nil, fmt.Errorf("full-node requires OnStartScript")
+	if config.OnStartScript == "" {
+		return nil, fmt.Errorf("OnStartScript is required for standalone nodes")
 	}
+	script := config.OnStartScript
 
 	scriptResp, err := p.client.CreateStartupScript(ctx, fmt.Sprintf("gpuscale-%s", config.InstanceID), script)
 	if err != nil {
@@ -170,12 +164,11 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		IsSpot:          offer.CapacityType == "spot",
 	}
 	// Set OS volume name and size from the model's disk requirement.
-	// MinDisk = VRAMRequired + 50GB overhead (model weights + OS/K3s/CUDA tools).
+	// MinDisk = VRAMRequired + 50GB overhead (model weights + CUDA tools).
 	// Verda API requires an os_volume object with {name, size}; plain os_volume_size_gb doesn't exist.
 	// on_spot_discontinue=keep_detached means the volume survives spot eviction as a detached
 	// volume, which our volume-reuse logic can then recover from trash for the next cold start.
-	// Only applicable when image is an OS image type (not a volume UUID reuse).
-	if config.NodeType == "full-node" && config.MinDisk > 0 {
+	if config.MinDisk > 0 {
 		createReq.OsVolume = &OsVolumeRequest{
 			Name:              fmt.Sprintf("gpuscale-%s-os", config.InstanceID),
 			Size:              config.MinDisk,
@@ -196,23 +189,12 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		}
 	}
 
-	// Build endpoint for ray-worker type
-	endpoint := ""
-	if config.NodeType == "ray-worker" && resp.IP != "" {
-		servePort := config.RayServePort
-		if servePort == 0 {
-			servePort = 8000
-		}
-		endpoint = fmt.Sprintf("http://%s:%d", resp.IP, servePort)
-	}
-
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   resp.ID,
-		NodeType:     config.NodeType,
+		NodeType:     "standalone",
 		IP:           resp.IP,
 		SSHPort:      22,
-		Endpoint:     endpoint,
 		Status:       normalizeStatus(resp.Status),
 		GPUType:      resp.GPUType,
 		GPUCount:     resp.GPUCount,
@@ -356,66 +338,6 @@ func (p *Provider) ListInstances(ctx context.Context) ([]*provider.Instance, err
 		})
 	}
 	return result, nil
-}
-
-func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
-	servePort := config.RayServePort
-	if servePort == 0 {
-		servePort = 8000
-	}
-	modelID := config.ModelID
-	if modelID == "" {
-		modelID = "THUDM/glm-4-9b-chat"
-	}
-	hfRepo := modelID
-	if config.ModelSource != "" {
-		hfRepo = strings.TrimPrefix(config.ModelSource, "hf:")
-	}
-	maxModelLen := config.MaxModelLen
-	if maxModelLen == 0 {
-		maxModelLen = 4096
-	}
-	dtype := config.DType
-	if dtype == "" {
-		dtype = "auto"
-	}
-	gpuMemUtil := config.GPUMemUtil
-	if gpuMemUtil <= 0 {
-		gpuMemUtil = 0.90
-	}
-
-	trustFlag := ""
-	if config.TrustRemoteCode {
-		trustFlag = " \\\n  --trust-remote-code"
-	}
-
-	tpFlag := ""
-	if config.TensorParallelSize > 1 {
-		tpFlag = fmt.Sprintf(" \\\n  --tensor-parallel-size %d", config.TensorParallelSize)
-	}
-
-	return fmt.Sprintf(`#!/bin/bash
-set -euo pipefail
-
-echo '[gpuscale] Starting vLLM worker on verda'
-echo '[gpuscale] Instance: %s, GPU: %s'
-echo '[gpuscale] Model: %s (repo: %s)'
-
-# Install vLLM if not present (Verda images may not have it pre-installed)
-if ! python -c "import vllm" 2>/dev/null; then
-  echo '[gpuscale] Installing vLLM...'
-  pip install vllm 2>&1 | tail -10
-fi
-
-exec python -m vllm.entrypoints.openai.api_server \
-  --model '%s' \
-  --host 0.0.0.0 \
-  --port %d \
-  --gpu-memory-utilization %.2f \
-  --max-model-len %d \
-  --dtype %s%s%s
-`, config.InstanceID, config.GPUType, modelID, hfRepo,
-		hfRepo, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 }
 
 func parsePrice(priceStr string) (float64, error) {

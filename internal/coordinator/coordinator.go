@@ -191,11 +191,8 @@ func (c *Coordinator) ProvisionInstance(
 			offerConfig.GPUType = offer.GPUType
 
 			// Generate bootstrap script per-offer, since scripts embed ProviderName and GPUType.
-			if offerConfig.NodeType == "full-node" && offerConfig.NetbirdKey != "" {
+			if offerConfig.GPUAPIURL != "" {
 				offerConfig.OnStartScript = bootstrap.GenerateScript(offerConfig)
-				offerConfig.OnStartEnv = bootstrap.GenerateEnvVars(offerConfig)
-			} else if offerConfig.NodeType == "ray-worker" && offerConfig.RayHeadAddr != "" {
-				offerConfig.OnStartScript = bootstrap.GenerateRayWorkerScript(offerConfig)
 				offerConfig.OnStartEnv = bootstrap.GenerateEnvVars(offerConfig)
 			}
 

@@ -154,7 +154,7 @@ func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) erro
 	}
 
 	// Determine node type
-	nodeType := "ray-worker"
+	nodeType := "standalone"
 	if cfg.NodeType != "" {
 		nodeType = cfg.NodeType
 	} else if len(pool.Spec.Providers) > 0 && pool.Spec.Providers[0].NodeType != "" {
@@ -544,7 +544,7 @@ func findPool(pools []v1alpha1.GPUNodePool, poolName, nodeType string) *v1alpha1
 	// pools share the same nodeType, but keeps backward compat for models
 	// that don't set an explicit pool).
 	if nodeType == "" {
-		nodeType = "ray-worker"
+		nodeType = "standalone"
 	}
 	for i := range pools {
 		for _, p := range pools[i].Spec.Providers {

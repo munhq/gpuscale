@@ -4,16 +4,15 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/munhq/gpuscale/pkg/provider"
 )
 
 // minCUDAVersion is the minimum CUDA driver version required on Vast.ai hosts.
-// The rayproject/ray-llm image uses CUDA 12.8 (cu128). Hosts with older drivers
-// fail with OCI runtime errors at container start.
-const minCUDAVersion = 12.8
+// vllm/vllm-openai and gpu-agent require CUDA 12.x drivers.
+// Hosts with older drivers fail with OCI runtime errors at container start.
+const minCUDAVersion = 12.0
 
 // Provider implements the provider.Provider interface for Vast.ai.
 type Provider struct {
@@ -36,12 +35,6 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		"order":    "dph_total",
 		"type":     "ask",
 		"verified": "true",
-	}
-
-	// For full-node (VM) mode, filter to machines that support VMs.
-	// Container-only hosts reject vm:true create requests.
-	if req.NodeType == "full-node" {
-		params["vms_enabled"] = "true"
 	}
 
 	if req.GPUCount > 0 {
@@ -127,67 +120,24 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("invalid offer ID %q: %w", offer.OfferID, err)
 	}
 
-	var env map[string]string
-	var onstart string
-	var image string
-
-	image = config.Image
-
-	if config.OnStartScript != "" {
-		// Caller provided a bootstrap script — use it as-is.
-		// This covers ray-worker (ray start), full-node (VPN+K3s), or any custom script.
-		onstart = config.OnStartScript
-		env = config.OnStartEnv
-		if config.NodeType == "full-node" {
-			// Full-node MUST use Vast.ai KVM image — real VM with systemd,
-			// WireGuard support, and ability to install K3s.
-			// Docker images (like vllm/vllm-openai) don't have these capabilities.
-			image = "vastai/kvm:ubuntu_terminal"
-		} else if image == "" {
-			image = "rayproject/ray-llm:2.53.0-py311-cu128"
-		}
-	} else if config.NodeType == "ray-worker" {
-		// Fallback: no script provided, generate standalone vLLM bootstrap.
-		// This is the legacy path — prefer passing OnStartScript from provisioner.
-		if image == "" {
-			image = "vllm/vllm-openai:latest"
-		}
-		env = map[string]string{
-			"GPU_TYPE":    config.GPUType,
-			"PROVIDER":    config.ProviderName,
-			"INSTANCE_ID": config.InstanceID,
-		}
-		if config.ModelID != "" {
-			env["MODEL_ID"] = config.ModelID
-		}
-		if config.ModelCacheURL != "" {
-			env["MODEL_CACHE_URL"] = config.ModelCacheURL
-		}
-		for k, v := range config.ExtraEnv {
-			env[k] = v
-		}
-		onstart = generateVLLMBootstrapScript(config)
-	} else {
-		return nil, fmt.Errorf("full-node requires OnStartScript")
+	if config.OnStartScript == "" {
+		return nil, fmt.Errorf("OnStartScript is required for standalone nodes")
 	}
 
-	// Use ssh_proxy mode when we have an onstart script — "args" mode
-	// uses the docker entrypoint and ignores onstart, causing the script
-	// content to be treated as a file path (exec error).
-	runType := "ssh_proxy"
+	image := config.Image
+	if image == "" {
+		image = "vllm/vllm-openai:latest"
+	}
 
-	// full-node uses Vast.ai VM mode: a real Ubuntu VM with systemd, root access,
-	// and the ability to install arbitrary software (Netbird, K3s, NVIDIA toolkit).
-	// VMs have outbound internet so Netbird VPN connects without any inbound port hacks.
-	isVM := config.NodeType == "full-node"
-
+	// Use ssh_proxy mode so the onstart script runs on container start.
+	// "args" mode ignores onstart and treats script content as a file path.
 	createReq := InstanceCreateRequest{
 		Image:   image,
 		Disk:    50,
-		RunType: runType,
-		Env:     env,
-		Onstart: onstart,
-		VM:      isVM,
+		RunType: "ssh_proxy",
+		Env:     config.OnStartEnv,
+		Onstart: config.OnStartScript,
+		VM:      false,
 	}
 
 	resp, err := p.client.CreateInstance(ctx, offerID, createReq)
@@ -195,90 +145,18 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("creating vast.ai instance: %w", err)
 	}
 
-	// Build endpoint for ray-worker type
-	endpoint := ""
-	if config.NodeType == "ray-worker" {
-		servePort := config.RayServePort
-		if servePort == 0 {
-			servePort = 8000
-		}
-		if resp.SSHHost != "" {
-			endpoint = fmt.Sprintf("http://%s:%d", resp.SSHHost, servePort)
-		}
-	}
-
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   strconv.Itoa(resp.ID),
-		NodeType:     config.NodeType,
+		NodeType:     "standalone",
 		IP:           resp.SSHHost,
 		SSHPort:      resp.SSHPort,
-		Endpoint:     endpoint,
 		Status:       normalizeStatus(resp.ActualStatus),
 		GPUType:      resp.GPUName,
 		GPUCount:     resp.NumGPUs,
 		PricePerHour: resp.DPHTotal,
 		CreatedAt:    time.Now(),
 	}, nil
-}
-
-// generateVLLMBootstrapScript creates an inline bootstrap script for vLLM workers.
-// vLLM handles model download internally via huggingface_hub (parallel shard downloads).
-func generateVLLMBootstrapScript(config provider.BootstrapConfig) string {
-	servePort := config.RayServePort
-	if servePort == 0 {
-		servePort = 8000
-	}
-
-	modelID := config.ModelID
-	if modelID == "" {
-		modelID = "THUDM/glm-4-9b-chat"
-	}
-	// Use source if different from ID (e.g., ID="glm-4-7", Source="hf:zai-org/GLM-4.7-Flash")
-	hfRepo := modelID
-	if config.ModelSource != "" {
-		hfRepo = strings.TrimPrefix(config.ModelSource, "hf:")
-	}
-
-	maxModelLen := config.MaxModelLen
-	if maxModelLen == 0 {
-		maxModelLen = 4096
-	}
-	dtype := config.DType
-	if dtype == "" {
-		dtype = "auto"
-	}
-	gpuMemUtil := config.GPUMemUtil
-	if gpuMemUtil <= 0 {
-		gpuMemUtil = 0.90
-	}
-
-	trustFlag := ""
-	if config.TrustRemoteCode {
-		trustFlag = "\n  --trust-remote-code \\"
-	}
-
-	tpFlag := ""
-	if config.TensorParallelSize > 1 {
-		tpFlag = fmt.Sprintf("\n  --tensor-parallel-size %d \\", config.TensorParallelSize)
-	}
-
-	return fmt.Sprintf(`#!/bin/bash
-set -euo pipefail
-
-echo '[gpuscale] Starting vLLM worker on %s'
-echo '[gpuscale] Instance: %s, GPU: %s'
-echo '[gpuscale] Model: %s (repo: %s)'
-
-exec python -m vllm.entrypoints.openai.api_server \
-  --model '%s' \
-  --host 0.0.0.0 \
-  --port %d \
-  --gpu-memory-utilization %.2f \
-  --max-model-len %d \
-  --dtype %s%s%s
-`, config.ProviderName, config.InstanceID, config.GPUType, modelID, hfRepo,
-		hfRepo, servePort, gpuMemUtil, maxModelLen, dtype, tpFlag, trustFlag)
 }
 
 // StopInstance implements HibernatingProvider.
