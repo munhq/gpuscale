@@ -64,6 +64,13 @@ func New(accessKeyID, secretAccessKey, region, subnetID, securityGroupID string)
 
 func (p *Provider) Name() string { return "aws" }
 
+func (p *Provider) Validate(ctx context.Context) error {
+	if err := p.client.DescribeAvailabilityZones(ctx); err != nil {
+		return fmt.Errorf("aws credential check: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
 	isSpot := req.CapacityType == "spot"
 

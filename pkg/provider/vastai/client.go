@@ -305,6 +305,32 @@ func (c *Client) SetInstanceState(ctx context.Context, instanceID int, state str
 	return nil
 }
 
+// GetCurrentUser validates the API key by calling the current-user endpoint.
+// Returns nil if the key is accepted, an error otherwise.
+func (c *Client) GetCurrentUser(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/users/current/", nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("vast.ai API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("vast.ai API key rejected (HTTP %d) — check your key", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("vast.ai auth check returned %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // DestroyInstance deletes an instance.
 func (c *Client) DestroyInstance(ctx context.Context, instanceID int) error {
 	reqURL := fmt.Sprintf("%s/instances/%d/", c.baseURL, instanceID)

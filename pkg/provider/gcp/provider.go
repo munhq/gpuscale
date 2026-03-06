@@ -75,6 +75,13 @@ func New(saJSON, projectID, zones string) (*Provider, error) {
 
 func (p *Provider) Name() string { return "gcp" }
 
+func (p *Provider) Validate(ctx context.Context) error {
+	if _, err := p.client.token(ctx); err != nil {
+		return fmt.Errorf("gcp credential check: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
 	isSpot := req.CapacityType == "spot"
 

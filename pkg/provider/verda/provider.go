@@ -33,6 +33,13 @@ func (p *Provider) Name() string {
 	return "verda"
 }
 
+func (p *Provider) Validate(ctx context.Context) error {
+	if err := p.client.authenticate(ctx); err != nil {
+		return fmt.Errorf("verda credential check: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
 	types, err := p.client.ListInstanceTypes(ctx)
 	if err != nil {

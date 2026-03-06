@@ -25,6 +25,13 @@ func (p *Provider) Name() string {
 	return "runpod"
 }
 
+func (p *Provider) Validate(ctx context.Context) error {
+	if _, err := p.client.ListGPUTypes(ctx); err != nil {
+		return fmt.Errorf("runpod credential check: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
 	types, err := p.client.ListGPUTypes(ctx)
 	if err != nil {

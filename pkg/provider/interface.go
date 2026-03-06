@@ -91,6 +91,13 @@ type Provider interface {
 	// Name returns the provider identifier (e.g., "vast.ai", "verda", "runpod").
 	Name() string
 
+	// Validate checks that the stored credentials are valid by making a
+	// lightweight authenticated request to the provider API.
+	// Returns nil if credentials are accepted, a descriptive error otherwise.
+	// This is called at credential-save time so errors surface immediately
+	// rather than only when the first provision fails.
+	Validate(ctx context.Context) error
+
 	// SearchOffers returns available GPU offers matching the requirements.
 	SearchOffers(ctx context.Context, req GPURequirements) ([]Offer, error)
 

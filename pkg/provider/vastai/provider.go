@@ -30,6 +30,13 @@ func (p *Provider) Name() string {
 	return "vast.ai"
 }
 
+func (p *Provider) Validate(ctx context.Context) error {
+	if err := p.client.GetCurrentUser(ctx); err != nil {
+		return fmt.Errorf("vast.ai credential check: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
 	params := map[string]string{
 		"order":    "dph_total",

@@ -364,6 +364,13 @@ func (c *Client) GetLatestUbuntuAMI(ctx context.Context) (string, error) {
 	return c.cachedAMI, nil
 }
 
+// DescribeAvailabilityZones is the lightest authenticated EC2 call available.
+// It validates that the access key, secret, and region are all accepted by AWS.
+func (c *Client) DescribeAvailabilityZones(ctx context.Context) error {
+	_, err := c.ec2Action(ctx, map[string]string{"Action": "DescribeAvailabilityZones"})
+	return err
+}
+
 func sha256hex(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
