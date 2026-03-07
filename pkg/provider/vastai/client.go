@@ -305,10 +305,15 @@ func (c *Client) SetInstanceState(ctx context.Context, instanceID int, state str
 	return nil
 }
 
-// GetCurrentUser validates the API key by calling the current-user endpoint.
-// Returns nil if the key is accepted, an error otherwise.
+// GetCurrentUser validates the API key by doing a minimal bundles search.
+// /users/current/ returns 404 even for valid keys; /bundles/ is the reliable endpoint.
 func (c *Client) GetCurrentUser(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/users/current/", nil)
+	u, _ := url.Parse(c.baseURL + "/bundles/")
+	q := u.Query()
+	q.Set("limit", "1")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
@@ -321,11 +326,18 @@ func (c *Client) GetCurrentUser(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("vast.ai API key rejected (HTTP %d) — check your key", resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
+		resp.StatusCode == http.StatusNotFound {
+		var errResp struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal(body, &errResp) == nil && errResp.Msg != "" {
+			return fmt.Errorf("%s", errResp.Msg)
+		}
+		return fmt.Errorf("vast.ai API key rejected (HTTP %d)", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("vast.ai auth check returned %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
