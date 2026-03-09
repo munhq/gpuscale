@@ -117,6 +117,13 @@ func (s *Selector) SelectTopOffers(ctx context.Context, req GPURequirements, pre
 	return filtered, nil
 }
 
+// FilterByRequirements is the exported version of filterByRequirements.
+// Use this in any path that must enforce all hardware constraints precisely
+// (provisioning). Browse paths may apply a subset of filters instead.
+func FilterByRequirements(offers []Offer, req GPURequirements) []Offer {
+	return filterByRequirements(offers, req)
+}
+
 func filterByRequirements(offers []Offer, req GPURequirements) []Offer {
 	var result []Offer
 	for _, o := range offers {
