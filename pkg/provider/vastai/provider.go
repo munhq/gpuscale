@@ -42,6 +42,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		"order":    "dph_total",
 		"type":     "ask",
 		"verified": "true",
+		"rentable": "true", // exclude offline/hibernated machines (they show disk-only prices)
 	}
 
 	if req.GPUCount > 0 {
@@ -67,9 +68,9 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 	if len(req.GPUTypes) > 0 {
 		params["gpu_name"] = req.GPUTypes[0]
 	}
-	if req.CapacityType == "spot" {
-		params["rentable"] = "true"
-	}
+	// Note: rentable=true is already set above for all queries.
+	// Spot vs on-demand is distinguished by the interruptible field in the offer,
+	// not by a separate rentable filter. Both spot and on-demand offers are rentable.
 
 	offers, err := p.client.SearchOffers(ctx, params)
 	if err != nil {
