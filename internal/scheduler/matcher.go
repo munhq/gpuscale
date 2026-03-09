@@ -78,7 +78,7 @@ func ExtractGPURequirements(pod *corev1.Pod) provider.GPURequirements {
 	}
 	if maxPrice, ok := annotations[AnnotationMaxPrice]; ok {
 		if p, err := strconv.ParseFloat(maxPrice, 64); err == nil {
-			req.MaxPricePerGPU = p
+			req.MaxPricePerHour = p
 		}
 	}
 	if priority, ok := annotations[AnnotationPriority]; ok {
@@ -120,9 +120,9 @@ func MergeRequirements(reqs []provider.GPURequirements) provider.GPURequirements
 			merged.CapacityType = "on-demand"
 		}
 		// Use the lowest per-GPU max price (most restrictive)
-		if r.MaxPricePerGPU > 0 {
-			if merged.MaxPricePerGPU == 0 || r.MaxPricePerGPU < merged.MaxPricePerGPU {
-				merged.MaxPricePerGPU = r.MaxPricePerGPU
+		if r.MaxPricePerHour > 0 {
+			if merged.MaxPricePerHour == 0 || r.MaxPricePerHour < merged.MaxPricePerHour {
+				merged.MaxPricePerHour = r.MaxPricePerHour
 			}
 		}
 		// Collect all GPU types

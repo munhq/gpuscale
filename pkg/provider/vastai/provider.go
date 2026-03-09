@@ -47,16 +47,16 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 	if req.GPUCount > 0 {
 		params["num_gpus"] = strconv.Itoa(req.GPUCount)
+	} else if !req.MultiGpu {
+		// When multi-GPU is not requested, restrict to single-GPU instances.
+		params["num_gpus"] = "1"
 	}
 	if req.MinVRAM > 0 {
 		// Vast.ai uses MB for gpu_totalram
 		params["min_gpu_totalram"] = strconv.Itoa(req.MinVRAM * 1024)
 	}
-	if req.MaxPricePerGPU > 0 {
-		// Use a generous ceiling so the API returns a wide result set;
-		// the coordinator's per-GPU price filter does the precise cut.
-		// 8 GPUs is the practical NVLink maximum per instance.
-		params["max_dph_total"] = fmt.Sprintf("%.2f", req.MaxPricePerGPU*8)
+	if req.MaxPricePerHour > 0 {
+		params["max_dph_total"] = fmt.Sprintf("%.2f", req.MaxPricePerHour)
 	}
 	if req.MinDisk > 0 {
 		params["min_disk_space"] = strconv.Itoa(req.MinDisk)

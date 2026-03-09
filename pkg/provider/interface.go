@@ -19,7 +19,7 @@ type GPURequirements struct {
 	MinVRAM         int      // GB, total VRAM required across all GPUs on the instance
 	MaxVRAM         int      // GB, max VRAM per GPU to prevent over-provisioning (0 = no limit)
 	GPUTypes        []string // preferred GPU types (empty = any)
-	MaxPricePerGPU  float64  // $/hr per GPU; 0 = no limit (total price = MaxPricePerGPU * offer.GPUCount)
+	MaxPricePerHour float64  // $/hr total for the instance; 0 = no limit
 	CapacityType    string   // "spot" or "on-demand"
 	MinDisk         int      // GB
 	MinRAM          int      // GB

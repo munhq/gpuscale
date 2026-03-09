@@ -9,7 +9,7 @@ import (
 // filterByRequirements returns only offers that meet the GPU requirements.
 // o.VRAM is total VRAM across all GPUs on the instance.
 // req.GPUCount is a minimum (0 = any count covering MinVRAM).
-// req.MaxPricePerGPU caps $/hr per GPU (offer.PricePerHour / offer.GPUCount).
+// req.MaxPricePerHour caps total $/hr for the instance (0 = no limit).
 func filterByRequirements(offers []provider.Offer, req provider.GPURequirements) []provider.Offer {
 	var result []provider.Offer
 	for _, o := range offers {
@@ -26,7 +26,7 @@ func filterByRequirements(offers []provider.Offer, req provider.GPURequirements)
 			continue
 		}
 		// Per-GPU price cap.
-		if req.MaxPricePerGPU > 0 && o.GPUCount > 0 && o.PricePerHour/float64(o.GPUCount) > req.MaxPricePerGPU {
+		if req.MaxPricePerHour > 0 && o.PricePerHour > req.MaxPricePerHour {
 			continue
 		}
 		if req.CapacityType != "" && o.CapacityType != req.CapacityType {

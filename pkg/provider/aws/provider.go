@@ -104,7 +104,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 			}
 			capacityType = "spot"
 		}
-		if req.MaxPricePerGPU > 0 && spec.GPUCount > 0 && price/float64(spec.GPUCount) > req.MaxPricePerGPU {
+		if req.MaxPricePerHour > 0 && spec.GPUCount > 0 && price/float64(spec.GPUCount) > req.MaxPricePerHour {
 			continue
 		}
 

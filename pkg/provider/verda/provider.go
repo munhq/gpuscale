@@ -173,7 +173,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 				continue // neither capacity type available in this region
 			}
 
-			if req.MaxPricePerGPU > 0 && ti.gpuCount > 0 && price/float64(ti.gpuCount) > req.MaxPricePerGPU {
+			if req.MaxPricePerHour > 0 && ti.gpuCount > 0 && price/float64(ti.gpuCount) > req.MaxPricePerHour {
 				continue
 			}
 

@@ -71,7 +71,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		}
 
 		pricePerHour := h.Pricing.GPU.Hourly * float64(gpuCount)
-		if req.MaxPricePerGPU > 0 && gpuCount > 0 && h.Pricing.GPU.Hourly > req.MaxPricePerGPU {
+		if req.MaxPricePerHour > 0 && pricePerHour > req.MaxPricePerHour {
 			continue
 		}
 

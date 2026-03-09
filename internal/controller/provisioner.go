@@ -247,7 +247,7 @@ func (r *ProvisioningController) processBatch(ctx context.Context) {
 				GPUCount:       merged.GPUCount,
 				MinVRAM:        merged.MinVRAM,
 				GPUTypes:       merged.GPUTypes,
-				MaxPricePerGPU: merged.MaxPricePerGPU,
+				MaxPricePerGPU: merged.MaxPricePerHour,
 			},
 			PodRefs: podRefs,
 		},

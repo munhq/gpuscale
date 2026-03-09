@@ -85,7 +85,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		}
 
 		// Per-GPU price cap.
-		if req.MaxPricePerGPU > 0 && gpuCount > 0 && price/float64(gpuCount) > req.MaxPricePerGPU {
+		if req.MaxPricePerHour > 0 && price > req.MaxPricePerHour {
 			continue
 		}
 
