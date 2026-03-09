@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/munhq/gpuscale/pkg/provider"
@@ -40,14 +41,22 @@ func (p *Provider) Validate(ctx context.Context) error {
 	return nil
 }
 
+// typeInfo is the pre-filtered instance type used for availability checks.
+type typeInfo struct {
+	t             InstanceType
+	gpuCount      int
+	totalVRAM     int
+	ramGB         int
+	onDemandPrice float64
+	spotPrice     float64
+}
+
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
 	types, err := p.client.ListInstanceTypes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing verda instance types: %w", err)
 	}
 
-	// Expand offers across all regions. When a region returns 503 (no capacity),
-	// the coordinator's retry-next-offer logic will try the next region naturally.
 	locations, err := p.client.ListLocations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing verda locations: %w", err)
@@ -64,56 +73,121 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		regionCodes = []string{""} // fallback: let Verda pick
 	}
 
-	isSpot := req.CapacityType == "spot"
+	isSpotOnly := req.CapacityType == "spot"
+	isOnDemandOnly := req.CapacityType == "on-demand"
+	// "any" or "" = check both, prefer spot
+	checkSpot := isSpotOnly || (!isOnDemandOnly)
+	checkOnDemand := isOnDemandOnly || (!isSpotOnly)
 
-	var offers []provider.Offer
+	// Pre-filter by hardware requirements before making availability API calls.
+	var eligible []typeInfo
 	for _, t := range types {
 		gpuCount := t.GPU.NumberOfGPUs
 		vramGB := t.GPUMemory.SizeInGigabytes
+		totalVRAM := gpuCount * vramGB
 		ramGB := t.Memory.SizeInGigabytes
-		gpuType := t.Model
 
 		if !req.MultiGpu && gpuCount > 1 {
 			continue
 		}
-		totalVRAM := gpuCount * vramGB
 		if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
 			continue
 		}
 		if req.MinRAM > 0 && ramGB < req.MinRAM {
 			continue
 		}
-
 		onDemandPrice, err := parsePrice(t.PricePerHour)
 		if err != nil {
 			continue
 		}
 		spotPrice, _ := parsePrice(t.SpotPrice)
 
-		price := onDemandPrice
-		capacityType := "on-demand"
-		if isSpot && spotPrice > 0 {
-			price = spotPrice
-			capacityType = "spot"
-		}
+		eligible = append(eligible, typeInfo{t, gpuCount, totalVRAM, ramGB, onDemandPrice, spotPrice})
+	}
+	if len(eligible) == 0 {
+		return nil, nil
+	}
 
-		if req.MaxPricePerGPU > 0 && gpuCount > 0 && price/float64(gpuCount) > req.MaxPricePerGPU {
-			continue
-		}
+	// Check live availability for each type × region × capacity combo in parallel.
+	// Bounded to 10 concurrent requests to avoid hammering the Verda API.
+	// On-demand checks fail open (include offer on error) — false negatives are
+	// worse than false positives because they hide available inventory from the user.
+	// Spot checks fail closed — we never assume spot capacity exists.
+	type availKey struct {
+		instanceType string
+		region       string
+		isSpot       bool
+	}
+	availMap := make(map[availKey]bool)
+	var mu sync.Mutex
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
 
-		// One offer per region — coordinator retries through regions on 503.
+	for _, ti := range eligible {
 		for _, region := range regionCodes {
+			if checkOnDemand {
+				wg.Add(1)
+				go func(instanceType, regionCode string) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					avail, err := p.client.CheckAvailabilityInLocation(ctx, instanceType, false, regionCode)
+					mu.Lock()
+					availMap[availKey{instanceType, regionCode, false}] = err != nil || avail // fail open
+					mu.Unlock()
+				}(ti.t.InstanceType, region)
+			}
+			if checkSpot && ti.spotPrice > 0 {
+				wg.Add(1)
+				go func(instanceType, regionCode string) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					avail, err := p.client.CheckAvailabilityInLocation(ctx, instanceType, true, regionCode)
+					mu.Lock()
+					availMap[availKey{instanceType, regionCode, true}] = err == nil && avail // fail closed
+					mu.Unlock()
+				}(ti.t.InstanceType, region)
+			}
+		}
+	}
+	wg.Wait()
+
+	// Build offers for available type × region combos.
+	// For "any" capacity: prefer spot (cheaper) when available, fall back to on-demand.
+	// Reliability is 0 (renders as "—") — Verda is a managed inventory, not a marketplace.
+	var offers []provider.Offer
+	for _, ti := range eligible {
+		for _, region := range regionCodes {
+			var price float64
+			var capacityType string
+
+			spotKey := availKey{ti.t.InstanceType, region, true}
+			odKey := availKey{ti.t.InstanceType, region, false}
+
+			if checkSpot && availMap[spotKey] && ti.spotPrice > 0 {
+				price, capacityType = ti.spotPrice, "spot"
+			} else if checkOnDemand && availMap[odKey] {
+				price, capacityType = ti.onDemandPrice, "on-demand"
+			} else {
+				continue // neither capacity type available in this region
+			}
+
+			if req.MaxPricePerGPU > 0 && ti.gpuCount > 0 && price/float64(ti.gpuCount) > req.MaxPricePerGPU {
+				continue
+			}
+
 			offers = append(offers, provider.Offer{
 				ProviderName: p.Name(),
-				OfferID:      t.InstanceType,
-				GPUType:      gpuType,
-				GPUCount:     gpuCount,
-				VRAM:         totalVRAM,
+				OfferID:      ti.t.InstanceType,
+				GPUType:      ti.t.Model,
+				GPUCount:     ti.gpuCount,
+				VRAM:         ti.totalVRAM,
 				PricePerHour: price,
 				CapacityType: capacityType,
-				Reliability:  0.95,
+				Reliability:  0, // inventory provider — no marketplace reliability score
 				DiskGB:       0,
-				RAMGB:        ramGB,
+				RAMGB:        ti.ramGB,
 				Region:       region,
 			})
 		}
