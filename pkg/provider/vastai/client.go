@@ -153,33 +153,42 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	if resp.StatusCode == http.StatusNotFound ||
-		(resp.StatusCode >= 400 && strings.Contains(string(respBody), "no_such_ask")) {
-		return nil, fmt.Errorf("vast.ai offer %d expired: %s: %w", offerID, string(respBody), provider.ErrOfferExpired)
-	}
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("vast.ai create returned %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	// Vast.ai create response format: {"success": true, "new_contract": <instance_id>}
+	// Parse the response body first — new_contract being present means the instance
+	// was created regardless of HTTP status or the success field.
+	// Vast.ai uses no_such_ask both for "offer taken by someone else" AND (in some
+	// edge cases) when the ask was consumed by our own request; new_contract is the
+	// only reliable signal that creation actually happened.
 	var createResp struct {
 		Success     bool   `json:"success"`
 		NewContract int    `json:"new_contract"`
 		Error       string `json:"error,omitempty"`
+		Msg         string `json:"msg,omitempty"`
 	}
-	if err := json.Unmarshal(respBody, &createResp); err != nil {
-		preview := string(respBody)
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
-		}
-		return nil, fmt.Errorf("decoding create response: %w. Response: %s", err, preview)
+	_ = json.Unmarshal(respBody, &createResp) // best-effort; checked below
+
+	if createResp.NewContract > 0 {
+		// Instance was created — success regardless of HTTP status.
+		return &InstanceResponse{
+			ID:           createResp.NewContract,
+			ActualStatus: "created",
+		}, nil
 	}
 
-	if !createResp.Success || createResp.NewContract == 0 {
-		return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s, raw=%s",
-			createResp.Success, createResp.NewContract, createResp.Error, string(respBody))
+	// No contract ID: classify the failure.
+	if resp.StatusCode == http.StatusNotFound ||
+		(resp.StatusCode >= 400 && strings.Contains(string(respBody), "no_such_ask")) ||
+		strings.Contains(createResp.Msg, "no_such_ask") {
+		return nil, fmt.Errorf("vast.ai offer %d expired (HTTP %d): %s: %w",
+			offerID, resp.StatusCode, string(respBody), provider.ErrOfferExpired)
 	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("vast.ai create returned HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// HTTP 200 but no contract and no recognisable error.
+	return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s, raw=%s",
+		createResp.Success, createResp.NewContract, createResp.Error, string(respBody))
 
 	// Return the contract ID directly. Don't call GetInstance here — the
 	// instance may not be queryable immediately after creation, and any
