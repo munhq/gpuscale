@@ -282,7 +282,7 @@ func (r *ClaimReconciler) handlePending(ctx context.Context, claim *v1alpha1.GPU
 		MinVRAM:        claim.Spec.Requirements.MinVRAM,
 		MaxVRAM:        claim.Spec.Requirements.MaxVRAM,
 		GPUTypes:       claim.Spec.Requirements.GPUTypes,
-		MaxPricePerGPU: claim.Spec.Requirements.MaxPricePerHour,
+		MaxPricePerHour: claim.Spec.Requirements.MaxPricePerHour,
 		CapacityType:   "spot",
 		NodeType:       nodeType,
 		MinPCIeGen:     pool.Spec.Requirements.MinPCIeGen,
