@@ -291,6 +291,24 @@ func (r *DisruptionController) handleIdleClaim(ctx context.Context, claim *v1alp
 		}
 	}
 
+	// MinReplicas guard: don't destroy if this model would drop below its configured floor.
+	// Applies to the primary model only — co-located models are covered by their own claims.
+	if r.DemandStore != nil && claim.Spec.ModelID != "" {
+		if mcfg, cfgErr := r.DemandStore.GetModelConfig(ctx, claim.Spec.ModelID); cfgErr == nil && mcfg != nil && mcfg.MinReplicas > 1 {
+			var allClaims v1alpha1.GPUNodeClaimList
+			if listErr := r.List(ctx, &allClaims, client.InNamespace(claimNamespace())); listErr == nil {
+				activeReplicas := countActiveClaimsForModel(allClaims.Items, claim.Spec.ModelID)
+				if activeReplicas <= mcfg.MinReplicas {
+					log.Info("At MinReplicas, holding destroy",
+						"model", claim.Spec.ModelID,
+						"activeReplicas", activeReplicas,
+						"minReplicas", mcfg.MinReplicas)
+					return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+				}
+			}
+		}
+	}
+
 	log.Info("Idle at optimal destroy time, initiating destroy")
 	return destroyFn()
 }

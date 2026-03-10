@@ -100,36 +100,48 @@ func (r *ProvisionTrigger) Start(ctx context.Context) error {
 func (r *ProvisionTrigger) handleTrigger(ctx context.Context, model string) error {
 	log := r.Log.WithValues("model", model)
 
-	// Check if model is already loaded — no provisioning needed
-	if r.DemandStore.IsModelLoaded(ctx, model) {
-		log.Info("Model already loaded, skipping provisioning")
-		return nil
-	}
-
-	// Dedup: a model is covered if it appears as primary OR co-located in any active claim.
-	var claims v1alpha1.GPUNodeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
-		return fmt.Errorf("listing claims: %w", err)
-	}
-	for i := range claims.Items {
-		c := &claims.Items[i]
-		if c.Status.Phase == v1alpha1.ClaimPhaseTerminated || c.Status.Phase == v1alpha1.ClaimPhaseDraining {
-			continue
-		}
-		if c.Spec.ModelID != model && !slices.Contains(c.Spec.ModelIDs, model) {
-			continue
-		}
-		log.Info("Model already covered by existing claim", "claim", c.Name, "phase", c.Status.Phase)
-		return nil
-	}
-
-	// Get model config from Dragonfly
+	// Get model config first — needed for MaxReplicas and other constraints.
 	cfg, err := r.DemandStore.GetModelConfig(ctx, model)
 	if err != nil {
 		return fmt.Errorf("getting model config: %w", err)
 	}
 	if cfg == nil {
 		return fmt.Errorf("model %q not found in config", model)
+	}
+
+	maxReplicas := cfg.MaxReplicas
+	if maxReplicas < 1 {
+		maxReplicas = 1 // default: single replica
+	}
+
+	// Count active (non-Terminated, non-Draining) claims for this model.
+	var claims v1alpha1.GPUNodeClaimList
+	if err := r.List(ctx, &claims, client.InNamespace(claimNamespace())); err != nil {
+		return fmt.Errorf("listing claims: %w", err)
+	}
+	activeReplicas := countActiveClaimsForModel(claims.Items, model)
+
+	if activeReplicas >= maxReplicas {
+		log.V(1).Info("Model at MaxReplicas, skipping provisioning",
+			"activeReplicas", activeReplicas, "maxReplicas", maxReplicas)
+		return nil
+	}
+
+	// Scale-up path: already have at least one replica — only add more when
+	// there are requests queued and waiting for capacity.
+	if activeReplicas > 0 {
+		queueDepth, err := r.DemandStore.GetQueueDepth(ctx, model)
+		if err != nil {
+			return fmt.Errorf("checking queue depth: %w", err)
+		}
+		if queueDepth == 0 {
+			log.V(1).Info("No queued requests, skipping scale-up",
+				"model", model, "activeReplicas", activeReplicas)
+			return nil
+		}
+		log.Info("Queue depth detected, adding replica",
+			"model", model, "activeReplicas", activeReplicas,
+			"maxReplicas", maxReplicas, "queueDepth", queueDepth)
 	}
 
 	// Find a pool matching this model's nodeType
@@ -554,6 +566,23 @@ func findPool(pools []v1alpha1.GPUNodePool, poolName, nodeType string) *v1alpha1
 		}
 	}
 	return &pools[0]
+}
+
+// countActiveClaimsForModel returns the number of non-Terminated, non-Draining,
+// non-Hibernated claims that serve the given model (primary or co-located).
+// Used by both ProvisionTrigger (MaxReplicas cap) and DisruptionController (MinReplicas floor).
+func countActiveClaimsForModel(claims []v1alpha1.GPUNodeClaim, modelID string) int {
+	count := 0
+	for _, c := range claims {
+		switch c.Status.Phase {
+		case v1alpha1.ClaimPhaseTerminated, v1alpha1.ClaimPhaseDraining, v1alpha1.ClaimPhaseHibernated:
+			continue
+		}
+		if c.Spec.ModelID == modelID || slices.Contains(c.Spec.ModelIDs, modelID) {
+			count++
+		}
+	}
+	return count
 }
 
 // SetupWithManager registers this controller as a Runnable.
