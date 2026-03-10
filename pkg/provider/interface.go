@@ -45,8 +45,9 @@ type Offer struct {
 
 // BootstrapConfig contains the configuration needed to bootstrap a standalone gpu-agent node.
 type BootstrapConfig struct {
-	NodeType string // always "standalone": gpu-agent + vLLM, outbound WSS tunnel to GPU API
-	Image    string // Docker image (e.g., "vllm/vllm-openai:latest")
+	NodeType string // always "standalone": gpu-agent + inference server, outbound WSS tunnel to GPU API
+	Engine   string // inference engine: "vllm" (default), "sglang", "ollama"
+	Image    string // Docker image override (e.g., "vllm/vllm-openai:latest"); usually left empty
 
 	// Standalone (gpu-agent) bootstrap fields.
 	GPUAPIURL   string // WSS endpoint for gpu-agent tunnel (e.g., "wss://ai.example.com")
