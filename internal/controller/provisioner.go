@@ -323,8 +323,7 @@ func (r *ProvisioningController) countActiveClaims(ctx context.Context) int {
 }
 
 // countPendingGPUPods returns the number of pending, unschedulable GPU pods
-// that GPUScale manages (demand-signal pods only). KubeRay worker pods are
-// excluded — they are not GPUScale demand signals.
+// that GPUScale manages (demand-signal pods only).
 func (r *ProvisioningController) countPendingGPUPods(ctx context.Context) int {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods); err != nil {
@@ -333,9 +332,6 @@ func (r *ProvisioningController) countPendingGPUPods(ctx context.Context) int {
 	}
 	count := 0
 	for _, p := range pods.Items {
-		if p.Labels["app.kubernetes.io/created-by"] == "kuberay-operator" {
-			continue
-		}
 		if p.Status.Phase == corev1.PodPending &&
 			scheduler.IsGPUPod(&p) &&
 			scheduler.IsUnschedulable(&p) {

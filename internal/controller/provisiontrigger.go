@@ -57,7 +57,7 @@ func (r *ProvisionTrigger) Start(ctx context.Context) error {
 	recentlyHandled := make(map[string]time.Time)
 
 	// Safety net: periodic queue reconciliation catches orphaned requests
-	// from controller restarts, lost pub/sub messages, or broken Ray autoscaler.
+	// from controller restarts or lost pub/sub messages.
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
@@ -475,7 +475,7 @@ func (r *ProvisionTrigger) createBinPackedClaim(ctx context.Context, candidates 
 
 // reconcileQueues checks all model queues in Redis for orphaned requests
 // that have no active claim. Runs on startup and every 60s as a safety net
-// for controller restarts, lost pub/sub messages, or broken Ray autoscaler.
+// for controller restarts or lost pub/sub messages.
 func (r *ProvisionTrigger) reconcileQueues(ctx context.Context) {
 	log := r.Log
 	demands, err := r.DemandStore.GetAllDemands(ctx)

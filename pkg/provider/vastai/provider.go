@@ -47,9 +47,6 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 
 	if req.GPUCount > 0 {
 		params["num_gpus"] = strconv.Itoa(req.GPUCount)
-	} else if !req.MultiGpu {
-		// When multi-GPU is not requested, restrict to single-GPU instances.
-		params["num_gpus"] = "1"
 	}
 	if req.MinVRAM > 0 {
 		// Vast.ai uses MB for gpu_totalram

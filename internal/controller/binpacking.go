@@ -7,6 +7,27 @@ import (
 	"github.com/munhq/gpuscale/pkg/provider"
 )
 
+// GPUNode represents a single GPU node's capacity.
+type GPUNode struct {
+	NodeID     string
+	GPUType    string
+	GPUCount   int
+	VRAMPerGPU int
+	TotalVRAM  int
+	UsedVRAM   int
+	FreeVRAM   int
+}
+
+// ClusterCapacity represents the current cluster GPU capacity.
+type ClusterCapacity struct {
+	Nodes        []GPUNode
+	TotalGPUs    int
+	TotalVRAM    int
+	LoadedModels []string
+	UsedVRAM     int
+	FreeVRAM     int
+}
+
 // ProvisioningDecision represents whether to provision and what to provision.
 type ProvisioningDecision struct {
 	ShouldProvision bool

@@ -51,24 +51,11 @@ func (h *NodeHealthChecker) WaitForNodeReady(ctx context.Context, instanceID str
 	return nil, fmt.Errorf("node with instance-id %s did not become ready within %s", instanceID, timeout)
 }
 
-// IsNodeReady checks if a node has a Ready=True condition.
-func IsNodeReady(node *corev1.Node) bool {
-	return isNodeReady(node)
-}
-
 func isNodeReady(node *corev1.Node) bool {
 	for _, cond := range node.Status.Conditions {
 		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
 			return true
 		}
-	}
-	return false
-}
-
-// HasGPUCapacity checks if a node has nvidia.com/gpu resources available.
-func HasGPUCapacity(node *corev1.Node) bool {
-	if q, ok := node.Status.Capacity["nvidia.com/gpu"]; ok {
-		return !q.IsZero()
 	}
 	return false
 }

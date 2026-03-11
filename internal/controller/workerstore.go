@@ -31,7 +31,7 @@ type WorkerInfo struct {
 }
 
 // WorkerStore writes GPUNodeClaim status to Dragonfly for observability.
-// This is NOT used for routing — Ray handles that. This is for GPU API
+// This is NOT used for routing. This is for GPU API
 // to show users provisioning state ("spinning up", "ready", etc).
 type WorkerStore struct {
 	rdb *redis.Client
@@ -49,7 +49,7 @@ func NewWorkerStore(redisURL string) *WorkerStore {
 		// Fall back to host:port format (no scheme)
 		opts = &redis.Options{
 			Addr: redisURL,
-			DB:   0, // Use DB 0 for worker status (same as Ray GCS)
+			DB:   0,
 		}
 	}
 

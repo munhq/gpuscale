@@ -149,7 +149,7 @@ func main() {
 	})
 
 	// Set up controllers
-	// ProvisioningController watches pending GPU pods (from Ray autoscaler or KEDA) and creates claims
+	// ProvisioningController watches pending GPU pods and creates claims
 	provisioningCtrl := gpucontroller.NewProvisioningController(
 		mgr.GetClient(),
 		ctrl.Log.WithName("provisioner"),

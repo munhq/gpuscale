@@ -86,7 +86,7 @@ type ModelConfig struct {
 	AlwaysActive   bool     `json:"alwaysActive"`
 	MinReplicas    int      `json:"minReplicas"`
 	MaxReplicas    int      `json:"maxReplicas"`
-	NodeType       string   `json:"nodeType"`        // "ray-worker" or "full-node"
+	NodeType       string   `json:"nodeType"`        // e.g. "full-node"
 	MaxPricePerGPU float64  `json:"maxPricePerGPU"`
 	MaxVRAMPerGPU  int      `json:"maxVramPerGpu"`   // max VRAM per GPU in GB (0 = no limit)
 	PreferredGPUs  []string `json:"preferredGpus"`   // preferred GPU types (tried first)
@@ -360,9 +360,8 @@ func (s *DemandStore) SubscribeProvisionTrigger(ctx context.Context) <-chan stri
 
 // PublishModelAvailable publishes a "try drain" event to the model_loaded channel
 // WITHOUT setting the loaded_models registry key. This triggers GPU API's queue
-// processor to attempt forwarding queued requests to Ray Serve, which in turn
-// triggers Ray Serve autoscaling. The actual loaded_models key is set later
-// when we confirm the Ray Serve application is RUNNING.
+// processor to attempt forwarding queued requests. The actual loaded_models key
+// is set later when we confirm the model is serving.
 func (s *DemandStore) PublishModelAvailable(ctx context.Context, model string) {
 	if s == nil || s.rdb == nil || model == "" {
 		return
@@ -370,8 +369,8 @@ func (s *DemandStore) PublishModelAvailable(ctx context.Context, model string) {
 	s.rdb.Publish(ctx, modelLoadedChannel, model)
 }
 
-// PublishModelFailed signals GPU API to cancel any pending Ray Serve HTTP forwards
-// for this model. Called by drainAndDestroy when an instance is destroyed (DEPLOY_FAILED,
+// PublishModelFailed signals GPU API to cancel any pending inference forwards
+// for this model. Called by drainAndDestroy when an instance is destroyed (e.g.
 // preemption, deploy timeout) so the queue processor doesn't wait for the 30-min timeout.
 func (s *DemandStore) PublishModelFailed(ctx context.Context, model string) {
 	if s == nil || s.rdb == nil || model == "" {

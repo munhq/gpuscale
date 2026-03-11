@@ -867,39 +867,8 @@ func (r *ClaimReconciler) writeTerminatedRecord(ctx context.Context, claim *v1al
 	}
 }
 
-// emitRayEventOnce writes a bootstrap event for the given step exactly once per claim.
-// It uses a claim annotation as a dedup key so the event is not duplicated on every 60s tick.
-// The annotation patch is best-effort; a failure means the event may be emitted more than
-// once (acceptable — it will appear as a duplicate in the timeline rather than missing).
-func (r *ClaimReconciler) emitRayEventOnce(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger, step, message string) {
-	if r.ClaimWriter == nil {
-		return
-	}
-	annotKey := "gpuscale.io/event-" + step
-	if claim.Annotations[annotKey] == "1" {
-		return
-	}
-	if err := r.ClaimWriter.WriteEvent(ctx, claim.Name, step, message); err != nil {
-		log.Error(err, "Failed to write ray event", "step", step)
-		return
-	}
-	// Mark as emitted via annotation patch so we don't duplicate on next reconcile.
-	// Also update bootstrap-step so the Live tab shows current progress (same field
-	// the bootstrap script posts to via /internal/bootstrap-event).
-	patch := client.MergeFrom(claim.DeepCopy())
-	if claim.Annotations == nil {
-		claim.Annotations = make(map[string]string)
-	}
-	claim.Annotations[annotKey] = "1"
-	claim.Annotations["gpuscale.io/bootstrap-step"] = step
-	if err := r.Patch(ctx, claim, patch); err != nil {
-		log.Error(err, "Failed to mark ray event emitted (non-fatal)", "step", step)
-	}
-}
-
-
 // triggerConsolidationDrain checks if this bin-packed claim now has all co-located
-// models loaded in Ray Serve. If so, it annotates any older single-model claims
+// models loaded. If so, it annotates any older single-model claims
 // for those same models with annotationConsolidationDrain so the DisruptionController
 // drains them immediately — they are being replaced by this more efficient shared node.
 func (r *ClaimReconciler) triggerConsolidationDrain(ctx context.Context, claim *v1alpha1.GPUNodeClaim, log logr.Logger) {
