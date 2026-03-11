@@ -189,15 +189,6 @@ func (c *Client) CreateInstance(ctx context.Context, offerID int, createReq Inst
 	// HTTP 200 but no contract and no recognisable error.
 	return nil, fmt.Errorf("vast.ai create failed: success=%v, contract=%d, error=%s, raw=%s",
 		createResp.Success, createResp.NewContract, createResp.Error, string(respBody))
-
-	// Return the contract ID directly. Don't call GetInstance here — the
-	// instance may not be queryable immediately after creation, and any
-	// parsing issues could override the valid contract ID with 0.
-	// The ClaimReconciler polls GetInstance during the Bootstrapping phase.
-	return &InstanceResponse{
-		ID:           createResp.NewContract,
-		ActualStatus: "created",
-	}, nil
 }
 
 // GetInstance returns the details of a specific instance.
