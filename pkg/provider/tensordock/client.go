@@ -1,19 +1,25 @@
 package tensordock
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
-const baseURL = "https://marketplace.tensordock.com/api/v0"
+const baseURL = "https://dashboard.tensordock.com/api/v0"
 
 // Client is an HTTP client for the TensorDock marketplace API.
-// Auth uses api_key + api_token passed as Basic credentials.
+// Auth: GET endpoints are public (no auth); POST endpoints use api_key + api_token
+// as application/x-www-form-urlencoded body fields.
 type Client struct {
 	apiKey     string
 	apiToken   string
@@ -31,28 +37,30 @@ func NewClient(apiKey, apiToken string) *Client {
 	}
 }
 
-// doGET executes a GET request and JSON-decodes the response into dst.
+// doGET executes an unauthenticated GET request and JSON-decodes the response into dst.
+// The hostnodes listing endpoint is public and requires no credentials.
 func (c *Client) doGET(ctx context.Context, path string, dst interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.SetBasicAuth(c.apiKey, c.apiToken)
 	return c.do(req, dst)
 }
 
-// doPOST executes a POST with a JSON body and decodes the response into dst.
-func (c *Client) doPOST(ctx context.Context, path string, body, dst interface{}) error {
-	data, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshal body: %w", err)
+// doPOST executes an authenticated POST with application/x-www-form-urlencoded body.
+// api_key and api_token are injected as form fields.
+func (c *Client) doPOST(ctx context.Context, path string, form url.Values, dst interface{}) error {
+	if form == nil {
+		form = url.Values{}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(data))
+	form.Set("api_key", c.apiKey)
+	form.Set("api_token", c.apiToken)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(c.apiKey, c.apiToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return c.do(req, dst)
 }
 
@@ -75,14 +83,14 @@ func (c *Client) do(req *http.Request, dst interface{}) error {
 		_ = json.Unmarshal(body, &apiErr)
 		msg := apiErr.Error
 		if msg == "" {
-			msg = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 		return fmt.Errorf("tensordock API error: %s", msg)
 	}
 
 	if dst != nil {
 		if err := json.Unmarshal(body, dst); err != nil {
-			return fmt.Errorf("decode response: %w", err)
+			return fmt.Errorf("decode response: %w (body: %.200s)", err, string(body))
 		}
 	}
 	return nil
@@ -90,126 +98,149 @@ func (c *Client) do(req *http.Request, dst interface{}) error {
 
 // --- API response types ---
 
-// HostsResponse is returned by GET /client/list/
-type HostsResponse struct {
-	Success bool                    `json:"success"`
-	Hosts   map[string]HostDetails  `json:"servers"`
+// GPUModel holds the count and price for one GPU model on a hostnode.
+type GPUModel struct {
+	Amount int     `json:"amount"`
+	Price  float64 `json:"price"` // $/GPU/hr
 }
 
-// HostDetails describes one available bare-metal server in the marketplace.
-type HostDetails struct {
-	ID       string      `json:"id"`
-	Name     string      `json:"name"`
-	CPU      HostCPU     `json:"cpu"`
-	GPU      HostGPU     `json:"gpu"`
-	RAM      int         `json:"ram"`      // GB
-	Storage  int         `json:"storage"`  // GB
-	Location HostLocation `json:"location"`
-	Pricing  HostPricing `json:"pricing"`
+// HostnodeSpecs describes available hardware on a TensorDock server.
+type HostnodeSpecs struct {
+	CPU struct {
+		Amount int     `json:"amount"` // max vCPUs
+		Type   string  `json:"type"`
+		Price  float64 `json:"price"` // $/vCPU/hr
+	} `json:"cpu"`
+	RAM struct {
+		Amount int     `json:"amount"` // GB
+		Price  float64 `json:"price"`  // $/GB/hr
+	} `json:"ram"`
+	Storage struct {
+		Amount int     `json:"amount"` // GB
+		Price  float64 `json:"price"`  // $/GB/hr
+	} `json:"storage"`
+	// GPU is a map from model slug (e.g. "geforcertx3080-pcie-10gb") to count+price.
+	GPU map[string]GPUModel `json:"gpu"`
 }
 
-type HostCPU struct {
-	Amount int    `json:"amount"`
-	Type   string `json:"type"`
+// HostnodeStatus holds availability info for a TensorDock server.
+type HostnodeStatus struct {
+	Listed bool    `json:"listed"`
+	Online bool    `json:"online"`
+	Uptime float64 `json:"uptime"` // 0–1 reliability score
 }
 
-type HostGPU struct {
-	Amount int    `json:"amount"`
-	Type   string `json:"type"`
-	VRAM   int    `json:"vram"` // GB
-}
-
-type HostLocation struct {
-	ID      string `json:"id"`
-	Country string `json:"country"`
+// HostnodeLocation holds datacenter location info.
+type HostnodeLocation struct {
 	City    string `json:"city"`
+	Country string `json:"country"`
+	Region  string `json:"region"`
+	ID      string `json:"id"`
 }
 
-type HostPricing struct {
-	GPU     HostGPUPricing `json:"gpu"`
-	Storage float64        `json:"storage"` // $/GB/hr
+// Hostnode represents one TensorDock bare-metal server.
+type Hostnode struct {
+	UUID     string           // populated from the map key in HostnodesResponse
+	Location HostnodeLocation `json:"location"`
+	Specs    HostnodeSpecs    `json:"specs"`
+	Status   HostnodeStatus   `json:"status"`
 }
 
-type HostGPUPricing struct {
-	Hourly float64 `json:"hourly"` // $/GPU/hr
+// HostnodesResponse is returned by GET /client/deploy/hostnodes.
+type HostnodesResponse struct {
+	Success   bool                `json:"success"`
+	Hostnodes map[string]Hostnode `json:"hostnodes"`
 }
 
-// DeployRequest is the body for POST /client/deploy/virtualMachine/
-type DeployRequest struct {
-	// Identifying which host to use
-	ServerID string `json:"server_id"`
-
-	// GPU configuration
-	GPUModel string `json:"gpu_model"`
-	GPUCount int    `json:"gpu_count"`
-
-	// Compute specs (can be overridden per host)
-	VCPUs   int `json:"vcpus"`
-	RAM     int `json:"ram"`     // GB
-	Storage int `json:"storage"` // GB
-
-	// OS
-	OperatingSystem string `json:"operating_system"`
-
-	// Network
-	ExternalPorts string `json:"external_ports,omitempty"` // e.g. "22,80,443"
-
-	// Hostname
-	Hostname string `json:"hostname"`
-
-	// Bootstrap
-	StartupScript string `json:"startup_script,omitempty"` // cloud-init / bash script
-}
-
-// DeployResponse is the body returned by POST /client/deploy/virtualMachine/
+// DeployResponse is returned by POST /client/deploy/single.
 type DeployResponse struct {
-	Success    bool   `json:"success"`
-	ServerID   string `json:"server"`
-	InstanceID string `json:"id"`
-	IP         string `json:"ip"`
-	Error      string `json:"error,omitempty"`
+	Success      bool              `json:"success"`
+	Server       string            `json:"server"` // VM UUID — use as InstanceID
+	IP           string            `json:"ip"`
+	PortForwards map[string]string `json:"port_forwards"` // external → internal port
+	Error        string            `json:"error,omitempty"`
 }
 
-// DeleteResponse is returned by DELETE /client/delete/{id}/
+// VMStatus is returned by POST /client/get/single.
+type VMStatus struct {
+	Success      bool              `json:"success"`
+	Status       string            `json:"status"` // "Running", "Outbid", etc.
+	IP           string            `json:"ip"`
+	PortForwards map[string]string `json:"port_forwards"`
+	Error        string            `json:"error,omitempty"`
+}
+
+// DeleteResponse is returned by POST /client/delete/single.
 type DeleteResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
 }
 
-// InstanceStatusResponse is returned by GET /client/single/{id}/
-type InstanceStatusResponse struct {
-	Success  bool   `json:"success"`
-	Status   string `json:"status"`
-	IP       string `json:"ip"`
-	ServerID string `json:"server_id"`
-	Error    string `json:"error,omitempty"`
+// VMListEntry is one entry in the POST /client/list response.
+type VMListEntry struct {
+	Status string `json:"status"`
+	IP     string `json:"ip"`
+	Name   string `json:"name"`
+}
+
+// ListVMsResponse is returned by POST /client/list.
+type ListVMsResponse struct {
+	Success bool                    `json:"success"`
+	Servers map[string]VMListEntry  `json:"servers"`
 }
 
 // --- API methods ---
 
-// ListHosts returns all currently available GPU hosts in the marketplace.
-func (c *Client) ListHosts(ctx context.Context) ([]HostDetails, error) {
-	var resp HostsResponse
-	if err := c.doGET(ctx, "/client/list/", &resp); err != nil {
+// ListHostnodes returns all available GPU hosts in the marketplace.
+// This endpoint is public — no credentials required.
+func (c *Client) ListHostnodes(ctx context.Context) ([]Hostnode, error) {
+	var resp HostnodesResponse
+	if err := c.doGET(ctx, "/client/deploy/hostnodes", &resp); err != nil {
+		return nil, err
+	}
+	nodes := make([]Hostnode, 0, len(resp.Hostnodes))
+	for id, node := range resp.Hostnodes {
+		node.UUID = id
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+// ListVMs returns all VMs deployed under this account.
+// Used for credential validation and instance listing.
+func (c *Client) ListVMs(ctx context.Context) (map[string]VMListEntry, error) {
+	var resp ListVMsResponse
+	if err := c.doPOST(ctx, "/client/list", nil, &resp); err != nil {
 		return nil, err
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("tensordock list hosts: API returned success=false")
+		return nil, fmt.Errorf("tensordock list VMs: API returned success=false")
 	}
-	hosts := make([]HostDetails, 0, len(resp.Hosts))
-	for id, h := range resp.Hosts {
-		if h.ID == "" {
-			h.ID = id
-		}
-		hosts = append(hosts, h)
-	}
-	return hosts, nil
+	return resp.Servers, nil
 }
 
-// DeployVM provisions a new VM on the given host.
-func (c *Client) DeployVM(ctx context.Context, req DeployRequest) (*DeployResponse, error) {
+// DeployVM provisions a new VM on the given hostnode.
+func (c *Client) DeployVM(ctx context.Context, hostnodeUUID, gpuModel string, gpuCount, vcpus, ramGB, storageGB int, password, cloudinitScript string) (*DeployResponse, error) {
+	name := sanitizeHostname("gpuapi-" + hostnodeUUID[:8])
+
+	form := url.Values{
+		"hostnode":         {hostnodeUUID},
+		"gpu_model":        {gpuModel},
+		"gpu_count":        {strconv.Itoa(gpuCount)},
+		"vcpus":            {strconv.Itoa(vcpus)},
+		"ram":              {strconv.Itoa(ramGB)},
+		"storage":          {strconv.Itoa(storageGB)},
+		"operating_system": {"Ubuntu 22.04 LTS"},
+		"password":         {password},
+		"name":             {name},
+		"internal_ports":   {"{22}"},
+	}
+	if cloudinitScript != "" {
+		form.Set("cloudinit_script", cloudinitScript)
+	}
+
 	var resp DeployResponse
-	if err := c.doPOST(ctx, "/client/deploy/virtualMachine/", req, &resp); err != nil {
+	if err := c.doPOST(ctx, "/client/deploy/single", form, &resp); err != nil {
 		return nil, err
 	}
 	if !resp.Success {
@@ -222,19 +253,32 @@ func (c *Client) DeployVM(ctx context.Context, req DeployRequest) (*DeployRespon
 	return &resp, nil
 }
 
-// GetInstance returns the current status of a deployed instance.
-func (c *Client) GetInstance(ctx context.Context, instanceID string) (*InstanceStatusResponse, error) {
-	var resp InstanceStatusResponse
-	if err := c.doGET(ctx, "/client/single/"+instanceID+"/", &resp); err != nil {
+// GetVM returns the current status of a deployed VM.
+// Returns (nil, nil) if the server UUID is not found.
+func (c *Client) GetVM(ctx context.Context, serverUUID string) (*VMStatus, error) {
+	form := url.Values{"server": {serverUUID}}
+	var resp VMStatus
+	if err := c.doPOST(ctx, "/client/get/single", form, &resp); err != nil {
+		// A "not found" error from TensorDock comes as an API error, not HTTP 404.
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Server not found") {
+			return nil, nil
+		}
 		return nil, err
+	}
+	if !resp.Success {
+		if strings.Contains(strings.ToLower(resp.Error), "not found") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tensordock get VM: %s", resp.Error)
 	}
 	return &resp, nil
 }
 
-// DeleteInstance terminates an instance.
-func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
+// DeleteVM terminates a VM.
+func (c *Client) DeleteVM(ctx context.Context, serverUUID string) error {
+	form := url.Values{"server": {serverUUID}}
 	var resp DeleteResponse
-	if err := c.doPOST(ctx, "/client/delete/"+instanceID+"/", struct{}{}, &resp); err != nil {
+	if err := c.doPOST(ctx, "/client/delete/single", form, &resp); err != nil {
 		return err
 	}
 	if !resp.Success {
@@ -245,4 +289,39 @@ func (c *Client) DeleteInstance(ctx context.Context, instanceID string) error {
 		return fmt.Errorf("tensordock delete failed: %s", msg)
 	}
 	return nil
+}
+
+// GeneratePassword creates a random 24-hex-char password suitable for VM provisioning.
+func GeneratePassword() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return "Td1!" + hex.EncodeToString(b) // prefix satisfies typical complexity requirements
+}
+
+// ParseVRAMFromSlug extracts VRAM in GB from a GPU model slug.
+// E.g. "geforcertx3080-pcie-10gb" → 10, "a100-sxm5-80gb" → 80.
+var vramRegex = regexp.MustCompile(`-(\d+)gb$`)
+
+func ParseVRAMFromSlug(slug string) int {
+	m := vramRegex.FindStringSubmatch(slug)
+	if len(m) < 2 {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// sanitizeHostname returns a lowercase alphanumeric+hyphen string ≤ 24 chars.
+func sanitizeHostname(s string) string {
+	var b strings.Builder
+	for _, c := range strings.ToLower(s) {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+			b.WriteRune(c)
+		}
+	}
+	if b.Len() > 24 {
+		return b.String()[:24]
+	}
+	return b.String()
 }

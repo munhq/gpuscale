@@ -13,7 +13,9 @@ import (
 	"time"
 )
 
-const baseURL = "https://api.verda.com/v1"
+// Verda (formerly DataCrunch.io) — the product was rebranded but the API infrastructure
+// still runs under datacrunch.io. api.verda.com does not resolve.
+const baseURL = "https://api.datacrunch.io/v1"
 
 // Client is an HTTP client for the Verda API with OAuth2 auth.
 type Client struct {

@@ -22,77 +22,105 @@ func New(apiKey, apiToken string) *Provider {
 
 func (p *Provider) Name() string { return "tensordock" }
 
+// Validate verifies credentials by making an authenticated list-VMs request.
 func (p *Provider) Validate(ctx context.Context) error {
-	if _, err := p.client.ListHosts(ctx); err != nil {
+	if _, err := p.client.ListVMs(ctx); err != nil {
 		return fmt.Errorf("tensordock credential check: %w", err)
 	}
 	return nil
 }
 
 func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirements) ([]provider.Offer, error) {
-	hosts, err := p.client.ListHosts(ctx)
+	hosts, err := p.client.ListHostnodes(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("tensordock: list hosts: %w", err)
+		return nil, fmt.Errorf("tensordock: list hostnodes: %w", err)
 	}
 
 	var offers []provider.Offer
 	for _, h := range hosts {
-		gpuType := h.GPU.Type
-		gpuCount := h.GPU.Amount
-		vramPerGPU := h.GPU.VRAM // GB per GPU
-		totalVRAM := gpuCount * vramPerGPU
-
-		if gpuType == "" || gpuCount == 0 {
+		// Skip offline or unlisted hosts.
+		if !h.Status.Online || !h.Status.Listed {
 			continue
 		}
 
-		// GPU type filter (soft preference — skip if no match and GPUTypes specified)
-		if len(req.GPUTypes) > 0 && !matchesGPUType(gpuType, req.GPUTypes) {
-			continue
-		}
-		// Multi-GPU filter
-		if !req.MultiGpu && gpuCount > 1 {
-			continue
-		}
-		// VRAM filter
-		if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
-			continue
-		}
-		if req.MaxVRAM > 0 && vramPerGPU > req.MaxVRAM {
-			continue
-		}
-		// RAM filter
-		if req.MinRAM > 0 && h.RAM < req.MinRAM {
-			continue
-		}
-		// Disk filter
-		if req.MinDisk > 0 && h.Storage < req.MinDisk {
-			continue
-		}
+		ramGB := h.Specs.RAM.Amount
+		storageGB := h.Specs.Storage.Amount
 
-		pricePerHour := h.Pricing.GPU.Hourly * float64(gpuCount)
-		if req.MaxPricePerHour > 0 && pricePerHour > req.MaxPricePerHour {
-			continue
-		}
+		// Each GPU model on a hostnode becomes a separate offer.
+		for modelSlug, gpu := range h.Specs.GPU {
+			if gpu.Amount == 0 {
+				continue
+			}
 
-		region := h.Location.ID
-		if region == "" {
-			region = h.Location.Country
-		}
+			gpuType := gpuTypeFromSlug(modelSlug)
+			vramPerGPU := ParseVRAMFromSlug(modelSlug)
+			gpuCount := gpu.Amount
+			totalVRAM := gpuCount * vramPerGPU
 
-		offers = append(offers, provider.Offer{
-			ProviderName: p.Name(),
-			OfferID:      h.ID,
-			GPUType:      gpuType,
-			GPUCount:     gpuCount,
-			VRAM:         totalVRAM,
-			PricePerHour: pricePerHour,
-			CapacityType: "on-demand", // TensorDock has no spot
-			Region:       region,
-			Reliability:  0.95, // TensorDock is datacenter-grade, no spot interruptions
-			DiskGB:       h.Storage,
-			RAMGB:        h.RAM,
-		})
+			if gpuType == "" || vramPerGPU == 0 {
+				continue
+			}
+
+			// GPU type filter (soft match — skip only if GPUTypes is specified and there's no match).
+			if len(req.GPUTypes) > 0 && !matchesGPUType(gpuType, req.GPUTypes) {
+				continue
+			}
+			// Multi-GPU filter.
+			if !req.MultiGpu && gpuCount > 1 {
+				continue
+			}
+			// VRAM filter.
+			if req.MinVRAM > 0 && totalVRAM < req.MinVRAM {
+				continue
+			}
+			if req.MaxVRAM > 0 && vramPerGPU > req.MaxVRAM {
+				continue
+			}
+			// RAM filter.
+			if req.MinRAM > 0 && ramGB < req.MinRAM {
+				continue
+			}
+			// Disk filter.
+			if req.MinDisk > 0 && storageGB < req.MinDisk {
+				continue
+			}
+
+			// Total price: GPU cost (dominant) + RAM + storage at default deploy sizes.
+			// We use 8 vCPUs, the host's full RAM and storage as the upper bound.
+			// Users see GPU-dominated pricing; small overhead from RAM/storage is included.
+			defaultVCPUs := 8
+			pricePerHour := gpu.Price*float64(gpuCount) +
+				h.Specs.CPU.Price*float64(defaultVCPUs) +
+				h.Specs.RAM.Price*float64(ramGB) +
+				h.Specs.Storage.Price*float64(storageGB)
+
+			if req.MaxPricePerHour > 0 && pricePerHour > req.MaxPricePerHour {
+				continue
+			}
+
+			region := h.Location.Region
+			if region == "" {
+				region = h.Location.Country
+			}
+
+			// OfferID encodes both the hostnode UUID and GPU model slug,
+			// separated by ":", so CreateInstance can reconstruct both.
+			offerID := h.UUID + ":" + modelSlug
+
+			offers = append(offers, provider.Offer{
+				ProviderName: p.Name(),
+				OfferID:      offerID,
+				GPUType:      gpuType,
+				GPUCount:     gpuCount,
+				VRAM:         totalVRAM,
+				PricePerHour: pricePerHour,
+				CapacityType: "on-demand", // TensorDock has no spot
+				Region:       region,
+				Reliability:  h.Status.Uptime, // real uptime from TensorDock status feed
+				DiskGB:       storageGB,
+				RAMGB:        ramGB,
+			})
+		}
 	}
 	return offers, nil
 }
@@ -102,49 +130,48 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 		return nil, fmt.Errorf("tensordock: OnStartScript is required")
 	}
 
+	// OfferID format: "{hostnode_uuid}:{gpu_model_slug}"
+	hostnodeUUID, gpuModelSlug, err := parseOfferID(offer.OfferID)
+	if err != nil {
+		return nil, fmt.Errorf("tensordock: invalid offer ID %q: %w", offer.OfferID, err)
+	}
+
 	diskSize := config.MinDisk
 	if diskSize <= 0 {
 		diskSize = 100
 	}
 
-	// Default compute specs — headroom above bare GPU requirements.
-	vcpus := 8
-	ram := offer.RAMGB
-	if ram <= 0 {
-		ram = 32
+	ramGB := offer.RAMGB
+	if ramGB <= 0 {
+		ramGB = 32
+	}
+	// Cap RAM at a reasonable deployment size (don't allocate the entire host).
+	if ramGB > 128 {
+		ramGB = 128
 	}
 
-	hostname := sanitize("gpuapi-" + config.InstanceID)
-	if len(hostname) > 24 {
-		hostname = hostname[:24]
-	}
+	// TensorDock uses cloud-init YAML for startup scripts.
+	cloudinit := wrapInCloudInit(config.OnStartScript)
 
-	req := DeployRequest{
-		ServerID:        offer.OfferID,
-		GPUModel:        offer.GPUType,
-		GPUCount:        offer.GPUCount,
-		VCPUs:           vcpus,
-		RAM:             ram,
-		Storage:         diskSize,
-		OperatingSystem: "Ubuntu 22.04 LTS",
-		ExternalPorts:   "22",
-		Hostname:        hostname,
-		StartupScript:   config.OnStartScript,
-	}
+	password := GeneratePassword()
 
-	resp, err := p.client.DeployVM(ctx, req)
+	resp, err := p.client.DeployVM(ctx,
+		hostnodeUUID,
+		gpuModelSlug,
+		offer.GPUCount,
+		8, // default vCPUs
+		ramGB,
+		diskSize,
+		password,
+		cloudinit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("tensordock: deploy VM: %w", err)
 	}
 
-	instanceID := resp.InstanceID
-	if instanceID == "" {
-		instanceID = resp.ServerID
-	}
-
 	return &provider.Instance{
 		ProviderName: p.Name(),
-		InstanceID:   instanceID,
+		InstanceID:   resp.Server,
 		NodeType:     "standalone",
 		IP:           resp.IP,
 		Status:       "starting",
@@ -156,40 +183,56 @@ func (p *Provider) CreateInstance(ctx context.Context, offer provider.Offer, con
 }
 
 func (p *Provider) DestroyInstance(ctx context.Context, instanceID string) error {
-	return p.client.DeleteInstance(ctx, instanceID)
+	return p.client.DeleteVM(ctx, instanceID)
 }
 
 func (p *Provider) GetInstance(ctx context.Context, instanceID string) (*provider.Instance, error) {
-	resp, err := p.client.GetInstance(ctx, instanceID)
+	resp, err := p.client.GetVM(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
-	status := normalizeStatus(resp.Status)
-	if status == "stopped" {
+	if resp == nil {
 		return nil, provider.ErrInstanceNotFound
 	}
 	return &provider.Instance{
 		ProviderName: p.Name(),
 		InstanceID:   instanceID,
 		IP:           resp.IP,
-		Status:       status,
+		Status:       normalizeStatus(resp.Status),
 		CreatedAt:    time.Now(),
 	}, nil
 }
 
 func (p *Provider) ListInstances(ctx context.Context) ([]*provider.Instance, error) {
-	// TensorDock lists deployed instances via the same /client/list/ endpoint
-	// with a different filter; return empty for now since we track in our DB.
-	return nil, nil
+	vms, err := p.client.ListVMs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*provider.Instance, 0, len(vms))
+	for id, vm := range vms {
+		result = append(result, &provider.Instance{
+			ProviderName: p.Name(),
+			InstanceID:   id,
+			IP:           vm.IP,
+			Status:       normalizeStatus(vm.Status),
+			CreatedAt:    time.Now(),
+		})
+	}
+	return result, nil
 }
+
+// --- helpers ---
 
 func normalizeStatus(s string) string {
 	switch strings.ToLower(s) {
 	case "running", "online":
 		return "running"
-	case "deploying", "starting", "pending", "created", "":
+	case "deploying", "starting", "pending", "created", "provisioning", "":
 		return "starting"
 	case "stopped", "offline", "terminated", "deleted":
+		return "stopped"
+	case "outbid": // spot preemption (TensorDock spot, if ever added)
 		return "stopped"
 	default:
 		return "error"
@@ -206,17 +249,67 @@ func matchesGPUType(gpuType string, want []string) bool {
 	return false
 }
 
-func sanitize(s string) string {
-	var b strings.Builder
-	for _, c := range s {
-		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
-			b.WriteRune(c)
-		case c >= 'A' && c <= 'Z':
-			b.WriteRune(c + 32) // to lower
-		case c == '_' || c == ' ':
-			b.WriteRune('-')
-		}
+// gpuTypeFromSlug converts a TensorDock GPU model slug into a human-readable name.
+// E.g. "geforcertx3080-pcie-10gb" → "GeForce RTX 3080", "rtxa4000-pcie-16gb" → "RTX A4000".
+func gpuTypeFromSlug(slug string) string {
+	// Remove the VRAM suffix (-Ngb) and interface suffix (-pcie-/-sxm-/-sxm4-/-sxm5-).
+	s := vramRegex.ReplaceAllString(slug, "")
+	// Remove common interface identifiers.
+	for _, iface := range []string{"-pcie", "-sxm5", "-sxm4", "-sxm"} {
+		s = strings.TrimSuffix(s, iface)
 	}
+	// Map known prefixes to pretty names.
+	switch {
+	case strings.HasPrefix(s, "geforcertx"):
+		n := strings.TrimPrefix(s, "geforcertx")
+		return "GeForce RTX " + strings.ToUpper(n)
+	case strings.HasPrefix(s, "geforcegt"):
+		n := strings.TrimPrefix(s, "geforcegt")
+		return "GeForce GT " + strings.ToUpper(n)
+	case strings.HasPrefix(s, "rtx"):
+		n := strings.TrimPrefix(s, "rtx")
+		return "RTX " + strings.ToUpper(n)
+	case strings.HasPrefix(s, "a"):
+		// A100, A30, A40, A4000, A6000 etc.
+		return strings.ToUpper(s[:1]) + s[1:]
+	case strings.HasPrefix(s, "h"):
+		// H100, H200
+		return strings.ToUpper(s[:1]) + s[1:]
+	case strings.HasPrefix(s, "l"):
+		// L40, L4
+		return strings.ToUpper(s[:1]) + s[1:]
+	default:
+		// Fallback: return the cleaned slug as-is.
+		return s
+	}
+}
+
+// parseOfferID splits an OfferID into hostnode UUID and GPU model slug.
+// Format: "{hostnode_uuid}:{gpu_model_slug}"
+func parseOfferID(offerID string) (hostnodeUUID, gpuModelSlug string, err error) {
+	idx := strings.Index(offerID, ":")
+	if idx < 0 {
+		return "", "", fmt.Errorf("expected format 'hostnode_uuid:gpu_model_slug'")
+	}
+	return offerID[:idx], offerID[idx+1:], nil
+}
+
+// wrapInCloudInit wraps a bash script in cloud-init YAML so TensorDock can execute it on first boot.
+// Uses write_files to place the script and runcmd to execute it asynchronously.
+func wrapInCloudInit(script string) string {
+	var b strings.Builder
+	b.WriteString("#cloud-config\n")
+	b.WriteString("write_files:\n")
+	b.WriteString("  - path: /root/bootstrap.sh\n")
+	b.WriteString("    permissions: '0755'\n")
+	b.WriteString("    content: |\n")
+	for _, line := range strings.Split(script, "\n") {
+		b.WriteString("      ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	// Run async so cloud-init doesn't wait for the long-running bootstrap.
+	b.WriteString("runcmd:\n")
+	b.WriteString("  - nohup bash /root/bootstrap.sh > /var/log/gpu-bootstrap.log 2>&1 &\n")
 	return b.String()
 }

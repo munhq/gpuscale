@@ -185,7 +185,7 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 				VRAM:         ti.totalVRAM,
 				PricePerHour: price,
 				CapacityType: capacityType,
-				Reliability:  0, // inventory provider — no marketplace reliability score
+				Reliability:  1.0, // managed inventory provider — guaranteed datacenter hardware
 				DiskGB:       0,
 				RAMGB:        ti.ramGB,
 				Region:       region,
