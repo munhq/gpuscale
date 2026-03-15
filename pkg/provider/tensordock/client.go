@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const baseURL = "https://dashboard.tensordock.com/api/v0"
+const baseURL = "https://marketplace.tensordock.com/api/v0"
 
 // Client is an HTTP client for the TensorDock marketplace API.
 // Auth: GET endpoints are public (no auth); POST endpoints use api_key + api_token
@@ -37,10 +37,15 @@ func NewClient(apiKey, apiToken string) *Client {
 	}
 }
 
-// doGET executes an unauthenticated GET request and JSON-decodes the response into dst.
-// The hostnodes listing endpoint is public and requires no credentials.
+// doGET executes an authenticated GET request, passing api_key and api_token as query params.
 func (c *Client) doGET(ctx context.Context, path string, dst interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+	u := baseURL + path
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	u += sep + "api_key=" + url.QueryEscape(c.apiKey) + "&api_token=" + url.QueryEscape(c.apiToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -98,10 +103,11 @@ func (c *Client) do(req *http.Request, dst interface{}) error {
 
 // --- API response types ---
 
-// GPUModel holds the count and price for one GPU model on a hostnode.
+// GPUModel holds the count, price and VRAM for one GPU model on a hostnode.
 type GPUModel struct {
 	Amount int     `json:"amount"`
 	Price  float64 `json:"price"` // $/GPU/hr
+	VRAM   int     `json:"vram"`  // GB per GPU
 }
 
 // HostnodeSpecs describes available hardware on a TensorDock server.
@@ -298,12 +304,12 @@ func GeneratePassword() string {
 	return "Td1!" + hex.EncodeToString(b) // prefix satisfies typical complexity requirements
 }
 
-// ParseVRAMFromSlug extracts VRAM in GB from a GPU model slug.
-// E.g. "geforcertx3080-pcie-10gb" → 10, "a100-sxm5-80gb" → 80.
-var vramRegex = regexp.MustCompile(`-(\d+)gb$`)
+// ParseVRAMFromSlug extracts VRAM in GB from a GPU model slug as a fallback
+// when the vram field is absent. E.g. "rtxa4000-pcie-16gb" → 16.
+var vramRegex = regexp.MustCompile(`-?(\d+)gb$`)
 
 func ParseVRAMFromSlug(slug string) int {
-	m := vramRegex.FindStringSubmatch(slug)
+	m := vramRegex.FindStringSubmatch(strings.ToLower(slug))
 	if len(m) < 2 {
 		return 0
 	}

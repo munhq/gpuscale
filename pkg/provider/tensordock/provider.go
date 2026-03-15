@@ -47,13 +47,18 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 		storageGB := h.Specs.Storage.Amount
 
 		// Each GPU model on a hostnode becomes a separate offer.
-		for modelSlug, gpu := range h.Specs.GPU {
+		// The map key is the model name (e.g. "rtx4090", "a100"); VRAM is a direct field.
+		for modelKey, gpu := range h.Specs.GPU {
 			if gpu.Amount == 0 {
 				continue
 			}
 
-			gpuType := gpuTypeFromSlug(modelSlug)
-			vramPerGPU := ParseVRAMFromSlug(modelSlug)
+			gpuType := gpuTypeFromKey(modelKey)
+			vramPerGPU := gpu.VRAM
+			if vramPerGPU == 0 {
+				// Fallback: try to parse VRAM from the key name itself.
+				vramPerGPU = ParseVRAMFromSlug(modelKey)
+			}
 			gpuCount := gpu.Amount
 			totalVRAM := gpuCount * vramPerGPU
 
@@ -103,9 +108,9 @@ func (p *Provider) SearchOffers(ctx context.Context, req provider.GPURequirement
 				region = h.Location.Country
 			}
 
-			// OfferID encodes both the hostnode UUID and GPU model slug,
+			// OfferID encodes both the hostnode UUID and GPU model key,
 			// separated by ":", so CreateInstance can reconstruct both.
-			offerID := h.UUID + ":" + modelSlug
+			offerID := h.UUID + ":" + modelKey
 
 			offers = append(offers, provider.Offer{
 				ProviderName: p.Name(),
@@ -249,38 +254,27 @@ func matchesGPUType(gpuType string, want []string) bool {
 	return false
 }
 
-// gpuTypeFromSlug converts a TensorDock GPU model slug into a human-readable name.
-// E.g. "geforcertx3080-pcie-10gb" → "GeForce RTX 3080", "rtxa4000-pcie-16gb" → "RTX A4000".
-func gpuTypeFromSlug(slug string) string {
-	// Remove the VRAM suffix (-Ngb) and interface suffix (-pcie-/-sxm-/-sxm4-/-sxm5-).
-	s := vramRegex.ReplaceAllString(slug, "")
-	// Remove common interface identifiers.
-	for _, iface := range []string{"-pcie", "-sxm5", "-sxm4", "-sxm"} {
-		s = strings.TrimSuffix(s, iface)
-	}
-	// Map known prefixes to pretty names.
+// gpuTypeFromKey converts a TensorDock GPU model key into a human-readable name.
+// Keys are lowercase identifiers like "rtx4090", "a100", "h100", "rtxa4000".
+func gpuTypeFromKey(key string) string {
+	s := strings.ToLower(key)
 	switch {
 	case strings.HasPrefix(s, "geforcertx"):
-		n := strings.TrimPrefix(s, "geforcertx")
-		return "GeForce RTX " + strings.ToUpper(n)
+		return "GeForce RTX " + strings.ToUpper(strings.TrimPrefix(s, "geforcertx"))
 	case strings.HasPrefix(s, "geforcegt"):
-		n := strings.TrimPrefix(s, "geforcegt")
-		return "GeForce GT " + strings.ToUpper(n)
+		return "GeForce GT " + strings.ToUpper(strings.TrimPrefix(s, "geforcegt"))
+	case strings.HasPrefix(s, "rtxa"):
+		return "RTX A" + strings.TrimPrefix(s, "rtxa")
 	case strings.HasPrefix(s, "rtx"):
-		n := strings.TrimPrefix(s, "rtx")
-		return "RTX " + strings.ToUpper(n)
-	case strings.HasPrefix(s, "a"):
-		// A100, A30, A40, A4000, A6000 etc.
+		return "RTX " + strings.ToUpper(strings.TrimPrefix(s, "rtx"))
+	case s == "a100" || s == "a30" || s == "a40" || strings.HasPrefix(s, "a100"):
 		return strings.ToUpper(s[:1]) + s[1:]
 	case strings.HasPrefix(s, "h"):
-		// H100, H200
-		return strings.ToUpper(s[:1]) + s[1:]
+		return strings.ToUpper(s[:1]) + s[1:] // H100, H200
 	case strings.HasPrefix(s, "l"):
-		// L40, L4
-		return strings.ToUpper(s[:1]) + s[1:]
+		return strings.ToUpper(s[:1]) + s[1:] // L4, L40
 	default:
-		// Fallback: return the cleaned slug as-is.
-		return s
+		return strings.ToUpper(s[:1]) + s[1:]
 	}
 }
 
