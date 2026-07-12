@@ -55,7 +55,7 @@ emit '{"claim":"'"$CLAIM_NAME"'","step":"cuda_ready","message":"NVIDIA driver re
 
 # Download gpu-agent binary from latest GitHub release
 mkdir -p /usr/local/bin
-AGENT_URL='https://github.com/munhq/kubernetes_gpu/releases/latest/download/gpu-agent-linux-amd64'
+AGENT_URL='https://github.com/munhq/k3s-gpu/releases/latest/download/gpu-agent-linux-amd64'
 echo '[gpuscale] downloading gpu-agent...'
 curl -fsSL "$AGENT_URL" -o /usr/local/bin/gpu-agent
 chmod +x /usr/local/bin/gpu-agent
