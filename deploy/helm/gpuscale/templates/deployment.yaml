@@ -1,0 +1,180 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gpuscale.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gpuscale.labels" . | nindent 4 }}
+  annotations:
+    # Keel force+poll auto-roll (fleet-standard, same as chat-recall / axon /
+    # munbot-platform): every green CI push to :latest deploys within ~2m.
+    keel.sh/policy: force
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 2m"
+    # REQUIRED for a mutable tag (:latest): watch THIS tag for digest changes so
+    # keel force-updates on same-tag repush instead of doing semver repo watching.
+    keel.sh/match-tag: "true"
+    # Needs the image ignoreDifferences + RespectIgnoreDifferences in this app's
+    # ApplicationSet so ArgoCD selfHeal doesn't stomp keel's in-cluster digest patch.
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "gpuscale.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpuscale.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "gpuscale.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --batch-window={{ .Values.controller.batchWindow }}
+            - --cooldown-period={{ .Values.controller.cooldownPeriod }}
+            - --interruption-poll-interval={{ .Values.controller.interruptionPollInterval }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: REDIS_URL
+              value: {{ .Values.redisURL | quote }}
+            - name: POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gpuscale-provider-credentials
+                  key: postgres-url
+                  optional: true
+            {{- if .Values.providers.vastai.enabled }}
+            - name: VASTAI_API_KEY
+              {{- if .Values.providers.vastai.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.vastai.existingSecret }}
+                  key: {{ .Values.providers.vastai.existingSecretKey | default "api-key" }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpuscale.fullname" . }}-provider-credentials
+                  key: vastai-api-key
+              {{- end }}
+            {{- end }}
+            {{- if .Values.providers.runpod.enabled }}
+            - name: RUNPOD_API_KEY
+              {{- if .Values.providers.runpod.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.runpod.existingSecret }}
+                  key: {{ .Values.providers.runpod.existingSecretKey | default "api-key" }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpuscale.fullname" . }}-provider-credentials
+                  key: runpod-api-key
+              {{- end }}
+            {{- end }}
+            {{- if .Values.providers.verda.enabled }}
+            - name: VERDA_CLIENT_ID
+              {{- if .Values.providers.verda.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.verda.existingSecret }}
+                  key: {{ .Values.providers.verda.existingSecretClientIDKey | default "client-id" }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpuscale.fullname" . }}-provider-credentials
+                  key: verda-client-id
+              {{- end }}
+            - name: VERDA_CLIENT_SECRET
+              {{- if .Values.providers.verda.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.verda.existingSecret }}
+                  key: {{ .Values.providers.verda.existingSecretClientSecretKey | default "client-secret" }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "gpuscale.fullname" . }}-provider-credentials
+                  key: verda-client-secret
+              {{- end }}
+            {{- end }}
+            {{- if .Values.providers.gcp.enabled }}
+            - name: GCP_SERVICE_ACCOUNT_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.gcp.existingSecret | default (printf "%s-provider-credentials" (include "gpuscale.fullname" .)) }}
+                  key: {{ .Values.providers.gcp.existingSecretKey | default "gcp-service-account-json" }}
+            - name: GCP_PROJECT_ID
+              value: {{ .Values.providers.gcp.projectID | quote }}
+            - name: GCP_ZONES
+              value: {{ .Values.providers.gcp.zones | default "us-central1-a,us-east1-d,europe-west4-a" | quote }}
+            {{- end }}
+            {{- if .Values.providers.aws.enabled }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.aws.existingSecret | default (printf "%s-provider-credentials" (include "gpuscale.fullname" .)) }}
+                  key: {{ .Values.providers.aws.existingSecretKeyID | default "aws-access-key-id" }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.providers.aws.existingSecret | default (printf "%s-provider-credentials" (include "gpuscale.fullname" .)) }}
+                  key: {{ .Values.providers.aws.existingSecretAccessKey | default "aws-secret-access-key" }}
+            - name: AWS_REGION
+              value: {{ .Values.providers.aws.region | default "us-east-1" | quote }}
+            {{- if .Values.providers.aws.subnetID }}
+            - name: AWS_SUBNET_ID
+              value: {{ .Values.providers.aws.subnetID | quote }}
+            {{- end }}
+            {{- if .Values.providers.aws.securityGroupID }}
+            - name: AWS_SECURITY_GROUP_ID
+              value: {{ .Values.providers.aws.securityGroupID | quote }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,14 @@
+apiVersion: v2
+name: gpuscale
+description: Multi-cloud GPU node autoscaler for Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - gpu
+  - autoscaler
+  - kubernetes
+  - k3s
+  - vast.ai
+  - verda
+  - runpod

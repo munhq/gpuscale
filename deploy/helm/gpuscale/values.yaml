@@ -1,0 +1,105 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/munhq/gpuscale-controller
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+# Controller configuration
+controller:
+  batchWindow: "10s"
+  cooldownPeriod: "2m"
+  interruptionPollInterval: "30s"
+
+# Provider credentials — use existingSecret to reference a pre-created K8s Secret,
+# or set apiKey inline (not recommended for production).
+providers:
+  vastai:
+    enabled: false
+    apiKey: ""
+    existingSecret: ""
+    existingSecretKey: "api-key"
+  runpod:
+    enabled: false
+    apiKey: ""
+    existingSecret: ""
+    existingSecretKey: "api-key"
+  verda:
+    enabled: false
+    clientID: ""
+    clientSecret: ""
+    existingSecret: ""
+    existingSecretClientIDKey: "client-id"
+    existingSecretClientSecretKey: "client-secret"
+  gcp:
+    enabled: false
+    existingSecret: ""
+    existingSecretKey: "service-account-json"
+    projectID: ""
+    zones: "us-central1-a,us-east1-d,europe-west4-a"
+  aws:
+    enabled: false
+    existingSecret: ""
+    existingSecretKeyID: "access-key-id"
+    existingSecretAccessKey: "secret-access-key"
+    region: "us-east-1"
+    subnetID: ""
+    securityGroupID: ""
+
+# Default GPUNodePool (creates a pool CR on install)
+defaultPool:
+  enabled: false
+  name: spot-gpu-pool
+  providers: []
+  #   - name: vast.ai
+  #     apiKeySecret:
+  #       name: gpuscale-provider-credentials
+  #       namespace: gpuscale-system
+  #     capacityType: spot
+  #     maxPrice: 0.50
+  #     nodeType: standalone
+  requirements:
+    minVRAM: 10
+    minDisk: 50
+    minRAM: 16
+  scaling:
+    batchWindow: "10s"
+    cooldownPeriod: "2m"
+    maxNodes: 6
+    minNodes: 0
+  bootstrap:
+    image: "vllm/vllm-openai:latest"
+    gpuApiURL: ""
+    gpuApiTokenSecret:
+      name: ""
+      namespace: ""
+      key: gpu-api-token
+  limits:
+    maxGPUs: 12
+    maxCostPerHour: 3.00
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+serviceAccount:
+  create: true
+  name: gpuscale-controller
+
+podAnnotations: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Optional second pool, disabled by default. Enable and fill providers to use it.
+verdaPool:
+  enabled: false

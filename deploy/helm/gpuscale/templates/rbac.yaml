@@ -1,0 +1,55 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gpuscale-controller
+  labels:
+    {{- include "gpuscale.labels" . | nindent 4 }}
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # GPUScale CRDs
+  - apiGroups: ["gpuscale.io"]
+    resources: ["gpunodepools"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["gpuscale.io"]
+    resources: ["gpunodepools/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["gpuscale.io"]
+    resources: ["gpunodeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["gpuscale.io"]
+    resources: ["gpunodeclaims/status"]
+    verbs: ["get", "update", "patch"]
+  # Coordination for leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpuscale-controller
+  labels:
+    {{- include "gpuscale.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpuscale-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "gpuscale.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

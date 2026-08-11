@@ -1,0 +1,72 @@
+{{- if .Values.verdaPool.enabled }}
+apiVersion: gpuscale.io/v1alpha1
+kind: GPUNodePool
+metadata:
+  name: {{ .Values.verdaPool.name | default "verda-gpu-pool" }}
+spec:
+  providers:
+    {{- range .Values.verdaPool.providers }}
+    - name: {{ .name }}
+      apiKeySecret:
+        name: {{ .apiKeySecret.name }}
+        namespace: {{ .apiKeySecret.namespace | default $.Release.Namespace }}
+      capacityType: {{ .capacityType | default "spot" }}
+      {{- if .maxPrice }}
+      maxPrice: {{ .maxPrice }}
+      {{- end }}
+      nodeType: {{ .nodeType | default "standalone" }}
+    {{- end }}
+  requirements:
+    {{- if .Values.verdaPool.requirements.gpuTypes }}
+    gpuTypes:
+      {{- toYaml .Values.verdaPool.requirements.gpuTypes | nindent 6 }}
+    {{- end }}
+    {{- if .Values.verdaPool.requirements.minVRAM }}
+    minVRAM: {{ .Values.verdaPool.requirements.minVRAM }}
+    {{- end }}
+    minDisk: {{ .Values.verdaPool.requirements.minDisk | default 50 }}
+    minRAM: {{ .Values.verdaPool.requirements.minRAM | default 32 }}
+  scaling:
+    batchWindow: {{ .Values.verdaPool.scaling.batchWindow | default "10s" }}
+    cooldownPeriod: {{ .Values.verdaPool.scaling.cooldownPeriod | default "10m" }}
+    maxNodes: {{ .Values.verdaPool.scaling.maxNodes | default 2 }}
+    minNodes: {{ .Values.verdaPool.scaling.minNodes | default 0 }}
+  bootstrap:
+    {{- if .Values.verdaPool.bootstrap.image }}
+    image: {{ .Values.verdaPool.bootstrap.image }}
+    {{- end }}
+    {{- if .Values.verdaPool.bootstrap.gpuApiURL }}
+    gpuApiURL: {{ .Values.verdaPool.bootstrap.gpuApiURL }}
+    {{- end }}
+    {{- if .Values.verdaPool.bootstrap.gpuApiTokenSecret.name }}
+    gpuApiTokenSecret:
+      name: {{ .Values.verdaPool.bootstrap.gpuApiTokenSecret.name }}
+      namespace: {{ .Values.verdaPool.bootstrap.gpuApiTokenSecret.namespace | default $.Release.Namespace }}
+      key: {{ .Values.verdaPool.bootstrap.gpuApiTokenSecret.key | default "gpu-api-token" }}
+    {{- end }}
+    {{- if .Values.verdaPool.bootstrap.modelCacheURL }}
+    modelCacheURL: {{ .Values.verdaPool.bootstrap.modelCacheURL }}
+    {{- end }}
+    {{- if .Values.verdaPool.bootstrap.vpnSetupKeySecret }}
+    vpnSetupKeySecret:
+      name: {{ .Values.verdaPool.bootstrap.vpnSetupKeySecret.name }}
+      namespace: {{ .Values.verdaPool.bootstrap.vpnSetupKeySecret.namespace | default $.Release.Namespace }}
+    {{- end }}
+    {{- if .Values.verdaPool.bootstrap.k8sTokenSecret }}
+    k8sTokenSecret:
+      name: {{ .Values.verdaPool.bootstrap.k8sTokenSecret.name }}
+      namespace: {{ .Values.verdaPool.bootstrap.k8sTokenSecret.namespace | default $.Release.Namespace }}
+    {{- end }}
+    {{- if .Values.verdaPool.bootstrap.k8sURL }}
+    k8sURL: {{ .Values.verdaPool.bootstrap.k8sURL }}
+    {{- end }}
+  {{- if .Values.verdaPool.limits }}
+  limits:
+    {{- if .Values.verdaPool.limits.maxGPUs }}
+    maxGPUs: {{ .Values.verdaPool.limits.maxGPUs }}
+    {{- end }}
+    {{- if .Values.verdaPool.limits.maxCostPerHour }}
+    maxCostPerHour: {{ .Values.verdaPool.limits.maxCostPerHour }}
+    {{- end }}
+  {{- end }}
+{{- end }}

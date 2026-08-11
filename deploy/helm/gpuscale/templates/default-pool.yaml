@@ -1,0 +1,73 @@
+{{- if .Values.defaultPool.enabled }}
+apiVersion: gpuscale.io/v1alpha1
+kind: GPUNodePool
+metadata:
+  name: {{ .Values.defaultPool.name | default "spot-gpu-pool" }}
+spec:
+  providers:
+    {{- range .Values.defaultPool.providers }}
+    - name: {{ .name }}
+      apiKeySecret:
+        name: {{ .apiKeySecret.name }}
+        namespace: {{ .apiKeySecret.namespace | default $.Release.Namespace }}
+      capacityType: {{ .capacityType | default "spot" }}
+      {{- if .maxPrice }}
+      maxPrice: {{ .maxPrice }}
+      {{- end }}
+      nodeType: {{ .nodeType | default "standalone" }}
+    {{- end }}
+  requirements:
+    {{- if .Values.defaultPool.requirements.gpuTypes }}
+    gpuTypes:
+      {{- toYaml .Values.defaultPool.requirements.gpuTypes | nindent 6 }}
+    {{- end }}
+    minVRAM: {{ .Values.defaultPool.requirements.minVRAM | default 10 }}
+    minDisk: {{ .Values.defaultPool.requirements.minDisk | default 50 }}
+    minRAM: {{ .Values.defaultPool.requirements.minRAM | default 16 }}
+    {{- if .Values.defaultPool.requirements.minPCIeGen }}
+    minPCIeGen: {{ .Values.defaultPool.requirements.minPCIeGen }}
+    {{- end }}
+  scaling:
+    batchWindow: {{ .Values.defaultPool.scaling.batchWindow | default "10s" }}
+    cooldownPeriod: {{ .Values.defaultPool.scaling.cooldownPeriod | default "10m" }}
+    maxNodes: {{ .Values.defaultPool.scaling.maxNodes | default 6 }}
+    minNodes: {{ .Values.defaultPool.scaling.minNodes | default 0 }}
+  bootstrap:
+    {{- if .Values.defaultPool.bootstrap.image }}
+    image: {{ .Values.defaultPool.bootstrap.image }}
+    {{- end }}
+    {{- if .Values.defaultPool.bootstrap.gpuApiURL }}
+    gpuApiURL: {{ .Values.defaultPool.bootstrap.gpuApiURL }}
+    {{- end }}
+    {{- if .Values.defaultPool.bootstrap.gpuApiTokenSecret.name }}
+    gpuApiTokenSecret:
+      name: {{ .Values.defaultPool.bootstrap.gpuApiTokenSecret.name }}
+      namespace: {{ .Values.defaultPool.bootstrap.gpuApiTokenSecret.namespace | default $.Release.Namespace }}
+      key: {{ .Values.defaultPool.bootstrap.gpuApiTokenSecret.key | default "gpu-api-token" }}
+    {{- end }}
+    {{- if .Values.defaultPool.bootstrap.modelCacheURL }}
+    modelCacheURL: {{ .Values.defaultPool.bootstrap.modelCacheURL }}
+    {{- end }}
+    {{- if .Values.defaultPool.bootstrap.vpnSetupKeySecret }}
+    vpnSetupKeySecret:
+      name: {{ .Values.defaultPool.bootstrap.vpnSetupKeySecret.name }}
+      namespace: {{ .Values.defaultPool.bootstrap.vpnSetupKeySecret.namespace | default $.Release.Namespace }}
+    {{- end }}
+    {{- if .Values.defaultPool.bootstrap.k8sTokenSecret }}
+    k8sTokenSecret:
+      name: {{ .Values.defaultPool.bootstrap.k8sTokenSecret.name }}
+      namespace: {{ .Values.defaultPool.bootstrap.k8sTokenSecret.namespace | default $.Release.Namespace }}
+    {{- end }}
+    {{- if .Values.defaultPool.bootstrap.k8sURL }}
+    k8sURL: {{ .Values.defaultPool.bootstrap.k8sURL }}
+    {{- end }}
+  {{- if .Values.defaultPool.limits }}
+  limits:
+    {{- if .Values.defaultPool.limits.maxGPUs }}
+    maxGPUs: {{ .Values.defaultPool.limits.maxGPUs }}
+    {{- end }}
+    {{- if .Values.defaultPool.limits.maxCostPerHour }}
+    maxCostPerHour: {{ .Values.defaultPool.limits.maxCostPerHour }}
+    {{- end }}
+  {{- end }}
+{{- end }}

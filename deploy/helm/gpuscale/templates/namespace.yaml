@@ -1,0 +1,8 @@
+{{- if ne .Release.Namespace "gpu-workloads" }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "gpuscale.labels" . | nindent 4 }}
+{{- end }}
