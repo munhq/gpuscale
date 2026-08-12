@@ -1,19 +1,23 @@
 FROM golang:1.25 AS builder
 
 WORKDIR /workspace
-# Copy both gpuscale and pkg/provider (needed by go.mod replace directive)
-COPY gpuscale/go.mod gpuscale/go.sum gpuscale/
-COPY pkg/ pkg/
-# Disable go.work - we only need pkg/provider, not gpu-api
-ENV GOWORK=off
-WORKDIR /workspace/gpuscale
+
+# Dependencies first, so a source-only change does not re-download the module cache.
+COPY go.mod go.sum ./
 RUN go mod download
 
-COPY gpuscale/ .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -o gpuscale-controller ./cmd/controller/
+COPY api/ api/
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY pkg/ pkg/
+
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -a -trimpath -ldflags="-s -w" -o gpuscale-controller ./cmd/controller/
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
-COPY --from=builder /workspace/gpuscale/gpuscale-controller .
+COPY --from=builder /workspace/gpuscale-controller .
 USER 65532:65532
 ENTRYPOINT ["/gpuscale-controller"]
