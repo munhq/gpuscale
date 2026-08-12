@@ -173,7 +173,7 @@ Go 1.25, a Kubernetes cluster for the controller (the GPU instances themselves a
 
 This started as the Kubernetes-native path for a private inference platform. That platform has since moved its default provisioning into an API service driving a per-node agent over a WSS tunnel, which removes the Kubernetes dependency from the GPU nodes entirely — worth it there, because the GPU instances never needed to be cluster members.
 
-`gpuscale` remains the right shape if you want GPU capacity expressed as Kubernetes resources and scheduled by Kubernetes: multi-tenant clusters, existing CRD-driven workflows, or anywhere `kubectl get gpunodeclaims` is the interface you want. The provider layer in `pkg/provider` is shared by both designs and is actively used.
+Use `gpuscale` if you want GPU capacity expressed as Kubernetes resources and scheduled by Kubernetes: multi-tenant clusters, existing CRD-driven workflows, or anywhere `kubectl get gpunodeclaims` is the interface you want. The provider layer in `pkg/provider` is shared by both designs and is actively used.
 
 Issues and pull requests are welcome, particularly new providers.
 
