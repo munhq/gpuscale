@@ -140,19 +140,22 @@ Build the controller image from [`docker/controller/Dockerfile`](docker/controll
 A Helm chart is in [`deploy/helm/gpuscale`](deploy/helm/gpuscale). It installs the two CRDs, the controller Deployment, a ServiceAccount, ClusterRole and ClusterRoleBinding, and optionally a first `GPUNodePool`:
 
 ```
-# build and push the controller image to a registry you control
-docker build -t <your-registry>/gpuscale-controller:v0.1.0 -f docker/controller/Dockerfile .
-docker push <your-registry>/gpuscale-controller:v0.1.0
-
 helm install gpuscale deploy/helm/gpuscale \
   --namespace gpu-workloads --create-namespace \
-  --set image.repository=<your-registry>/gpuscale-controller \
-  --set image.tag=v0.1.0 \
   --set providers.vastai.enabled=true \
   --set providers.vastai.existingSecret=gpuscale-provider-credentials
 ```
 
-There is no published image yet, so build your own from the included Dockerfile — one command, and it keeps you in control of what runs in your cluster.
+Images are built and published by CI on every `v*` tag — multi-arch amd64 and arm64, to
+`ghcr.io/munhq/gpuscale-controller`, with the packaged Helm chart attached to the release.
+See [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
+To run your own build instead:
+
+```
+docker build -t <your-registry>/gpuscale-controller:dev -f docker/controller/Dockerfile .
+helm install gpuscale deploy/helm/gpuscale --set image.repository=<your-registry>/gpuscale-controller --set image.tag=dev
+```
 
 Every provider is disabled by default. Enable the ones you hold credentials for, and supply them through `existingSecret` rather than chart values.
 
