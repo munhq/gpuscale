@@ -1,8 +1,49 @@
 # gpuscale
 
-A Kubernetes controller that provisions GPU capacity from **seven cloud and GPU-marketplace providers**, keeps it healthy, and takes it away again when the demand goes.
+**Run LLM inference on the cheapest GPU available anywhere, and stop paying for it the moment nobody is asking.**
 
-`gpuscale` watches for pending GPU workloads, searches every configured provider for the cheapest offer that meets the requirement, provisions the instance, waits for it to come up, routes work to it, and terminates it when it goes idle or the provider preempts it.
+You declare the GPU you need. `gpuscale` shops seven providers, buys the cheapest instance that fits, brings up vLLM on it, routes traffic to it, watches its health, and destroys it when demand goes. It runs as a Kubernetes controller, but the GPUs it buys are not cluster members — they are standalone machines running two processes, an agent and vLLM.
+
+```yaml
+apiVersion: gpuscale.io/v1alpha1
+kind: GPUNodePool
+metadata:
+  name: inference
+spec:
+  providers:
+    - name: vast.ai
+      nodeType: standalone
+      capacityType: spot
+      maxPrice: 0.50                 # $/hr ceiling, per instance
+      apiKeySecret:
+        name: gpuscale-provider-credentials
+        namespace: gpuscale-system
+  requirements:
+    gpuTypes: ["RTX 4090", "RTX 3090", "A100"]
+    minVRAM: 24                      # GB
+    minDisk: 50
+    minRAM: 32
+  scaling:
+    minNodes: 0                      # scale to zero when idle
+    maxNodes: 6
+    batchWindow: "10s"
+    cooldownPeriod: "2m"
+  bootstrap:
+    image: "vllm/vllm-openai:latest"
+  limits:
+    maxGPUs: 12
+    maxCostPerHour: 3.00
+```
+
+Apply that, submit work, and capacity appears. Stop, and it goes away.
+
+## What you get
+
+- **A model serving, on hardware you did not have to pick.** Offers are searched across every configured provider and selected on GPU type, VRAM, price ceiling, and spot versus on-demand.
+- **Scale to zero.** `minNodes: 0` means an idle pool costs nothing. A cooldown stops it thrashing between requests.
+- **Preemption handled.** Spot instances get taken back; a controller notices and replaces the node if demand is still there.
+- **Cost as a first-class constraint.** `maxPricePerHour` is a hard ceiling, and consolidation bin-packs models onto fewer GPUs when they fit.
+- **Metrics.** vLLM metrics are scraped from every worker and re-exposed as `gpuscale_worker_vllm_*`, alongside the controller's own.
 
 ## Why this exists
 
@@ -99,11 +140,19 @@ Build the controller image from [`docker/controller/Dockerfile`](docker/controll
 A Helm chart is in [`deploy/helm/gpuscale`](deploy/helm/gpuscale). It installs the two CRDs, the controller Deployment, a ServiceAccount, ClusterRole and ClusterRoleBinding, and optionally a first `GPUNodePool`:
 
 ```
+# build and push the controller image to a registry you control
+docker build -t <your-registry>/gpuscale-controller:v0.1.0 -f docker/controller/Dockerfile .
+docker push <your-registry>/gpuscale-controller:v0.1.0
+
 helm install gpuscale deploy/helm/gpuscale \
   --namespace gpu-workloads --create-namespace \
+  --set image.repository=<your-registry>/gpuscale-controller \
+  --set image.tag=v0.1.0 \
   --set providers.vastai.enabled=true \
   --set providers.vastai.existingSecret=gpuscale-provider-credentials
 ```
+
+There is no published image yet, so build your own from the included Dockerfile — one command, and it keeps you in control of what runs in your cluster.
 
 Every provider is disabled by default. Enable the ones you hold credentials for, and supply them through `existingSecret` rather than chart values.
 
