@@ -1,8 +1,8 @@
 # gpuscale
 
-**Run LLM inference on the cheapest GPU available anywhere, and stop paying for it the moment nobody is asking.**
+gpuscale provisions GPU capacity from seven cloud and marketplace providers, runs vLLM on it, and releases it when demand stops. It runs as a Kubernetes controller. The GPU instances it creates are not cluster members: each runs an agent process and vLLM.
 
-You declare the GPU you need. `gpuscale` shops seven providers, buys the cheapest instance that fits, brings up vLLM on it, routes traffic to it, watches its health, and destroys it when demand goes. It runs as a Kubernetes controller, but the GPUs it buys are not cluster members — they are standalone machines running two processes, an agent and vLLM.
+You declare the capacity you are willing to buy as a `GPUNodePool`:
 
 ```yaml
 apiVersion: gpuscale.io/v1alpha1
@@ -35,32 +35,34 @@ spec:
     maxCostPerHour: 3.00
 ```
 
-Apply that, submit work, and capacity appears. Stop, and it goes away.
+Apply the resource. When a GPU workload is pending, the controller searches the configured providers, selects the cheapest offer that meets the requirements, creates the instance, waits for it to serve, and routes traffic to it. When demand stops, it destroys the instance.
 
-## What you get
+## Features
 
-- **A model serving, on hardware you did not have to pick.** Offers are searched across every configured provider and selected on GPU type, VRAM, price ceiling, and spot versus on-demand.
-- **Scale to zero.** `minNodes: 0` means an idle pool costs nothing. A cooldown stops it thrashing between requests.
-- **Preemption handled.** Spot instances get taken back; a controller notices and replaces the node if demand is still there.
-- **Cost as a first-class constraint.** `maxPricePerHour` is a hard ceiling, and consolidation bin-packs models onto fewer GPUs when they fit.
-- **Metrics.** vLLM metrics are scraped from every worker and re-exposed as `gpuscale_worker_vllm_*`, alongside the controller's own.
+- Offer selection across all configured providers, filtered on GPU type, VRAM, price ceiling, and spot or on-demand capacity.
+- Scale to zero. Set `minNodes: 0` and an idle pool costs nothing. A cooldown prevents repeated create and destroy cycles between requests.
+- Spot preemption handling. A controller polls provider APIs, detects reclaimed instances, and replaces them if demand remains.
+- A hard cost ceiling per instance (`maxPrice`) and per pool (`maxCostPerHour`).
+- Consolidation. When bin-packing shows the same models fit on fewer GPUs, the controller migrates them.
+- Metrics. vLLM metrics are scraped from each worker and re-exposed as `gpuscale_worker_vllm_*`, alongside controller metrics.
 
-## Why this exists
+## Background
 
-It replaces two things that did not fit: the scheduler, and the autoscaler.
+The platform this came from used Kueue for queueing and Ray for placement. Two problems followed from that design:
 
-**The scheduler.** The platform this came from started on **Kueue plus Ray**. Kueue queues the work correctly, but a queued job still lands on a worker that has to load the model, so every batch paid a cold start — and Ray added an orchestration layer whose only job was to place work on GPUs that `gpuscale` already knows about.
+- A queued job landed on a worker that had to load the model, so each batch paid the model load time.
+- Ray placed work on GPUs that the provisioner already tracked, which duplicated state.
 
-`gpuscale` replaced both. It schedules against GPU requirements declared as pod annotations and provisions to satisfy them:
+gpuscale replaces both. It schedules against GPU requirements declared as pod annotations:
 
 ```
 gpuscale.io/gpu-vram    gpuscale.io/gpu-type    gpuscale.io/max-price
 gpuscale.io/provider    gpuscale.io/priority
 ```
 
-A provisioned node runs **two processes: an agent and vLLM.** No K3s on the GPU node, no Ray, no service mesh. The node is a GPU running a model server and reporting its health; everything else is a control-plane concern.
+A provisioned node runs two processes, an agent and vLLM. It does not run Kubernetes or Ray.
 
-**The autoscaler.** Karpenter provisions on AWS and Azure only. Cluster Autoscaler needs node groups defined in advance. Neither can buy a spot GPU from a marketplace when that is the cheapest capacity available. If your GPU spend is dominated by price differences between providers, no existing open-source autoscaler can act on that.
+Existing autoscalers did not fit either. Karpenter supports AWS and Azure. Cluster Autoscaler requires node groups defined in advance. Neither can acquire a spot GPU from a marketplace.
 
 ## Providers
 
@@ -74,7 +76,7 @@ A provisioned node runs **two processes: an agent and vLLM.** No K3s on the GPU 
 | TensorDock | GPU marketplace |
 | Verda | GPU cloud |
 
-All seven sit behind one interface (`pkg/provider`). A provider supplies offer search, instance create, instance status and instance destroy; everything above it is provider-agnostic. Adding a provider means implementing that interface — nothing in the controllers changes.
+All seven providers implement one interface, `pkg/provider`. A provider supplies four operations: offer search, instance create, instance status, and instance destroy. Code above that interface is provider-agnostic. To add a provider, implement the interface. The controllers do not change.
 
 Offer selection filters on GPU count, GPU type, total VRAM, maximum VRAM per GPU, price ceiling per hour, disk, RAM, and spot versus on-demand.
 
@@ -99,17 +101,19 @@ Five controllers do the work:
 | Interruption | Poll provider APIs for preemption, clean up, re-provision if demand persists |
 | Worker metrics | Scrape vLLM metrics from workers and re-expose them as `gpuscale_worker_vllm_*` |
 
-## Failure handling, and the reasoning behind it
+## Failure handling
 
-The interesting part of an autoscaler is not how it adds capacity — it is what it does when capacity misbehaves. Three deliberate choices:
+### Failed offers are blacklisted
 
-**Bad offers are quarantined, not retried.** When an offer fails to bring up, its ID enters a TTL blacklist. Marketplace inventory is uneven; without this the scheduler picks the same broken offer on the next reconcile and burns the loop. The TTL expiry means a provider that has recovered comes back automatically, with no manual reset.
+When an offer fails to bring up, its ID is added to a blacklist with a time-to-live. Without this, the scheduler selects the same failing offer on the next reconcile. The TTL expiry returns the offer to the pool automatically, so a recovered provider requires no manual reset.
 
-**Idle nodes wait out a cooldown before they die.** A GPU that goes quiet for thirty seconds is not idle, it is between requests. Destroying it means paying the provisioning latency again — one to three minutes — the next time demand arrives. The cooldown is the price of not thrashing. Nodes serving always-active models are never destroyed.
+### Idle nodes are destroyed after a cooldown
 
-**Consolidation is separate from disruption.** When bin-packing shows the same models fit on fewer nodes, the reconciler brings the replacement to Ready and serving *first*, then annotates the old claim for immediate drain, skipping the normal cooldown. Consolidation should never open a capacity gap.
+A node with no active requests is not necessarily idle. Provisioning a replacement takes one to three minutes, so the controller waits for the configured `cooldownPeriod` before destroying an idle node. Nodes serving models marked always-active are never destroyed.
 
-The general rule behind all three: a fleet that destroys a node on a transient signal wastes more capacity than the fault did. Every automated teardown here is either reversible or gated behind a state that has already been observed to hold.
+### Consolidation completes before draining
+
+When bin-packing shows the same models fit on fewer nodes, the reconciler waits for the replacement claim to reach Ready and serve traffic, then annotates the original claim for immediate drain, bypassing the cooldown. This avoids a capacity gap during consolidation.
 
 ## Configuration
 
