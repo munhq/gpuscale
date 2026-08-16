@@ -12,7 +12,9 @@ import (
 // The script:
 //  1. Emits bootstrap-event heartbeats to GPU API for progress tracking.
 //  2. Verifies NVIDIA driver (nvidia-smi).
-//  3. Downloads the gpu-agent binary from the latest GitHub release.
+//  3. Downloads the gpu-agent binary from GPU API, with the token it already
+//     holds. A node needs no GitHub credential, and boot does not depend on
+//     GitHub being reachable.
 //  4. Exec's gpu-agent, which starts vLLM and opens the outbound WSS tunnel.
 //
 // gpu-agent takes over from here — it starts vLLM as a child process, waits for
@@ -53,11 +55,13 @@ if ! nvidia-smi > /dev/null 2>&1; then
 fi
 emit '{"claim":"'"$CLAIM_NAME"'","step":"cuda_ready","message":"NVIDIA driver ready"}'
 
-# Download gpu-agent binary from latest GitHub release
+# Download gpu-agent from GPU API, authenticated with the token this script
+# already carries. Retry: a spot node's network is up before its route is.
 mkdir -p /usr/local/bin
-AGENT_URL='https://github.com/munhq/k3s-gpu/releases/latest/download/gpu-agent-linux-amd64'
+AGENT_URL="${GPU_API%%/internal/bootstrap-event}/internal/agent/linux-amd64"
 echo '[gpuscale] downloading gpu-agent...'
-curl -fsSL "$AGENT_URL" -o /usr/local/bin/gpu-agent
+curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused \
+  -H "Authorization: Bearer $AUTH" "$AGENT_URL" -o /usr/local/bin/gpu-agent
 chmod +x /usr/local/bin/gpu-agent
 emit '{"claim":"'"$CLAIM_NAME"'","step":"agent_ready","message":"gpu-agent downloaded"}'
 

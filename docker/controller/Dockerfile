@@ -17,6 +17,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -a -trimpath -ldflags="-s -w" -o gpuscale-controller ./cmd/controller/
 
 FROM gcr.io/distroless/static:nonroot
+
+# Binds the GHCR package to this repository. Without it the package stays
+# unlinked, and another repository that pushes the same name can claim it.
+LABEL org.opencontainers.image.source="https://github.com/munhq/gpuscale"
+
 WORKDIR /
 COPY --from=builder /workspace/gpuscale-controller .
 USER 65532:65532

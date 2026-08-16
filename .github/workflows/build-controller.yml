@@ -1,0 +1,60 @@
+name: Build and Push Controller
+
+# Publishes ghcr.io/munhq/gpuscale-controller:latest, the image the production
+# cluster runs. `release.yml` still publishes version tags on `v*`; this
+# workflow keeps `:latest` current with main.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'docker/**'
+      - '.github/workflows/build-controller.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Derive the name from the repository. Two repositories that hardcode the
+  # same literal write one package, and the second silently replaces the
+  # first one's image.
+  IMAGE_NAME: ${{ github.repository_owner }}/gpuscale-controller
+
+jobs:
+  build:
+    runs-on: hotmun-arc
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/controller/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          no-cache: true
+
+      # Deploy trigger. Keel's registry poll cannot authenticate against
+      # ghcr.io/munhq (403 on a stale token), so the push tells keel directly:
+      # this runner executes INSIDE the prod cluster (ARC), so the
+      # native-webhook ClusterIP is one hop away and needs no credential.
+      - name: Trigger keel deploy (in-cluster native webhook)
+        run: |
+          curl -sf -X POST http://keel-metrics.keel.svc.cluster.local:9300/v1/webhooks/native \
+            -H 'content-type: application/json' \
+            -d '{"name":"ghcr.io/munhq/gpuscale-controller","tag":"latest"}'
