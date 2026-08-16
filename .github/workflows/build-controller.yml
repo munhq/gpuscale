@@ -24,7 +24,11 @@ env:
 
 jobs:
   build:
-    runs-on: hotmun-arc
+    # GitHub-hosted on purpose. GitHub withholds org self-hosted runners from
+    # public repositories by default, so a `hotmun-arc` job here queues for
+    # ever — and enabling it would let a fork's pull request run code inside
+    # the production cluster.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -49,12 +53,8 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           no-cache: true
 
-      # Deploy trigger. Keel's registry poll cannot authenticate against
-      # ghcr.io/munhq (403 on a stale token), so the push tells keel directly:
-      # this runner executes INSIDE the prod cluster (ARC), so the
-      # native-webhook ClusterIP is one hop away and needs no credential.
-      - name: Trigger keel deploy (in-cluster native webhook)
-        run: |
-          curl -sf -X POST http://keel-metrics.keel.svc.cluster.local:9300/v1/webhooks/native \
-            -H 'content-type: application/json' \
-            -d '{"name":"ghcr.io/munhq/gpuscale-controller","tag":"latest"}'
+      # No keel webhook here. Keel's native webhook is a ClusterIP inside the
+      # production cluster, which a GitHub-hosted runner cannot reach, and
+      # keel's own registry poll currently 403s on a stale credential. Until
+      # that credential is fixed, roll the controller by hand after a build:
+      #   kubectl rollout restart deploy/gpuscale-controller -n gpu-workloads
